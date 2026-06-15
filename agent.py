@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import datetime
 
 from textual.app import App, ComposeResult
@@ -10,14 +11,36 @@ client = OpenAI(
 )
 
 class NaiveContextAssembler:
-    def __init__(self):
-        self.context = ""
+    def __init__(self, db_path="context.db"):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                role      TEXT NOT NULL,
+                content   TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.commit()
+
+    def add_message(self, role, content):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO messages (timestamp, role, content) VALUES (?, ?, ?)",
+            (timestamp, role, content),
+        )
+        self.conn.commit()
 
     def get_context(self):
-        return self.context
-
-    def add_to_context(self, new_info):
-        self.context += f"\n(Current System Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, {new_info})"
+        rows = self.conn.execute(
+            "SELECT timestamp, role, content FROM messages ORDER BY timestamp"
+        ).fetchall()
+        return "\n".join(
+            f"(Current System Time: {timestamp}) {role}: {content}"
+            for timestamp, role, content in rows
+        )
 
 class Prompter:
     def __init__(self, context_assembler):
@@ -51,9 +74,15 @@ class AgentApp(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         log = self.query_one(RichLog)
-        log.write(f"[bold]you:[/bold] {event.value}")
-        log.write(f"[bold]agent:[/bold] {self.prompter.prompt_model(event.value)}")
-        self.prompter.context_assembler.add_to_context(event.value)
+        user_input = event.value
+        log.write(f"[bold]you:[/bold] {user_input}")
+
+        agent_reply = self.prompter.prompt_model(user_input)
+        log.write(f"[bold]agent:[/bold] {agent_reply}")
+
+        assembler = self.prompter.context_assembler
+        assembler.add_message("user", user_input)
+        assembler.add_message("agent", agent_reply)
 
         event.input.clear()
 
