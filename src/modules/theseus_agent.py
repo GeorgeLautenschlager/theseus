@@ -86,3 +86,16 @@ class TheseusAgent:
         self.memory: list[MemoryModule] = memory if memory is not None else []
         self.ui = ui
         self.max_cycles = max_cycles
+
+    def process(self, user_input: str) -> str:
+        last_action: Action | None = None
+        for cycle in range(self.max_cycles):
+            observation = self.observer.observe(user_input, self.memory, cycle)
+            orientation = self.orienter.orient(observation, self.memory)
+            last_action = self.decider.decide(orientation, self.memory)
+            result = self.actor.act(last_action, self.memory)
+            if last_action.emit:
+                if self.ui:
+                    self.ui.render(result)
+                return result
+        raise MaxCyclesExceeded(self.max_cycles, last_action)
