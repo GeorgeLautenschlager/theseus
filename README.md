@@ -1,4 +1,4 @@
-# Theseus - Many Parts One Agent
+# Theseus - Many Parts, Same Agent
 
 Theseus is my Rotrod, the project car. I'm building it's capabilities just to see how capable I can build it. Out of this little hobby, I hope to produce nicely packaged modules that will eventually provide a "construction kit". That's planned to include:
 - model providers
