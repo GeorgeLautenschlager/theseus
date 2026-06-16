@@ -30,7 +30,7 @@ Public interface: `process(user_input: str) -> str`.
 ```python
 def process(self, user_input: str) -> str:
     for cycle in range(self.max_cycles):
-        observation  = self.observer.observe(user_input, self.memory)
+        observation  = self.observer.observe(user_input, self.memory, cycle)
         orientation  = self.orienter.orient(observation, self.memory)
         action       = self.decider.decide(orientation, self.memory)
         result       = self.actor.act(action, self.memory)
@@ -74,7 +74,7 @@ class Action:
 
 ```python
 class Observer(Protocol):
-    def observe(self, user_input: str, memory: list[MemoryModule]) -> Observation: ...
+    def observe(self, user_input: str, memory: list[MemoryModule], cycle: int) -> Observation: ...
 
 class Orienter(Protocol):
     def orient(self, observation: Observation, memory: list[MemoryModule]) -> Orientation: ...
@@ -99,7 +99,7 @@ All protocols use structural typing (duck typing). `@runtime_checkable` is optio
 
 **`MaxCyclesExceeded`** — raised when the loop exhausts `max_cycles` without `action.emit=True`. Carries `cycles: int` and `last_action: Action` for diagnostics.
 
-**Construction-time validation** — `observer`, `orienter`, `decider`, and `actor` are validated at `__init__`. Missing required slots raise `ValueError` immediately rather than failing mid-loop.
+**Construction-time validation** — `observer`, `orienter`, `decider`, and `actor` are validated at `__init__`. Missing required slots raise `ValueError` immediately rather than failing mid-loop. `max_cycles` must be `>= 1` for the same reason.
 
 **Module exceptions** propagate unchanged. `TheseusAgent` does not catch or wrap errors from phase modules.
 
