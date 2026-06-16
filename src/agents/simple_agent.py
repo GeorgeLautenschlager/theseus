@@ -5,10 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from textual.app import App, ComposeResult
-from textual.widgets import Input, RichLog
-
 from src.modules.memory.naive_context_assembler import NaiveContextAssembler
+from src.modules.user_interfaces.textual_ui import AgentApp, TextualUI
 from src.modules.model_providers.llama_provider import LlamaProvider
 from src.modules.theseus_agent import (
     Action,
@@ -51,18 +49,6 @@ class NaiveActor:
         return action.response
 
 
-class TextualUI:
-    def __init__(self) -> None:
-        self._log: RichLog | None = None
-
-    def set_log(self, log: RichLog) -> None:
-        self._log = log
-
-    def render(self, content: str) -> None:
-        if self._log is not None:
-            self._log.write(f"[bold]agent:[/bold] {content}")
-
-
 _memory = NaiveContextAssembler()
 _provider = LlamaProvider()
 _ui = TextualUI()
@@ -77,20 +63,5 @@ simple_agent = TheseusAgent(
 )
 
 
-class AgentApp(App):
-    def compose(self) -> ComposeResult:
-        yield RichLog(highlight=True, markup=True)
-        yield Input(placeholder="words go here")
-
-    def on_mount(self) -> None:
-        _ui.set_log(self.query_one(RichLog))
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        log = self.query_one(RichLog)
-        log.write(f"[bold]you:[/bold] {event.value}")
-        simple_agent.process(event.value)
-        event.input.clear()
-
-
 if __name__ == "__main__":
-    AgentApp().run()
+    AgentApp(simple_agent, _ui).run()
