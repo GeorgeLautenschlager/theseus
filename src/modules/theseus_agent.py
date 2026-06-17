@@ -58,16 +58,29 @@ class Actor(Protocol):
 
 
 class TheseusAgent:
+    observer: Observer | None = None
+    orienter: Orienter | None = None
+    decider: Decider | None = None
+    actor: Actor | None = None
+    memory: list[MemoryModule] | None = None
+    ui: UI | None = None
+    max_cycles: int = 10
+
     def __init__(
         self,
-        observer: Observer,
-        orienter: Orienter,
-        decider: Decider,
-        actor: Actor,
+        observer: Observer | None = None,
+        orienter: Orienter | None = None,
+        decider: Decider | None = None,
+        actor: Actor | None = None,
         memory: list[MemoryModule] | None = None,
         ui: UI | None = None,
-        max_cycles: int = 10,
+        max_cycles: int | None = None,
     ):
+        observer = observer if observer is not None else type(self).observer
+        orienter = orienter if orienter is not None else type(self).orienter
+        decider = decider if decider is not None else type(self).decider
+        actor = actor if actor is not None else type(self).actor
+
         if observer is None:
             raise ValueError("observer is required")
         if orienter is None:
@@ -76,15 +89,19 @@ class TheseusAgent:
             raise ValueError("decider is required")
         if actor is None:
             raise ValueError("actor is required")
+
+        max_cycles = max_cycles if max_cycles is not None else type(self).max_cycles
         if max_cycles < 1:
             raise ValueError("max_cycles must be >= 1")
+
+        memory = memory if memory is not None else type(self).memory
 
         self.observer = observer
         self.orienter = orienter
         self.decider = decider
         self.actor = actor
         self.memory: list[MemoryModule] = memory if memory is not None else []
-        self.ui = ui
+        self.ui = ui if ui is not None else type(self).ui
         self.max_cycles = max_cycles
 
     def process(self, user_input: str) -> str:
