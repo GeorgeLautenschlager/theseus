@@ -282,3 +282,18 @@ class TestSubclassDeclaration:
         agent = Declared(observer=override)
         assert agent.observer is override
         assert agent.orienter is Declared.orienter
+
+
+class TestRun:
+    def test_run_delegates_to_transport(self):
+        observer, orienter, decider, actor = _mocks()
+        ui = Mock()
+        agent = TheseusAgent(observer, orienter, decider, actor, ui=ui)
+        agent.run()
+        ui.start.assert_called_once_with(agent)
+
+    def test_run_without_transport_raises(self):
+        observer, orienter, decider, actor = _mocks()
+        agent = TheseusAgent(observer, orienter, decider, actor, ui=None)
+        with pytest.raises(RuntimeError, match="transport"):
+            agent.run()

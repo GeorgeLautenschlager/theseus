@@ -38,6 +38,7 @@ class MemoryModule(Protocol):
 
 
 class UI(Protocol):
+    def start(self, agent: TheseusAgent) -> None: ...
     def render(self, content: str) -> None: ...
 
 
@@ -116,3 +117,10 @@ class TheseusAgent:
                     self.ui.render(result)
                 return result
         raise MaxCyclesExceeded(self.max_cycles, last_action)
+
+    def run(self) -> None:
+        if self.ui is None:
+            raise RuntimeError(
+                "no transport configured; set `ui` or call process() directly"
+            )
+        self.ui.start(self)
