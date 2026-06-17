@@ -8,6 +8,9 @@ class TextualUI:
     def __init__(self) -> None:
         self._log: RichLog | None = None
 
+    def start(self, agent) -> None:
+        AgentApp(agent, self).run()
+
     def set_log(self, log: RichLog) -> None:
         self._log = log
 
