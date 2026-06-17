@@ -50,7 +50,7 @@ The reference file's only remaining cost is a stack of explicit imports — acce
 
 ### 2. Slot resolution in `TheseusAgent.__init__`
 
-The constructor resolves each slot in priority order: **explicit keyword argument → subclass class attribute → default/validation**. This keeps the existing direct-injection interface (and the current test suite) working unchanged, because an explicitly passed module always wins.
+The constructor resolves each slot in priority order: **explicit keyword argument → subclass class attribute → default/validation**. This keeps the existing direct-injection interface (and all 16 current tests) working unchanged, because an explicitly passed module always wins.
 
 Base class gains class-level slot attributes:
 
@@ -195,7 +195,7 @@ The relocated class bodies are unchanged from their current form in `simple_agen
 
 ## Testing
 
-The existing 13 tests in `tests/test_theseus_agent.py` must continue to pass unchanged — slot resolution is designed to be backward compatible with direct injection.
+The existing 16 tests in `tests/test_theseus_agent.py` must continue to pass unchanged — slot resolution is designed to be backward compatible with direct injection.
 
 New tests:
 
