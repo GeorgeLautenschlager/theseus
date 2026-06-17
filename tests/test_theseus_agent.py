@@ -250,3 +250,50 @@ class TestProcess:
         result = agent.process("hi")
 
         assert result == "output"
+
+class TestSubclassDeclaration:
+    def test_subclass_class_attributes_resolve_into_slots(self):
+        class Declared(TheseusAgent):
+            observer = Mock()
+            orienter = Mock()
+            decider = Mock()
+            actor = Mock()
+            memory = [Mock()]
+            ui = Mock()
+            max_cycles = 7
+
+        agent = Declared()
+        assert agent.observer is Declared.observer
+        assert agent.orienter is Declared.orienter
+        assert agent.decider is Declared.decider
+        assert agent.actor is Declared.actor
+        assert agent.memory is Declared.memory
+        assert agent.ui is Declared.ui
+        assert agent.max_cycles == 7
+
+    def test_explicit_kwarg_overrides_class_attribute(self):
+        class Declared(TheseusAgent):
+            observer = Mock()
+            orienter = Mock()
+            decider = Mock()
+            actor = Mock()
+
+        override = Mock()
+        agent = Declared(observer=override)
+        assert agent.observer is override
+        assert agent.orienter is Declared.orienter
+
+
+class TestRun:
+    def test_run_delegates_to_transport(self):
+        observer, orienter, decider, actor = _mocks()
+        ui = Mock()
+        agent = TheseusAgent(observer, orienter, decider, actor, ui=ui)
+        agent.run()
+        ui.start.assert_called_once_with(agent)
+
+    def test_run_without_transport_raises(self):
+        observer, orienter, decider, actor = _mocks()
+        agent = TheseusAgent(observer, orienter, decider, actor, ui=None)
+        with pytest.raises(RuntimeError, match="transport"):
+            agent.run()
