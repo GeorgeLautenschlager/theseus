@@ -11,5 +11,7 @@ Theseus is my Rotrod, the project car. I'm building it's capabilities just to se
 - reflection systems
 - TUIs, GUIs, and other oooies
 - "sensory organs", such as Gemma 4 E4B converting a live audio/video feed into semantic inputs
+- at least one OpenTelemtry tracer, possibly others
+- a "gold set" and other agent evaluation tooling
 
 The current plan is to build the main agent loop as an OODA loop because... I'm a big fan of the works of John Boyd.
