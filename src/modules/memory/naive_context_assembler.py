@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime
 
-
+# KEEP BUT RENAME
 class NaiveContextAssembler:
     """SQLite-backed episodic memory. Stores pre-formatted lines, retrieves full history."""
 

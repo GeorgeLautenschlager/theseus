@@ -1,7 +1,7 @@
 # Theseus - Many Parts, Same Agent
 
 Theseus is my Rotrod, the project car. I'm building it's capabilities just to see how capable I can build it. Out of this little hobby, I hope to produce nicely packaged modules that will eventually provide a "construction kit". That's planned to include:
-- model providers
+- model providers (Ollama, LM Studio, OpenRouter, Claude, etc.)
 - context assemblers
 - reasoning engines
 - memory modules of several types, including:
@@ -10,7 +10,7 @@ Theseus is my Rotrod, the project car. I'm building it's capabilities just to se
   - procedural
 - reflection systems
 - TUIs, GUIs, and other oooies
-- "sensory organs", such as Gemma 4 E4B converting a live audio/video feed into semantic inputs
+- "sensory organs", such as Gemma 4 E4B intelligently feeding keyframes to a larger model
 - at least one OpenTelemtry tracer, possibly others
 - a "gold set" and other agent evaluation tooling
 
