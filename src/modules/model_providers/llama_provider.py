@@ -4,7 +4,7 @@ from openai import OpenAI
 class LlamaProvider:
     def __init__(
         self,
-        base_url: str = "http://100.126.84.49:8080/v1",
+        base_url: str = "http://127.0.0.1:11434/v1",
         model: str = "gemma",
         api_key: str = "none",
     ):

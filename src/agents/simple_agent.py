@@ -18,7 +18,7 @@ from src.modules.user_interfaces.textual_ui import TextualUI
 class SimpleAgent(TheseusAgent):
     observer = NaiveObserver()
     orienter = NaiveOrienter()
-    decider = LLMDecider(LlamaProvider())
+    decider = LLMDecider(LlamaProvider(base_url="http://127.0.0.1:11434/v1", model="gemma4:e4b"))
     actor = NaiveActor()
     memory = [NaiveContextAssembler()]
     ui = TextualUI()
