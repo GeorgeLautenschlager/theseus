@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from model_provider import ModelProvider
+from .model_provider import ModelProvider
 
 
-class LlamaProvider(ModelProvider):
+class OllamaProvider(ModelProvider):
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:11434/v1",

@@ -20,7 +20,7 @@ class ModelProvider(ABC):
         self,
         prompt: str,
         system_prompt: str | None = None,
-        max_tokens: int = 512,
+        max_tokens: int = 8196,
         temperature: float = 0.7,
     ) -> str:
         messages = []
