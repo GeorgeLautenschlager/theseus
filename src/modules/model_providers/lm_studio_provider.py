@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from model_provider import ModelProvider
+from .model_provider import ModelProvider
 
 
 class LmStudioProvider(ModelProvider):

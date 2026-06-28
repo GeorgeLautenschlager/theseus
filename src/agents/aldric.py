@@ -1,3 +1,5 @@
+from src.modules.model_providers.lm_studio_provider import LmStudioProvider
+from src.modules.model_providers.claude_provider import ClaudeProvider
 from src.modules.chat_effector import ChatEffector
 from src.modules.chat_observer import ChatObserver
 from src.modules.cognitive_core import CognitiveCore
@@ -27,7 +29,9 @@ class Aldric:
         self.chat_effector = ChatEffector()
         self.core = CognitiveCore(
             model_providers=[
+                LmStudioProvider(model="gemma-4-e4b-it-qat-nvfp4"),
                 OllamaProvider(model="gemma4:e4b"),
+                ClaudeProvider(),
             ],
             effector_callbacks={"chat_effector_callback": self.chat_effector.respond_callback},
         )
