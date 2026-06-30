@@ -1,3 +1,4 @@
+from src.modules.model_providers.llama_cpp_provider import LlamaCppProvider
 from src.modules.model_providers.lm_studio_provider import LmStudioProvider
 from src.modules.model_providers.claude_provider import ClaudeProvider
 from src.modules.chat_effector import ChatEffector
@@ -29,7 +30,11 @@ class Aldric:
         self.chat_effector = ChatEffector()
         self.core = CognitiveCore(
             model_providers=[
+                # TODO: we need to confirm the model identifers here
+                # TODO: this probably ought to be a dict, with named lists for specific applications
                 LmStudioProvider(model="gemma-4-e4b-it-qat-nvfp4"),
+                LlamaCppProvider(model="gemma-4-e4b-it-qat", local=True),
+                LlamaCppProvider(model="gemma-4-26b-it-qat", local=False),
                 OllamaProvider(model="gemma4:e4b"),
                 ClaudeProvider(),
             ],
