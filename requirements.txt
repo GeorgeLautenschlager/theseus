@@ -1,0 +1,4 @@
+openai
+textual
+sentence-transformers
+pytest

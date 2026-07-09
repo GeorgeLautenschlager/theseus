@@ -3,14 +3,14 @@ from src.modules.model_providers.lm_studio_provider import LmStudioProvider
 from src.modules.model_providers.claude_provider import ClaudeProvider
 from src.modules.chat_effector import ChatEffector
 from src.modules.chat_observer import ChatObserver
-from src.modules.cognitive_core import CognitiveCore
+from src.modules.chat_cognitive_core import ChatCognitiveCore
 from src.modules.model_providers.ollama_provider import OllamaProvider
 
 
 class Aldric:
     """Aldric is an agent built with the Theseus architecture.
 
-    Aldric is build in concentric layers. In the centre is an LLM, surrounded by a
+    Aldric is built in concentric layers. In the centre is an LLM, surrounded by a
     truncated OODA loop. Orient, Decide and Act make up what is called the Cognitive Core.
     Observers, are outside of that, along with memory systems and more complex subagents that
     function as sensory surrogates, feeding pre-processed information into the core.
@@ -28,13 +28,14 @@ class Aldric:
         self
     ):
         self.chat_effector = ChatEffector()
-        self.core = CognitiveCore(
+        self.core = ChatCognitiveCore(
             model_providers=[
                 # TODO: we need to confirm the model identifers here
                 # TODO: this probably ought to be a dict, with named lists for specific applications
                 LmStudioProvider(model="gemma-4-e4b-it-qat-nvfp4"),
-                LlamaCppProvider(model="gemma-4-e4b-it-qat", local=True),
-                LlamaCppProvider(model="gemma-4-26b-it-qat", local=False),
+                LmStudioProvider(model="gemma-4-26b-a4b-it-qat"),
+                LlamaCppProvider(model="gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL", local=False),
+                LlamaCppProvider(model="gemma-4-E2B-it-qat-GGUF:UD-Q4_K_XL", local=True),
                 OllamaProvider(model="gemma4:e4b"),
                 ClaudeProvider(),
             ],
