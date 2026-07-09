@@ -16,7 +16,7 @@ class ClaudeProvider(ModelProvider):
         max_tokens: int = 8196,
         temperature: float = 0.7,
     ) -> str:
-        cmd = ["claude", "-p", prompt, "--model", self.model, "--no-memory"]
+        cmd = ["claude", "-p", prompt, "--model", self.model]
         if system_prompt:
             cmd += ["--system-prompt", system_prompt]
 
