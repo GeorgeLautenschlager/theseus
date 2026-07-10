@@ -1,0 +1,2 @@
+{% from "_debug_macros.html" import debug_row %}
+{% for event in events %}{{ debug_row(event, oob=True) }}{% endfor %}

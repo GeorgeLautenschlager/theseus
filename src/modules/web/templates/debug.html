@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Theseus Debug</title>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/chat.css">
+<link rel="stylesheet" href="/static/debug.css">
+<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+<script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+</head>
+<body>
+{% from "_debug_macros.html" import debug_row, load_older_sentinel %}
+<div class="debug-screen">
+
+  <header class="debug-header">
+    <div class="avatar">T</div>
+    <div class="identity">
+      <div class="agent-name">Theseus Debug</div>
+      <div class="status-label">StimulusLog</div>
+    </div>
+    <a href="/" class="debug-link">← Chat</a>
+  </header>
+
+  <div id="debug-log" class="debug-log" hx-ext="sse" sse-connect="/debug/events">
+    <div id="sse-listener" sse-swap="message" hx-swap="none"></div>
+    {% if has_more %}{{ load_older_sentinel(oldest_id) }}{% endif %}
+    {% if not events %}
+    <div class="empty-state">No stimuli recorded yet.</div>
+    {% endif %}
+    {% for event in events %}{{ debug_row(event) }}{% endfor %}
+  </div>
+
+</div>
+<script src="/static/debug.js"></script>
+</body>
+</html>

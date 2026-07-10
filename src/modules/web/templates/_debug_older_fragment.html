@@ -1,0 +1,3 @@
+{% from "_debug_macros.html" import debug_row, load_older_sentinel %}
+{% if has_more %}{{ load_older_sentinel(oldest_id) }}{% endif %}
+{% for event in events %}{{ debug_row(event) }}{% endfor %}
