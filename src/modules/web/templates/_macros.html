@@ -1,0 +1,46 @@
+{% macro message_row(role, content_html, time, oob=False) -%}
+<div class="row {{ 'row-user' if role == 'user' else 'row-assistant' }}"{% if oob %} hx-swap-oob="beforeend:#messages"{% endif %}>
+  <div class="col">
+    <div class="bubble {{ 'bubble-user' if role == 'user' else 'bubble-assistant' }}">{{ content_html | safe }}</div>
+    <div class="timestamp">{{ time }}</div>
+  </div>
+</div>
+{%- endmacro %}
+
+{% macro typing_indicator(visible, oob=False) -%}
+<div id="typing-indicator"{% if oob %} hx-swap-oob="true"{% endif %}>
+{%- if visible %}
+  <div class="row row-assistant">
+    <div class="bubble bubble-assistant typing-bubble">
+      <span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>
+    </div>
+  </div>
+{%- endif %}
+</div>
+{%- endmacro %}
+
+{% macro status(thinking, oob=False) -%}
+<div id="status" class="status-row"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <div class="status-dot {{ 'status-dot-thinking' if thinking else 'status-dot-online' }}"></div>
+  <div class="status-label">{{ 'Thinking…' if thinking else 'Online' }}</div>
+</div>
+{%- endmacro %}
+
+{% macro composer_controls(disabled, oob=False) -%}
+<div id="composer-controls" class="composer-controls"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <textarea
+    id="composer-input"
+    name="message"
+    class="composer-input"
+    placeholder="Message Theseus…"
+    rows="1"
+    {% if disabled %}disabled{% endif %}
+  ></textarea>
+  <button
+    id="composer-send"
+    class="composer-send"
+    type="submit"
+    disabled
+  >→</button>
+</div>
+{%- endmacro %}

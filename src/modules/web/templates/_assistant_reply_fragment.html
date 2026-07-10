@@ -1,0 +1,16 @@
+{% from "_macros.html" import status, composer_controls %}
+{% if is_first %}
+<div class="row row-assistant" hx-swap-oob="beforeend:#messages">
+  <div class="col">
+    <div id="bubble-{{ bubble_id }}" class="bubble bubble-assistant">{{ content_html | safe }}</div>
+    <div class="timestamp">{{ time }}</div>
+  </div>
+</div>
+<div id="typing-indicator" hx-swap-oob="true"></div>
+{%- else %}
+<div hx-swap-oob="innerHTML:#bubble-{{ bubble_id }}">{{ content_html | safe }}</div>
+{%- endif %}
+{%- if is_done %}
+{{ status(thinking=False, oob=True) }}
+{{ composer_controls(disabled=False, oob=True) }}
+{%- endif %}

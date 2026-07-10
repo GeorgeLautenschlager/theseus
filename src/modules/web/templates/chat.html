@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Theseus Chat</title>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/chat.css">
+<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+<script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+</head>
+<body>
+{% from "_macros.html" import message_row, typing_indicator, status, composer_controls %}
+<div class="chat-screen">
+
+  <header class="chat-header">
+    <div class="avatar">T</div>
+    <div class="identity">
+      <div class="agent-name">Theseus</div>
+      {{ status(thinking=False) }}
+    </div>
+  </header>
+
+  <div id="messages" class="messages" hx-ext="sse" sse-connect="/events">
+    <div id="sse-listener" sse-swap="message" hx-swap="none"></div>
+    {% if not transcript %}
+    <div class="empty-state">Send a message to start the conversation.</div>
+    {% endif %}
+    {% for entry in transcript %}
+      {{ message_row(role=entry.role, content_html=entry.content_html, time=entry.time) }}
+    {% endfor %}
+    {{ typing_indicator(visible=False) }}
+  </div>
+
+  <form
+    id="composer"
+    class="composer"
+    hx-post="/chat"
+    hx-target="#messages"
+    hx-swap="beforeend"
+  >
+    {{ composer_controls(disabled=False) }}
+  </form>
+
+</div>
+<script src="/static/chat.js"></script>
+</body>
+</html>
