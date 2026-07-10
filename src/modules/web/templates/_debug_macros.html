@@ -1,0 +1,21 @@
+{% macro debug_row(event, oob=False) -%}
+<div class="debug-row" data-type="{{ event.type }}"
+     {% if oob %}hx-swap-oob="beforeend:#debug-log"{% endif %}>
+  <div class="debug-row-meta">
+    <span class="debug-time" title="{{ event.ts.isoformat() }}">{{ event.ts.astimezone().strftime('%H:%M:%S') }}</span>
+    <span class="debug-actor">{{ event.actor }}</span>
+    <span class="debug-type-badge">{{ event.type }}</span>
+    <span class="debug-id" title="event id">{{ event.id }}</span>
+  </div>
+  <pre class="debug-content code-block"><code>{{ event.content | pretty_json }}</code></pre>
+</div>
+{%- endmacro %}
+
+{% macro load_older_sentinel(oldest_id) -%}
+<div id="load-older" class="load-older"
+     hx-get="/debug/older?before={{ oldest_id }}&limit=25"
+     hx-trigger="intersect once root:#debug-log threshold:0.1"
+     hx-swap="outerHTML" hx-target="this">
+  Loading older events…
+</div>
+{%- endmacro %}

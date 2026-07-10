@@ -6,7 +6,9 @@ pairs with `ChatEffector`, but over HTTP/SSE instead of stdin/stdout.
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -20,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
+from src.modules.web.debug_pagination import most_recent_page, older_batch
 from src.modules.web.markdown import render_markdown
 
 _WEB_DIR = Path(__file__).parent / "web"
@@ -27,6 +30,8 @@ _TEMPLATES_DIR = _WEB_DIR / "templates"
 _STATIC_DIR = _WEB_DIR / "static"
 
 _SSE_POLL_TIMEOUT_SECONDS = 15
+_DEBUG_PAGE_SIZE = 25
+_DEBUG_POLL_INTERVAL_SECONDS = 1.0
 
 
 class WebObserver:
@@ -65,7 +70,13 @@ class WebObserver:
         self._listeners: list[Queue] = []
         self._streaming: dict[str, str] = {}
         self._lock = threading.Lock()
+        self._debug_listeners: list[Queue] = []
+        self._debug_last_id: str | None = None
+        self._debug_poll_thread: threading.Thread | None = None
         self._templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+        self._templates.env.filters["pretty_json"] = lambda content: json.dumps(
+            content, indent=2, ensure_ascii=False
+        )
         self.app = self._build_app()
 
     # -- called by WebEffector ---------------------------------------------
@@ -138,10 +149,10 @@ class WebObserver:
                 done=True,
             )
 
-    async def _event_stream(self, request: Request):
+    async def _sse_stream(self, request: Request, listeners: list[Queue]):
         queue: Queue = Queue()
         with self._lock:
-            self._listeners.append(queue)
+            listeners.append(queue)
         try:
             yield "retry: 2000\n\n"
             while True:
@@ -155,8 +166,67 @@ class WebObserver:
                 yield _format_sse_event(fragment)
         finally:
             with self._lock:
-                if queue in self._listeners:
-                    self._listeners.remove(queue)
+                if queue in listeners:
+                    listeners.remove(queue)
+
+    # -- debug mode ------------------------------------------------------
+
+    def _debug_initial_context(self) -> dict:
+        events = self.stimulus_log.read_all() if self.stimulus_log is not None else []
+        page, has_more = most_recent_page(events, _DEBUG_PAGE_SIZE)
+        if page:
+            with self._lock:
+                self._debug_last_id = max(self._debug_last_id or "", page[-1].id)
+        return {"events": page, "has_more": has_more, "oldest_id": page[0].id if page else None}
+
+    def _debug_older_context(self, before: str, limit: int) -> dict:
+        limit = max(1, min(limit, 200))
+        events = self.stimulus_log.read_all() if self.stimulus_log is not None else []
+        batch, has_more = older_batch(events, before_id=before, limit=limit)
+        return {"events": batch, "has_more": has_more, "oldest_id": batch[0].id if batch else before}
+
+    def _ensure_debug_poll_thread(self) -> None:
+        with self._lock:
+            if self._debug_poll_thread is not None and self._debug_poll_thread.is_alive():
+                return
+            self._debug_poll_thread = threading.Thread(target=self._debug_poll_loop, daemon=True)
+            self._debug_poll_thread.start()
+
+    def _debug_poll_loop(self) -> None:
+        """Broadcast newly appended StimulusEvents to open /debug tabs.
+
+        StimulusLog has no subscriber mechanism (multiple independent
+        producers write to it, and its own docstring commits it to "no
+        substrate assumptions"), so this polls read_all() instead of hooking
+        append() — keeps all the new complexity inside WebObserver. Runs
+        only while at least one debug tab is connected; self-terminates
+        otherwise, restarted lazily by _ensure_debug_poll_thread.
+        """
+        while True:
+            time.sleep(_DEBUG_POLL_INTERVAL_SECONDS)
+            with self._lock:
+                listeners = list(self._debug_listeners)
+                cursor = self._debug_last_id
+            if not listeners:
+                return
+            if self.stimulus_log is None:
+                continue
+            events = self.stimulus_log.read_all()
+            if cursor is None:
+                with self._lock:
+                    self._debug_last_id = events[-1].id if events else None
+                continue
+            new_events = [e for e in events if e.id > cursor]
+            if not new_events:
+                continue
+            fragment = self._templates.get_template("_debug_new_rows_fragment.html").render(
+                events=new_events
+            )
+            with self._lock:
+                self._debug_last_id = max(self._debug_last_id or "", new_events[-1].id)
+                listeners = list(self._debug_listeners)
+            for queue in listeners:
+                queue.put(fragment)
 
     def _build_app(self) -> FastAPI:
         app = FastAPI()
@@ -178,7 +248,28 @@ class WebObserver:
 
         @app.get("/events")
         async def events(request: Request):
-            return StreamingResponse(self._event_stream(request), media_type="text/event-stream")
+            return StreamingResponse(
+                self._sse_stream(request, self._listeners), media_type="text/event-stream"
+            )
+
+        @app.get("/debug", response_class=HTMLResponse)
+        async def debug_page(request: Request):
+            return self._templates.TemplateResponse(request, "debug.html", self._debug_initial_context())
+
+        @app.get("/debug/older", response_class=HTMLResponse)
+        async def debug_older(request: Request):
+            before = request.query_params.get("before", "")
+            limit = int(request.query_params.get("limit", _DEBUG_PAGE_SIZE))
+            return self._templates.TemplateResponse(
+                request, "_debug_older_fragment.html", self._debug_older_context(before, limit)
+            )
+
+        @app.get("/debug/events")
+        async def debug_events(request: Request):
+            self._ensure_debug_poll_thread()
+            return StreamingResponse(
+                self._sse_stream(request, self._debug_listeners), media_type="text/event-stream"
+            )
 
         return app
 

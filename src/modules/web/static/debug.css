@@ -1,0 +1,88 @@
+.debug-screen {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+.debug-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 24px;
+  height: 64px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.debug-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.load-older {
+  text-align: center;
+  padding: 10px;
+  font-size: 12px;
+  color: var(--text-status);
+}
+
+.debug-row {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+
+.debug-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.debug-time {
+  color: var(--text-timestamp);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.debug-actor {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.debug-type-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--border);
+  color: var(--text-primary);
+}
+
+.debug-row[data-type="chat_message"] .debug-type-badge { background: oklch(0.4 0.12 250); color: #fff; }
+.debug-row[data-type="decision"] .debug-type-badge { background: oklch(0.4 0.12 150); color: #fff; }
+.debug-row[data-type="observation"] .debug-type-badge { background: oklch(0.4 0.12 80); color: #fff; }
+.debug-row[data-type="exchange"] .debug-type-badge { background: oklch(0.4 0.12 320); color: #fff; }
+.debug-row[data-type="capture"] .debug-type-badge { background: oklch(0.4 0.12 20); color: #fff; }
+
+.debug-id {
+  margin-left: auto;
+  color: var(--text-placeholder);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+}
+
+.debug-content {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
