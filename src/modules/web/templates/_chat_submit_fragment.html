@@ -1,0 +1,5 @@
+{% from "_macros.html" import message_row, typing_indicator, status, composer_controls %}
+{{ message_row(role="user", content_html=content_html, time=time) }}
+{{ typing_indicator(visible=True, oob=True) }}
+{{ status(thinking=True, oob=True) }}
+{{ composer_controls(disabled=True, oob=True) }}
