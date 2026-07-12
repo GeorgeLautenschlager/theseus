@@ -34,7 +34,7 @@ _DEBUG_PAGE_SIZE = 25
 _DEBUG_POLL_INTERVAL_SECONDS = 1.0
 
 
-class WebObserver:
+class WebChatUIObserver:
     """Serves the Theseus Chat web UI and feeds user messages into the agent.
 
     Mirrors ChatObserver's role — append the incoming stimulus, then hand off
@@ -132,12 +132,12 @@ class WebObserver:
             self.stimulus_log.append(
                 actor="user", type="chat_message", content={"message": message}
             )
-        threading.Thread(target=self._run_core, args=(message,), daemon=True).start()
+        threading.Thread(target=self._run_core, args=(), daemon=True).start()
         return self._templates.get_template("_chat_submit_fragment.html").render(**entry)
 
-    def _run_core(self, message: str) -> None:
+    def _run_core(self) -> None:
         try:
-            self.orient_chat_message_callback(message)
+            self.orient_chat_message_callback()
         except Exception:
             # Otherwise a failed orient() (LLM error, bad JSON, ...) leaves
             # the UI stuck mid-"Thinking…" forever with the composer
@@ -279,7 +279,12 @@ class WebObserver:
         `observe_chat_message()`-style calls."""
         import uvicorn
 
-        uvicorn.run(self.app, host=host, port=port)
+        # Without this, uvicorn's graceful shutdown waits indefinitely for
+        # open connections to close on their own — but the SSE endpoints
+        # (/events, /debug/events) are infinite streams that only end when
+        # the browser disconnects, so Ctrl+C would hang forever with any
+        # tab left open.
+        uvicorn.run(self.app, host=host, port=port, timeout_graceful_shutdown=3)
 
 
 def _format_sse_event(html_fragment: str) -> str:

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from src.modules.web_chat_ui_observer import WebChatUIObserver
+from src.modules.web_chat_ui_effector import WebChatUIEffector
 from src.modules.model_providers.claude_provider import ClaudeProvider
 from src.modules.chat_observer import ChatObserver
 from src.modules.stimulus_log import StimulusLog
@@ -28,23 +30,26 @@ Your first duty is to the truth. Don't sacrifice that even if it inhibits your a
 """
 
 def main() -> None:
+    stimulus_log = StimulusLog(path="stimulus_log.jsonl")
+
     core = CognitiveCore(
         constitution=constitution,
         model_providers=[
-            ClaudeProvider(model="claude-opus-4-8"),
-            # LmStudioProvider(model="gemma-4-26b-a4b-it-qat"),
+            # ClaudeProvider(model="haiku"),
+            LmStudioProvider(model="gemma-4-26b-a4b-it-qat"),
         ],
-        effector_callbacks={"chat_effector_callback": ChatEffector().respond_callback},
-        stimulus_log=StimulusLog(path="stimulus_log.jsonl"),
+        effector_callbacks={},
+        stimulus_log=stimulus_log,
     )
 
-    chat_observer = ChatObserver(
-        stimulus_log=core.stimulus_log,
+    web_observer = WebChatUIObserver(
+        stimulus_log=stimulus_log,
         orient_chat_message_callback=core.orient
     )
 
-    while True:
-        chat_observer.observe_chat_message()
+    core.effector_callbacks = {WebChatUIEffector.__name__: WebChatUIEffector(web_observer=web_observer).respond_callback}
+
+    web_observer.serve()
 
 
 if __name__ == "__main__":

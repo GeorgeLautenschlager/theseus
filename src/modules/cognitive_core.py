@@ -5,6 +5,7 @@ from typing import List
 
 from typer import prompt
 
+from src.modules.web_chat_ui_effector import WebChatUIEffector
 from src.modules.stimulus_log import StimulusLog
 from src.modules.context_assembler import ContextAssembler
 
@@ -59,50 +60,41 @@ class CognitiveCore(ModelProvider):
             str(context) +
             "\n" +
             "The current system time is " + str(datetime.now()) + "." +
-            "Given recent stimuli and the capabilities described in your system prompt, " + 
-            "decide what to do next and emit that in the following JSON format: " +
-            '{"action": "name of effector to use", "rationale": "reasoning behind the action"}'
+            f"Select one of the following effectors: {'|'.join(self.effector_callbacks.keys())}, and provide a rationale for your choice. "
         )
 
         system_prompt = (
             str(self.constitution) +
-            "You have access to the following tools to help you decide:" +
-            "You can effect the world through the following effectors: [ChatEffector]" +
-            "Emit your decision as JSON in the following format with NO OTHER PARAMETERS: " +
-            '{"action": "name of effector to use", "rationale": "reasoning behind the action"}'
+            f"You can effect the world through the following effectors: [{', '.join(self.effector_callbacks.keys())}]" +
+            "Emit your decision as JSON in the following format: " +
+            f"{{'action': <{'|'.join(self.effector_callbacks.keys())}>, 'rationale': <reasoning for your decision>}}"
         )
 
         raw_response = model_provider.chat(
             prompt=prompt,
             system_prompt=system_prompt,
         )
+        print(f"Raw response from model provider: {raw_response}")
         action = self._parse_json_response(raw_response)
 
         self.stimulus_log.append(
             actor="Tam",
             type="decision",
-            content={"action": action["action"], "rationale": action["rationale"]},
-        )
-
-        print(
-            "########### ########### ########### \n" +
-            f"Decided on action: {action['action']}\n" +
-            f"for rationale: {action['rationale']}\n" +
-            "########### ########### ########### \n"
+            content={"action": action["action"], "rationale": action["rationale"], "raw_response": raw_response},
         )
 
         self.act(action, context)
 
     def act(self, action: dict, context: str):
-        if action["action"] == "ChatEffector":
-            self.chat_effector_callback = self.effector_callbacks.get("chat_effector_callback")
+        if action["action"] == WebChatUIEffector.__name__:
+            self.chat_effector_callback = self.effector_callbacks.get( action["action"])
 
             prompt = (
                 "Your StimulusLog records events you have recently experienced. This is your recent history:\n" +
                 str(context) +
                 "\n" +
-                "Given that recent stimuli " + 
-                "compose a response for the chat interface."
+                "Given that recent stimuli " +
+                "compose a response for the web interface."
             )
 
             system_prompt = self.constitution
