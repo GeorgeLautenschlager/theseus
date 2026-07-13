@@ -5,8 +5,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from theseus.agentic_memory import AgenticMemory
 from theseus.cognitive_core import CognitiveCore
 from theseus.cognitive_prompts import WAIT_ACTION
+from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusLog
 
 
@@ -29,13 +31,14 @@ def make_provider(responses):
     return provider
 
 
-def make_core(tmp_path, provider, effectors=None):
+def make_core(tmp_path, provider, effectors=None, memory=None):
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
     return CognitiveCore(
         constitution="You are Tam.",
         model_providers=[provider],
         effectors=effectors or {},
         stimulus_log=stimulus_log,
+        memory=memory,
     )
 
 
@@ -159,3 +162,89 @@ class TestAct:
 
         events = core.stimulus_log.read_all()
         assert all(e.actor == "Aldric" for e in events)
+
+
+WAIT_DECISION = json.dumps({"rationale": "Nothing to do.", "action": WAIT_ACTION})
+ENRICHMENT = json.dumps(
+    {"context": "George introduced himself.", "keywords": ["George"], "tags": ["identity"]}
+)
+
+
+def make_memory(tmp_path, provider):
+    return AgenticMemory(
+        model_providers=[provider],
+        store=MemoryStore(tmp_path / "memory.jsonl"),
+    )
+
+
+class TestMemoryIntegration:
+    def test_orient_forms_a_note_post_cycle(self, tmp_path):
+        provider = make_provider([WAIT_DECISION, ENRICHMENT])
+        provider.embed.return_value = [1.0, 0.0]
+        memory = make_memory(tmp_path, provider)
+        core = make_core(tmp_path, provider, memory=memory)
+        stimulus = core.stimulus_log.append(
+            actor="george", type="exchange", content={"message": "Hello, my name is George."}
+        )
+
+        core.orient()
+
+        notes = memory.store.read_all()
+        assert len(notes) == 1
+        assert notes[0].context == "George introduced himself."
+        # The note spans everything in the cycle: the stimulus and the decision it produced.
+        decision_event = core.stimulus_log.read_all()[-1]
+        assert notes[0].source_span == (stimulus.id, decision_event.id)
+
+    def test_formation_resumes_from_high_water_mark(self, tmp_path):
+        provider = make_provider(
+            [
+                WAIT_DECISION, ENRICHMENT,                       # cycle 1: decide, construct
+                WAIT_DECISION, ENRICHMENT, json.dumps({"links": []}),  # cycle 2: + link decision
+            ]
+        )
+        provider.embed.return_value = [1.0, 0.0]
+        memory = make_memory(tmp_path, provider)
+        core = make_core(tmp_path, provider, memory=memory)
+
+        core.stimulus_log.append(actor="george", type="exchange", content={"message": "First."})
+        core.orient()
+        second = core.stimulus_log.append(
+            actor="george", type="exchange", content={"message": "Second."}
+        )
+        core.orient()
+
+        notes = memory.store.read_all()
+        assert len(notes) == 2
+        # The second note starts exactly where the first left off — no re-consolidation.
+        assert notes[1].source_span[0] == second.id
+        assert "First." not in notes[1].content
+
+    def test_decide_prompt_contains_retrieved_memories(self, tmp_path):
+        provider = make_provider(
+            [ENRICHMENT, WAIT_DECISION, ENRICHMENT, json.dumps({"links": []})]
+        )
+        provider.embed.return_value = [1.0, 0.0]
+        memory = make_memory(tmp_path, provider)
+        core = make_core(tmp_path, provider, memory=memory)
+        # Seed one note through the real pipeline, then start a fresh cycle.
+        core.stimulus_log.append(actor="george", type="exchange", content={"message": "I am George."})
+        memory.form(core.stimulus_log.read_all())
+        core.stimulus_log.append(actor="george", type="exchange", content={"message": "Who am I?"})
+
+        core.orient()
+
+        decide_prompt = provider.chat.call_args_list[1].kwargs["prompt"]
+        assert "<memories>" in decide_prompt
+        assert "George introduced himself." in decide_prompt
+
+    def test_without_memory_behaves_as_before(self, tmp_path):
+        provider = make_provider([WAIT_DECISION])
+        core = make_core(tmp_path, provider)
+        core.stimulus_log.append(actor="george", type="exchange", content={"message": "Hello."})
+
+        core.orient()
+
+        assert provider.chat.call_count == 1
+        assert provider.embed.call_count == 0
+        assert "<memories>" not in provider.chat.call_args_list[0].kwargs["prompt"]

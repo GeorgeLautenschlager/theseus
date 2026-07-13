@@ -7,13 +7,19 @@ from openai import OpenAI
 class ModelProvider(ABC):
     """Base class for LLM providers using OpenAI-compatible APIs."""
 
+    # Class-level default so subclasses that skip __init__ (e.g. ClaudeProvider)
+    # still fail cleanly in embed() rather than with AttributeError.
+    embedding_model: str | None = None
+
     def __init__(
         self,
         base_url: str,
         model: str,
         api_key: str,
+        embedding_model: str | None = None,
     ):
         self.model = model
+        self.embedding_model = embedding_model
         self._client = OpenAI(base_url=base_url, api_key=api_key)
 
     @abstractmethod
@@ -49,3 +55,12 @@ class ModelProvider(ABC):
             **extra_kwargs,
         )
         return response.choices[0].message.content
+
+    def embed(self, text: str) -> list[float]:
+        if self.embedding_model is None:
+            raise RuntimeError(
+                f"{type(self).__name__} has no embedding_model configured; "
+                "pass embedding_model=... to use embeddings."
+            )
+        response = self._client.embeddings.create(model=self.embedding_model, input=text)
+        return response.data[0].embedding

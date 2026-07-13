@@ -11,8 +11,9 @@ class LmStudioProvider(ModelProvider):
         base_url: str = "http://100.126.84.49:1234/v1",
         model: str = "local-model",
         api_key: str = "lm-studio",
+        embedding_model: str | None = None,
     ):
-        super().__init__(base_url=base_url, model=model, api_key=api_key)
+        super().__init__(base_url=base_url, model=model, api_key=api_key, embedding_model=embedding_model)
 
     def is_available(self) -> bool:
         try:
