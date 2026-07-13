@@ -31,14 +31,14 @@ Your first duty is to the truth. Don't sacrifice that even if it inhibits your a
 """
 
 def main() -> None:
-    stimulus_log = StimulusLog(path="stimulus_log.jsonl")
+    stimulus_log = StimulusLog(path="/home/aldric/tam/v3/stimulus_log.jsonl")
 
     core = CognitiveCore(
         constitution=constitution,
         model_providers=[
-            ClaudeProvider(model="haiku"),
             LmStudioProvider(model="gemma-4-26b-a4b-it-qat"),
             OllamaProvider(model="gemma4:e4b"),
+            ClaudeProvider(model="haiku"),
         ],
         effectors={},
         stimulus_log=stimulus_log,
@@ -52,7 +52,7 @@ def main() -> None:
     web_chat_effector = WebChatUIEffector(web_observer=web_observer)
     core.effectors = {web_chat_effector.name: web_chat_effector}
 
-    web_observer.serve()
+    web_observer.serve(host="0.0.0.0", port=1337)
 
 
 if __name__ == "__main__":
