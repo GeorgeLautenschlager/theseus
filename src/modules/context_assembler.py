@@ -13,7 +13,7 @@ class ContextAssembler:
         self.stimulus_log = stimulus_log
         self.constitution = constitution
 
-    def assemble_context(self) -> dict:
+    def assemble_context(self) -> str:
         context = '\n'.join(event.to_json() for event in self.stimulus_log.read_all())
 
         return context
