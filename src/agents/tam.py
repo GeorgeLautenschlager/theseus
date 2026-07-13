@@ -40,7 +40,7 @@ def main() -> None:
             LmStudioProvider(model="gemma-4-26b-a4b-it-qat"),
             OllamaProvider(model="gemma4:e4b"),
         ],
-        effector_callbacks={},
+        effectors={},
         stimulus_log=stimulus_log,
     )
 
@@ -49,7 +49,8 @@ def main() -> None:
         orient_chat_message_callback=core.orient
     )
 
-    core.effector_callbacks = {WebChatUIEffector.__name__: WebChatUIEffector(web_observer=web_observer).respond_callback}
+    web_chat_effector = WebChatUIEffector(web_observer=web_observer)
+    core.effectors = {web_chat_effector.name: web_chat_effector}
 
     web_observer.serve()
 
