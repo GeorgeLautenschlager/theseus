@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from src.modules.stimulus_log import StimulusEvent, StimulusLog
-from src.modules.web.debug_pagination import most_recent_page, older_batch
+from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.web.debug_pagination import most_recent_page, older_batch
 
 
 def _event(id: str) -> StimulusEvent:

@@ -6,11 +6,10 @@ from pathlib import Path
 
 from fastapi.templating import Jinja2Templates
 
-from src.modules.stimulus_log import StimulusEvent
+import theseus.web
+from theseus.stimulus_log import StimulusEvent
 
-_TEMPLATES_DIR = (
-    Path(__file__).parent.parent / "src" / "modules" / "web" / "templates"
-)
+_TEMPLATES_DIR = Path(theseus.web.__file__).parent / "templates"
 
 
 def _templates() -> Jinja2Templates:

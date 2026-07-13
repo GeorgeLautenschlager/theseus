@@ -3,7 +3,7 @@ from __future__ import annotations
 import pdb
 from unittest.mock import MagicMock
 
-from src.agents.aldric import Aldric
+from theseus.agents.aldric import Aldric
 from sentence_transformers import CrossEncoder
 
 CORRECTED_LABELS_FOR_MODERN_CE = ['contradiction', 'entailment', 'neutral']

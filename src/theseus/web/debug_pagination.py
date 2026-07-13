@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import bisect
 
-from src.modules.stimulus_log import StimulusEvent
+from theseus.stimulus_log import StimulusEvent
 
 
 def most_recent_page(

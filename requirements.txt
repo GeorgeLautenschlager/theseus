@@ -1,7 +1,0 @@
-openai
-textual
-sentence-transformers
-pytest
-fastapi
-uvicorn
-jinja2

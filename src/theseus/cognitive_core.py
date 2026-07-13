@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 from typing import List
 
-from src.modules.cognitive_prompts import (
+from theseus.cognitive_prompts import (
     WAIT_ACTION,
     build_act_system_prompt,
     build_act_user_prompt,
@@ -13,9 +13,9 @@ from src.modules.cognitive_prompts import (
     build_decide_user_prompt,
     decision_json_schema,
 )
-from src.modules.context_assembler import ContextAssembler
-from src.modules.effector import Effector
-from src.modules.stimulus_log import StimulusLog
+from theseus.context_assembler import ContextAssembler
+from theseus.effector import Effector
+from theseus.stimulus_log import StimulusLog
 
 from .model_providers.model_provider import ModelProvider
 

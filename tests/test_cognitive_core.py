@@ -5,9 +5,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.modules.cognitive_core import CognitiveCore
-from src.modules.cognitive_prompts import WAIT_ACTION
-from src.modules.stimulus_log import StimulusLog
+from theseus.cognitive_core import CognitiveCore
+from theseus.cognitive_prompts import WAIT_ACTION
+from theseus.stimulus_log import StimulusLog
 
 
 class StubEffector:

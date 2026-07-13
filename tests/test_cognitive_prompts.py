@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.modules.cognitive_prompts import (
+from theseus.cognitive_prompts import (
     WAIT_ACTION,
     build_act_system_prompt,
     build_act_user_prompt,

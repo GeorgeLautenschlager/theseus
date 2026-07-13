@@ -16,6 +16,32 @@ Theseus is my Rotrod, the project car. I'm building it's capabilities just to se
 
 The current plan is to build the main agent loop as an OODA loop because... I'm a big fan of the works of John Boyd.
 
+## Getting started
+
+Theseus is a conventional Poetry package (Python 3.12, src layout).
+
+```bash
+poetry install              # library + pytest
+poetry install --with eval  # also installs sentence-transformers/torch for the eval tests
+make test                   # poetry run pytest -q tests/
+poetry run aldric           # run the reference agent
+```
+
+Agents built on Theseus live in their own repos and depend on it as a pinned git dependency:
+
+```toml
+[project]
+dependencies = [
+    "theseus @ git+ssh://git@github.com/GeorgeLautenschlager/theseus.git@v0.1.0",
+]
+```
+
+```python
+from theseus import CognitiveCore, StimulusLog
+```
+
+`src/theseus/agents/aldric.py` is the in-repo reference for composing an agent.
+
 ## Architecture
 
 Theseus is built on a simple foundation that I call the `StimulusLog`. If you've read [Generative Agents]([url](https://arxiv.org/abs/2304.03442)), you'll recognize the memory stream from that paper. Everything the agent experiences, including in most cases the things it does, goes into the `StimulusLog`. The `StimulusLog` is an append-online JSONL file, with each line corresponding to exactly one `StimulusEvent`. Another way to think of it is like the tape in a Universal Turing Machine. That brings us to the `CognitiveCore`. If `StimulusLog` is the tape in our Turing Machine analogy, `CognitiveCore` is the head. It is a module like any other in Theseus, but it exposes an opinionated set of ports:

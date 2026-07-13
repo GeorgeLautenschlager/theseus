@@ -1,4 +1,4 @@
-from src.modules.stimulus_log import StimulusLog
+from theseus.stimulus_log import StimulusLog
 
 
 class ContextAssembler:

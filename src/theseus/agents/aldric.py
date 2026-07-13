@@ -1,10 +1,10 @@
-from src.modules.model_providers.llama_cpp_provider import LlamaCppProvider
-from src.modules.model_providers.lm_studio_provider import LmStudioProvider
-from src.modules.model_providers.claude_provider import ClaudeProvider
-from src.modules.chat_effector import ChatEffector
-from src.modules.chat_observer import ChatObserver
-from src.modules.chat_cognitive_core import ChatCognitiveCore
-from src.modules.model_providers.ollama_provider import OllamaProvider
+from theseus.model_providers.llama_cpp_provider import LlamaCppProvider
+from theseus.model_providers.lm_studio_provider import LmStudioProvider
+from theseus.model_providers.claude_provider import ClaudeProvider
+from theseus.chat_effector import ChatEffector
+from theseus.chat_observer import ChatObserver
+from theseus.chat_cognitive_core import ChatCognitiveCore
+from theseus.model_providers.ollama_provider import OllamaProvider
 
 
 class Aldric:
@@ -49,5 +49,13 @@ class Aldric:
         """Run the agent. This is the main entry point for the agent."""
         while True:
             self.chat_observer.observe_chat_message()
+
+
+def main() -> None:
+    Aldric().run()
+
+
+if __name__ == "__main__":
+    main()
 
 

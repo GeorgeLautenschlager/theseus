@@ -14,7 +14,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.modules.web_chat_ui_observer import WebChatUIObserver
+    from theseus.web_chat_ui_observer import WebChatUIObserver
 
 _STEP_SECONDS = 0.05
 

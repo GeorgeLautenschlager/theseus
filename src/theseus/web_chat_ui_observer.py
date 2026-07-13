@@ -22,8 +22,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
-from src.modules.web.debug_pagination import most_recent_page, older_batch
-from src.modules.web.markdown import render_markdown
+from theseus.web.debug_pagination import most_recent_page, older_batch
+from theseus.web.markdown import render_markdown
 
 _WEB_DIR = Path(__file__).parent / "web"
 _TEMPLATES_DIR = _WEB_DIR / "templates"
