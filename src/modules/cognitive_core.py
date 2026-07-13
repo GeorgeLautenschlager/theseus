@@ -1,13 +1,21 @@
+from __future__ import annotations
+
 import json
 import re
 from datetime import datetime
 from typing import List
 
-from typer import prompt
-
-from src.modules.web_chat_ui_effector import WebChatUIEffector
-from src.modules.stimulus_log import StimulusLog
+from src.modules.cognitive_prompts import (
+    WAIT_ACTION,
+    build_act_system_prompt,
+    build_act_user_prompt,
+    build_decide_system_prompt,
+    build_decide_user_prompt,
+    decision_json_schema,
+)
 from src.modules.context_assembler import ContextAssembler
+from src.modules.effector import Effector
+from src.modules.stimulus_log import StimulusLog
 
 from .model_providers.model_provider import ModelProvider
 
@@ -19,20 +27,24 @@ class CognitiveCore:
     Args:
         model_providers: One or more model provider. These are listed in priority order, with the cognitive core ultimately
         deciding which model provider is used.
+        effectors: Available effectors keyed by their `name`.
+        name: The core's own actor name, used when logging its decisions and actions.
     """
     def __init__(
         self,
         constitution: str,
         model_providers: List[ModelProvider],
-        effector_callbacks: dict,
+        effectors: dict[str, Effector],
         stimulus_log: StimulusLog,
+        name: str = "Tam",
     ):
         self.constitution = constitution
         self.model_providers = model_providers
         self.loop_memory = {}
-        self.effector_callbacks = effector_callbacks
+        self.effectors = effectors
         self.stimulus_log = stimulus_log
         self.context_assembler = ContextAssembler(stimulus_log=stimulus_log)
+        self.name = name
 
     @staticmethod
     def _parse_json_response(raw_response: str) -> dict:
@@ -57,57 +69,56 @@ class CognitiveCore:
     def decide(self, context: str):
         model_provider = self._select_model_provider()
 
-        prompt = (
-            "Your StimulusLog records events you have recently experienced. This is your recent history:\n" +
-            str(context) +
-            "\n" +
-            "The current system time is " + str(datetime.now()) + "." +
-            f"Select one of the following effectors: {'|'.join(self.effector_callbacks.keys())}, and provide a rationale for your choice. "
-        )
+        options = [(effector.name, effector.description) for effector in self.effectors.values()]
+        action_names = [name for name, _ in options] + [WAIT_ACTION]
 
-        system_prompt = (
-            str(self.constitution) +
-            f"You can effect the world through the following effectors: [{', '.join(self.effector_callbacks.keys())}]" +
-            "Emit your decision as JSON in the following format: " +
-            f"{{'action': <{'|'.join(self.effector_callbacks.keys())}>, 'rationale': <reasoning for your decision>}}"
-        )
+        system_prompt = build_decide_system_prompt(self.constitution, options)
+        prompt = build_decide_user_prompt(context, str(datetime.now()))
 
         raw_response = model_provider.chat(
             prompt=prompt,
             system_prompt=system_prompt,
+            json_schema=decision_json_schema(action_names),
         )
 
-        action = self._parse_json_response(raw_response)
+        decision = self._parse_json_response(raw_response)
 
         self.stimulus_log.append(
-            actor="Tam",
+            actor=self.name,
             type="decision",
-            content={"action": action["action"], "rationale": action["rationale"], "raw_response": raw_response},
+            content={
+                "action": decision["action"],
+                "rationale": decision["rationale"],
+                "raw_response": raw_response,
+            },
         )
 
-        self.act(action, context)
+        self.act(decision, context)
 
-    def act(self, action: dict, context: str):
-        if action["action"] == WebChatUIEffector.__name__:
-            self.chat_effector_callback = self.effector_callbacks.get( action["action"])
+    def act(self, decision: dict, context: str):
+        action_name = decision["action"]
 
-            prompt = (
-                "Your StimulusLog records events you have recently experienced. This is your recent history:\n" +
-                str(context) +
-                "\n" +
-                "Given that recent stimuli " +
-                "compose a response for the web interface."
-            )
+        if action_name == WAIT_ACTION:
+            return
 
-            system_prompt = self.constitution
+        effector = self.effectors.get(action_name)
+        if effector is None:
+            print(f"Unknown action: {action_name}. No effector available to handle this action.")
+            return
 
-            model_provider = self._select_model_provider()
-            response = model_provider.chat(
-                prompt=prompt,
-                system_prompt=system_prompt,
-            )
+        system_prompt = build_act_system_prompt(self.constitution)
+        prompt = build_act_user_prompt(context, action_name, decision["rationale"], effector.act_instruction)
 
-            self.chat_effector_callback(response)
-        else:
-            print(f"Unknown action: {action['action']}. No effector available to handle this action.")
+        model_provider = self._select_model_provider()
+        response = model_provider.chat(
+            prompt=prompt,
+            system_prompt=system_prompt,
+        )
 
+        effector.execute(response)
+
+        self.stimulus_log.append(
+            actor=self.name,
+            type="action",
+            content={"action": action_name, "output": response},
+        )

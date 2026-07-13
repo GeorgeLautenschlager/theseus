@@ -20,9 +20,24 @@ _STEP_SECONDS = 0.05
 
 
 class WebChatUIEffector:
+    name = "respond_in_web_chat"
+    description = (
+        "Send a chat message to George through the web chat UI. Choose this when the recent "
+        "history contains a message or situation that calls for a reply from you."
+    )
+    act_instruction = (
+        "Compose your chat message to George now. Your entire output is delivered verbatim as "
+        "your message in the web chat UI — output only the message itself, with no JSON, no "
+        "preamble, and no notes about these instructions."
+    )
+
     def __init__(self, web_observer: "WebChatUIObserver"):
         self.response = None
         self.web_observer = web_observer
+
+    def execute(self, payload: str) -> None:
+        """Satisfies the Effector protocol; delegates to respond()."""
+        self.respond(payload)
 
     def respond(self, response: str) -> None:
         """Send the response to the chat UI, revealed in word-sized chunks.
