@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from src.modules.model_providers.ollama_provider import OllamaProvider
 from src.modules.web_chat_ui_observer import WebChatUIObserver
 from src.modules.web_chat_ui_effector import WebChatUIEffector
 from src.modules.model_providers.claude_provider import ClaudeProvider
@@ -35,8 +36,9 @@ def main() -> None:
     core = CognitiveCore(
         constitution=constitution,
         model_providers=[
-            # ClaudeProvider(model="haiku"),
+            ClaudeProvider(model="haiku"),
             LmStudioProvider(model="gemma-4-26b-a4b-it-qat"),
+            OllamaProvider(model="gemma4:e4b"),
         ],
         effector_callbacks={},
         stimulus_log=stimulus_log,

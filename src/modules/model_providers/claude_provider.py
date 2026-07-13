@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 
 from .model_provider import ModelProvider
@@ -9,6 +10,9 @@ from .model_provider import ModelProvider
 class ClaudeProvider(ModelProvider):
     def __init__(self, model: str = "claude-sonnet-4-6"):
         self.model = model
+
+    def is_available(self) -> bool:
+        return shutil.which("claude") is not None
 
     def chat(
         self,

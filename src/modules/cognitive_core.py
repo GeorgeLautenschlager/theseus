@@ -12,7 +12,7 @@ from src.modules.context_assembler import ContextAssembler
 from .model_providers.model_provider import ModelProvider
 
 
-class CognitiveCore(ModelProvider):
+class CognitiveCore:
     """A truncated OODA loop that serves as the primary cognitive process for a Theseus agent.
 
     The core does Orient, Decide and Act, steps and internalizes the LLM.
@@ -42,9 +42,11 @@ class CognitiveCore(ModelProvider):
         return json.loads(json_str)
 
     def _select_model_provider(self) -> ModelProvider:
-        """Selects the most appropriate model provider based on the current context and available providers."""
-        # For now, just return the first provider in the list.
-        return self.model_providers[0]
+        """Selects the first available provider, in priority order."""
+        for provider in self.model_providers:
+            if provider.is_available():
+                return provider
+        raise RuntimeError("No model providers are currently available.")
 
     def orient(self):
         """Callback to be invoked by chat UI"""
@@ -74,7 +76,7 @@ class CognitiveCore(ModelProvider):
             prompt=prompt,
             system_prompt=system_prompt,
         )
-        print(f"Raw response from model provider: {raw_response}")
+
         action = self._parse_json_response(raw_response)
 
         self.stimulus_log.append(

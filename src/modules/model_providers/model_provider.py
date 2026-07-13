@@ -16,6 +16,11 @@ class ModelProvider(ABC):
         self.model = model
         self._client = OpenAI(base_url=base_url, api_key=api_key)
 
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Returns True if this provider is currently reachable."""
+        ...
+
     def chat(
         self,
         prompt: str,
