@@ -34,3 +34,6 @@ class ClaudeProvider(ModelProvider):
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return result.stdout.strip()
+
+    def embed(self, text: str) -> list[float]:
+        raise NotImplementedError("The Claude CLI does not expose an embeddings endpoint.")

@@ -2,21 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from theseus.agentic_memory import AgenticMemory
+from theseus.memory import Memory
 from theseus.stimulus_log import StimulusLog
 
 
 @dataclass(frozen=True)
 class AssembledContext:
     recent_events: str   # tail of the stimulus log, one JSON event per line
-    memories: str        # rendered retrieved memory notes; "" when none
+    memories: str        # rendered memories from the memory module; "" when none
 
 
 class ContextAssembler:
     """assembles context for Decide from the following sources:
     - StimulusLog: the last `window_size` events, verbatim
-    - the agent's memory systems, if any are present: notes retrieved
-      against the recent-events window
+    - the agent's memory systems, if any are present: whatever the module's
+      `retrieve` returns against the recent-events window
     - persona, if present
     - constitution, if present
     """
@@ -24,7 +24,7 @@ class ContextAssembler:
     def __init__(
         self,
         stimulus_log: StimulusLog,
-        memory: AgenticMemory | None = None,
+        memory: Memory | None = None,
         window_size: int = 50,
         persona: str | None = None,
         constitution: str | None = None,
@@ -40,7 +40,6 @@ class ContextAssembler:
 
         memories = ""
         if self.memory is not None and recent_events:
-            notes = self.memory.retrieve(recent_events)
-            memories = "\n\n".join(note.render() for note in notes)
+            memories = self.memory.retrieve(recent_events)
 
         return AssembledContext(recent_events=recent_events, memories=memories)

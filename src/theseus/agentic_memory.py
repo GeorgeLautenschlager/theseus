@@ -1,14 +1,22 @@
 """AgenticMemory — A-MEM-inspired long-term memory over the StimulusLog.
 
 Pipeline (per Xu et al., arXiv 2502.12110, minus memory evolution, which is
-deferred): a batch of stimulus events is distilled into an enriched MemoryNote
+deferred): new stimulus events are distilled into an enriched MemoryNote
 (context/keywords/tags via one LLM call), embedded, then agentically linked to
 its nearest existing notes (a second LLM call chooses which neighbors are
 genuinely related). Retrieval is embedding similarity plus one hop of link
 expansion.
 
-Formation is called post-cycle by CognitiveCore and must never take the loop
-down: every failure is caught, reported to stdout, and swallowed.
+One memory module among (eventually) many: the core knows it only through the
+Memory protocol's form()/retrieve() and signals form() when a cognitive loop
+terminates. Everything else — which events are new (the high-water mark
+derived from note source spans), storage, linking — stays in here. Formation
+must never take the loop down: every failure is caught, reported to stdout,
+and swallowed.
+
+Chat and embedding models come from separate provider lists; an embedding
+provider is just a ModelProvider instance whose one model is an embedding
+model, e.g. OllamaProvider(model="nomic-embed-text").
 """
 
 from __future__ import annotations
@@ -26,42 +34,53 @@ from theseus.memory_prompts import (
 )
 from theseus.memory_store import MemoryStore
 from theseus.model_providers.model_provider import ModelProvider
-from theseus.stimulus_log import StimulusEvent, new_id
+from theseus.stimulus_log import StimulusEvent, StimulusLog, new_id
 
 
 class AgenticMemory:
     def __init__(
         self,
         model_providers: List[ModelProvider],
+        embedding_providers: List[ModelProvider],
         store: MemoryStore,
+        stimulus_log: StimulusLog,
         k_neighbors: int = 5,
         k_retrieve: int = 5,
     ):
         self.model_providers = model_providers
+        self.embedding_providers = embedding_providers
         self.store = store
+        self.stimulus_log = stimulus_log
         self.k_neighbors = k_neighbors
         self.k_retrieve = k_retrieve
 
-    def _select_model_provider(self) -> ModelProvider:
-        """Selects the first available provider, in priority order."""
-        for provider in self.model_providers:
+    @staticmethod
+    def _first_available(providers: List[ModelProvider]) -> ModelProvider:
+        for provider in providers:
             if provider.is_available():
                 return provider
         raise RuntimeError("No model providers are currently available.")
 
-    def form(self, events: list[StimulusEvent]) -> MemoryNote | None:
-        """Distill `events` into one linked, embedded note and persist it.
+    def _select_model_provider(self) -> ModelProvider:
+        return self._first_available(self.model_providers)
 
-        Returns the stored note, or None if there was nothing to form or any
-        step failed — memory formation must never crash the cognitive loop.
-        """
-        if not events:
-            return None
+    def _select_embedding_provider(self) -> ModelProvider:
+        return self._first_available(self.embedding_providers)
+
+    def form(self) -> None:
+        """Consolidate every stimulus event newer than the store's high-water
+        mark into one linked, embedded note. Signalled by the core at loop
+        termination; a no-op when nothing new has happened."""
         try:
-            return self._form(events)
+            high_water = self.store.last_consolidated_id()
+            events = [
+                e for e in self.stimulus_log.read_all()
+                if high_water is None or e.id > high_water
+            ]
+            if events:
+                self._form(events)
         except Exception as exc:
             print(f"Memory formation failed; skipping this batch: {exc}")
-            return None
 
     def _form(self, events: list[StimulusEvent]) -> MemoryNote:
         provider = self._select_model_provider()
@@ -81,7 +100,7 @@ class AgenticMemory:
             keywords=list(enrichment["keywords"]),
             tags=list(enrichment["tags"]),
             source_span=(events[0].id, events[-1].id),
-            embedding=provider.embed(enrichment["context"]),
+            embedding=self._select_embedding_provider().embed(enrichment["context"]),
         )
 
         candidates = self.store.top_k(note.embedding, self.k_neighbors)
@@ -96,13 +115,17 @@ class AgenticMemory:
 
         return self.store.add(note)
 
-    def retrieve(self, query: str) -> list[MemoryNote]:
+    def retrieve(self, query: str) -> str:
+        """Memories relevant to `query`, rendered ready for a prompt; "" when none."""
+        return "\n\n".join(note.render() for note in self._retrieve_notes(query))
+
+    def _retrieve_notes(self, query: str) -> list[MemoryNote]:
         """Top-k notes by embedding similarity, expanded one hop along links."""
         if len(self.store) == 0:
             return []
         try:
-            provider = self._select_model_provider()
-            hits = self.store.top_k(provider.embed(query), self.k_retrieve)
+            embedding = self._select_embedding_provider().embed(query)
+            hits = self.store.top_k(embedding, self.k_retrieve)
         except Exception as exc:
             print(f"Memory retrieval failed; continuing without memories: {exc}")
             return []

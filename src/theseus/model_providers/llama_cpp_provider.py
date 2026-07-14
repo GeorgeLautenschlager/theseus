@@ -12,9 +12,8 @@ class LlamaCppProvider(ModelProvider):
         model: str = "local-model",
         api_key: str = "local-llama",
         local: bool = False,
-        embedding_model: str | None = None,
     ):
-        super().__init__(base_url=base_url, model=model, api_key=api_key, embedding_model=embedding_model)
+        super().__init__(base_url=base_url, model=model, api_key=api_key)
 
     def is_available(self) -> bool:
         try:

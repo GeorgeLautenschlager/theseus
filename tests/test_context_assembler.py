@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 from theseus.context_assembler import ContextAssembler
-from theseus.memory_note import MemoryNote
-from theseus.stimulus_log import StimulusLog, new_id
+from theseus.stimulus_log import StimulusLog
 
 
 def fill_log(tmp_path, n) -> StimulusLog:
@@ -40,20 +38,14 @@ class TestMemories:
 
         assert assembled.memories == ""
 
-    def test_renders_retrieved_notes(self, tmp_path):
+    def test_uses_module_rendered_memories(self, tmp_path):
         log = fill_log(tmp_path, 1)
-        note = MemoryNote(
-            id=new_id(),
-            ts=datetime.now(timezone.utc),
-            content="raw",
-            context="George prefers tea.",
-        )
         memory = MagicMock()
-        memory.retrieve.return_value = [note]
+        memory.retrieve.return_value = "George prefers tea."
 
         assembled = ContextAssembler(stimulus_log=log, memory=memory).assemble_context()
 
-        assert "George prefers tea." in assembled.memories
+        assert assembled.memories == "George prefers tea."
         memory.retrieve.assert_called_once_with(assembled.recent_events)
 
     def test_skips_retrieval_on_empty_log(self, tmp_path):

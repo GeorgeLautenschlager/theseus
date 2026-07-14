@@ -41,6 +41,32 @@ high-water mark is *derived* (`MemoryStore.last_consolidated_id()` = max span
 end), never stored separately — so deleting the notes file and replaying
 cycles rebuilds memory from the log alone.
 
+## The Memory protocol
+
+`AgenticMemory` is the first memory module in the construction kit, not the
+last. The core therefore sees memory only through the `Memory` protocol
+(`memory.py`, mirroring `Effector`):
+
+- `form()` — the core's signal, sent at loop termination. What to consolidate
+  (and whether anything is new enough to bother) is the module's own business;
+  the module tracks its own high-water mark and reads the log itself. Must
+  never raise into the loop.
+- `retrieve(query) -> str` — a rendered, prompt-ready block of memories, `""`
+  when nothing is relevant.
+
+`retrieve` returning a string is what keeps the interface leak-proof: neither
+`CognitiveCore` nor `ContextAssembler` imports note types or stores.
+
+## Loop discipline
+
+`CognitiveCore` steps never pass data to each other — any step may kick back
+to Orient, so everything a loop accumulates lives in `loop_memory`
+(`recent_events`, `memories`, `decision`). Every terminal path of Act funnels
+through `loop_termination()`, which is skipped whenever another cycle is
+triggered. Loop termination currently hard-codes the `memory.form()` signal
+and resets `loop_memory`; a later iteration should accumulate callbacks and
+iterate over them.
+
 ## Components
 
 - `memory_note.py` — `MemoryNote`, frozen dataclass, JSONL-serializable,
@@ -51,20 +77,25 @@ cycles rebuilds memory from the log alone.
 - `memory_prompts.py` — pure prompt builders + JSON schemas for the two LLM
   steps (note construction, link decision), offline-testable like
   `cognitive_prompts.py`.
-- `agentic_memory.py` — `AgenticMemory.form(events)` and `.retrieve(query)`.
-  All failures are caught and reported: memory must never crash the loop.
-- `ModelProvider.embed(text)` — OpenAI-compatible `/v1/embeddings`, gated on a
-  new optional `embedding_model` constructor param on each provider.
+- `memory.py` — the `Memory` protocol (see above).
+- `agentic_memory.py` — `AgenticMemory`, implementing the protocol. All
+  failures are caught and reported: memory must never crash the loop.
+- `ModelProvider.embed(text)` — OpenAI-compatible `/v1/embeddings` using the
+  instance's one model. A provider class is a *place we get models*; an
+  embedding provider is just another instance, e.g.
+  `OllamaProvider(model="nomic-embed-text")`. `AgenticMemory` takes separate
+  `model_providers` (chat) and `embedding_providers` priority lists.
 
 ## Integration
 
 - `ContextAssembler` now returns `AssembledContext(recent_events, memories)`:
-  the last `window_size` (default 50) events verbatim, plus notes retrieved
-  against that window. The full-log dump is gone.
-- `CognitiveCore` accepts `memory: AgenticMemory | None = None`. Orient
-  assembles context (with retrieval), runs Decide/Act, then consolidates all
-  events past the high-water mark into a new note — post-cycle, so memory
-  writes never delay the agent's outward response.
+  the last `window_size` (default 50) events verbatim, plus whatever the
+  memory module's `retrieve` returns against that window. The full-log dump
+  is gone.
+- `CognitiveCore` accepts `memory: Memory | None = None`. Orient assembles
+  context (with retrieval) into `loop_memory`, runs Decide/Act, and
+  `loop_termination()` signals `memory.form()` — post-cycle, so memory writes
+  never delay the agent's outward response.
 - Formation timing is synchronous and post-cycle; no threads.
 
 ## Non-goals (this iteration)
@@ -78,11 +109,18 @@ cycles rebuilds memory from the log alone.
 ## Wiring example
 
 ```python
-provider = LmStudioProvider(model="...", embedding_model="text-embedding-nomic-embed-text-v1.5")
-memory = AgenticMemory(model_providers=[provider], store=MemoryStore("memory.jsonl"))
+provider = OllamaProvider(model="gemma4:e4b")
+embedder = OllamaProvider(model="nomic-embed-text")
+stimulus_log = StimulusLog("stimulus_log.jsonl")
+memory = AgenticMemory(
+    model_providers=[provider],
+    embedding_providers=[embedder],
+    store=MemoryStore("memory.jsonl"),
+    stimulus_log=stimulus_log,
+)
 core = CognitiveCore(
     constitution=..., model_providers=[provider],
-    effectors=..., stimulus_log=StimulusLog("stimulus_log.jsonl"),
+    effectors=..., stimulus_log=stimulus_log,
     memory=memory,
 )
 ```
