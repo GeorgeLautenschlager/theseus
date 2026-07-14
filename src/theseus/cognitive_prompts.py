@@ -31,6 +31,16 @@ def _render_stimulus_log_section(context: str) -> str:
     )
 
 
+def _render_memories_section(memories: str) -> str:
+    return (
+        "Distilled long-term memories relevant to the current situation, "
+        "retrieved from your memory system:\n\n"
+        "<memories>\n"
+        f"{memories}\n"
+        "</memories>"
+    )
+
+
 def build_decide_system_prompt(constitution: str, options: list[tuple[str, str]]) -> str:
     menu_lines = "\n".join(f"- {name}: {description}" for name, description in options)
 
@@ -57,8 +67,10 @@ def build_decide_system_prompt(constitution: str, options: list[tuple[str, str]]
     )
 
 
-def build_decide_user_prompt(context: str, now: str) -> str:
+def build_decide_user_prompt(context: str, now: str, memories: str = "") -> str:
+    memories_section = f"{_render_memories_section(memories)}\n\n" if memories else ""
     return (
+        f"{memories_section}"
         f"{_render_stimulus_log_section(context)}\n\n"
         f"Current system time: {now}\n\n"
         "Decide your next action."
@@ -76,8 +88,10 @@ def build_act_system_prompt(constitution: str) -> str:
     )
 
 
-def build_act_user_prompt(context: str, action: str, rationale: str, act_instruction: str) -> str:
+def build_act_user_prompt(context: str, action: str, rationale: str, act_instruction: str, memories: str = "") -> str:
+    memories_section = f"{_render_memories_section(memories)}\n\n" if memories else ""
     return (
+        f"{memories_section}"
         f"{_render_stimulus_log_section(context)}\n\n"
         f'In the Decide step you chose the action "{action}" with this rationale:\n'
         f"{rationale}\n\n"

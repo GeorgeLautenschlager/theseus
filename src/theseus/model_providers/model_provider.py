@@ -5,7 +5,13 @@ from openai import OpenAI
 
 
 class ModelProvider(ABC):
-    """Base class for LLM providers using OpenAI-compatible APIs."""
+    """Base class for LLM providers using OpenAI-compatible APIs.
+
+    A provider class is a *place we get models* (LM Studio, Ollama, ...); each
+    instance is exactly one model. An embedding provider is therefore just
+    another instance whose model is an embedding model, e.g.
+    OllamaProvider(model="nomic-embed-text").
+    """
 
     def __init__(
         self,
@@ -49,3 +55,7 @@ class ModelProvider(ABC):
             **extra_kwargs,
         )
         return response.choices[0].message.content
+
+    def embed(self, text: str) -> list[float]:
+        response = self._client.embeddings.create(model=self.model, input=text)
+        return response.data[0].embedding
