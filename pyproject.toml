@@ -25,6 +25,13 @@ packages = [{ include = "theseus", from = "src" }]
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8"
 
+# Screen-capture deps for surrogates; install with `poetry install --with surrogates`.
+[tool.poetry.group.surrogates]
+optional = true
+
+[tool.poetry.group.surrogates.dependencies]
+pillow = ">=10"
+
 # Heavy eval-only deps (pulls in torch); install with `poetry install --with eval`.
 [tool.poetry.group.eval]
 optional = true

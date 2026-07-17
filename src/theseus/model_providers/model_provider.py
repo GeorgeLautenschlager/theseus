@@ -34,11 +34,21 @@ class ModelProvider(ABC):
         max_tokens: int = 8196,
         temperature: float = 0.7,
         json_schema: dict | None = None,
+        images: list[str] | None = None,
     ) -> str:
+        """`images` are data URIs (e.g. "data:image/jpeg;base64,...") attached
+        to the user message; the model must support vision."""
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+        if images:
+            content = [{"type": "text", "text": prompt}]
+            content.extend(
+                {"type": "image_url", "image_url": {"url": url}} for url in images
+            )
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": prompt})
 
         extra_kwargs = {}
         if json_schema is not None:
