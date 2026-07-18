@@ -5,6 +5,15 @@ from theseus.memory import Memory
 from theseus.memory_note import MemoryNote
 from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.tools import (
+    Tool,
+    ToolCall,
+    ToolResult,
+    ToolRunner,
+    all_tools,
+    coding_tools,
+    read_only_tools,
+)
 
 __all__ = [
     "AgenticMemory",
@@ -15,4 +24,11 @@ __all__ = [
     "MemoryStore",
     "StimulusEvent",
     "StimulusLog",
+    "Tool",
+    "ToolCall",
+    "ToolResult",
+    "ToolRunner",
+    "all_tools",
+    "coding_tools",
+    "read_only_tools",
 ]

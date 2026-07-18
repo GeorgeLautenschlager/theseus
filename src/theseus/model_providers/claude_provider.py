@@ -35,5 +35,12 @@ class ClaudeProvider(ModelProvider):
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return result.stdout.strip()
 
+    def complete_with_tools(self, *args, **kwargs):
+        raise NotImplementedError(
+            "ClaudeProvider runs the Claude CLI as a plain completion (--tools \"\") and "
+            "does not support the OpenAI-style tool-calling loop. Use an OpenAI-compatible "
+            "provider (LM Studio, Ollama, llama.cpp) for tools."
+        )
+
     def embed(self, text: str) -> list[float]:
         raise NotImplementedError("The Claude CLI does not expose an embeddings endpoint.")
