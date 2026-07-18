@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
+from typing import Any
+
 from openai import OpenAI
+
+from theseus.tools.tool import AssistantTurn, Tool, ToolCall, to_openai_tool
 
 
 class ModelProvider(ABC):
@@ -65,6 +70,44 @@ class ModelProvider(ABC):
             **extra_kwargs,
         )
         return response.choices[0].message.content
+
+    def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Tool] | None = None,
+        max_tokens: int = 8196,
+        temperature: float = 0.7,
+    ) -> AssistantTurn:
+        """One turn of an OpenAI-style tool-calling exchange.
+
+        `messages` is a raw OpenAI-format history (the caller owns it — see `ToolRunner`).
+        Tools are serialized with `to_openai_tool`; the request is deliberately
+        non-streamed, which both simplifies parsing and sidesteps Ollama's streamed
+        multi-tool-call `index` bug. Any tool calls in the response are normalized to
+        `ToolCall` (arguments JSON-decoded to a dict).
+        """
+        extra_kwargs: dict[str, Any] = {}
+        if tools:
+            extra_kwargs["tools"] = [to_openai_tool(tool) for tool in tools]
+            extra_kwargs["tool_choice"] = "auto"
+
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            **extra_kwargs,
+        )
+        message = response.choices[0].message
+        calls: list[ToolCall] = []
+        for tc in message.tool_calls or []:
+            raw_args = tc.function.arguments
+            try:
+                arguments = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                arguments = {}
+            calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=arguments))
+        return AssistantTurn(text=message.content, tool_calls=tuple(calls))
 
     def embed(self, text: str) -> list[float]:
         response = self._client.embeddings.create(model=self.model, input=text)
