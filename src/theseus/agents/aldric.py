@@ -1,61 +1,61 @@
-from theseus.model_providers.llama_cpp_provider import LlamaCppProvider
-from theseus.model_providers.lm_studio_provider import LmStudioProvider
-from theseus.model_providers.claude_provider import ClaudeProvider
-from theseus.chat_effector import ChatEffector
-from theseus.chat_observer import ChatObserver
-from theseus.chat_cognitive_core import ChatCognitiveCore
-from theseus.model_providers.ollama_provider import OllamaProvider
+# from theseus.model_providers.llama_cpp_provider import LlamaCppProvider
+# from theseus.model_providers.lm_studio_provider import LmStudioProvider
+# from theseus.model_providers.claude_provider import ClaudeProvider
+# from theseus.chat_effector import ChatEffector
+# from theseus.chat_observer import ChatObserver
+# from theseus.chat_cognitive_core import ChatCognitiveCore
+# from theseus.model_providers.ollama_provider import OllamaProvider
 
 
-class Aldric:
-    """Aldric is an agent built with the Theseus architecture.
+# class Aldric:
+#     """Aldric is an agent built with the Theseus architecture.
 
-    Aldric is built in concentric layers. In the centre is an LLM, surrounded by a
-    truncated OODA loop. Orient, Decide and Act make up what is called the Cognitive Core.
-    Observers, are outside of that, along with memory systems and more complex subagents that
-    function as sensory surrogates, feeding pre-processed information into the core.
+#     Aldric is built in concentric layers. In the centre is an LLM, surrounded by a
+#     truncated OODA loop. Orient, Decide and Act make up what is called the Cognitive Core.
+#     Observers, are outside of that, along with memory systems and more complex subagents that
+#     function as sensory surrogates, feeding pre-processed information into the core.
 
-    Args:
-        core: this is the cognition of the agent. It operates as a truncated OODA loop which can be
-        entered at any point, but loops until it decides to terminate.
-        observers: One or more modules responsible for collecting and  where appropriate, pre-processing data
-        Memories: One or more memory systems
-        surrogates: One or more subagents that function as sensory surrogates, feeding pre-processed information into the core.
-        model_providers: One or more model provider. These are listed in priority order, with the cognitive core ultimately
-        deciding which model provider is used.
-    """
-    def __init__(
-        self
-    ):
-        self.chat_effector = ChatEffector()
-        self.core = ChatCognitiveCore(
-            model_providers=[
-                # TODO: we need to confirm the model identifers here
-                # TODO: this probably ought to be a dict, with named lists for specific applications
-                LmStudioProvider(model="gemma-4-e4b-it-qat-nvfp4"),
-                LmStudioProvider(model="gemma-4-26b-a4b-it-qat"),
-                LlamaCppProvider(model="gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL", local=False),
-                LlamaCppProvider(model="gemma-4-E2B-it-qat-GGUF:UD-Q4_K_XL", local=True),
-                OllamaProvider(model="gemma4:e4b"),
-                ClaudeProvider(),
-            ],
-            effector_callbacks={"chat_effector_callback": self.chat_effector.respond_callback},
-        )
-        self.chat_observer = ChatObserver(
-            orient_chat_message_callback=self.core.orient
-        )
+#     Args:
+#         core: this is the cognition of the agent. It operates as a truncated OODA loop which can be
+#         entered at any point, but loops until it decides to terminate.
+#         observers: One or more modules responsible for collecting and  where appropriate, pre-processing data
+#         Memories: One or more memory systems
+#         surrogates: One or more subagents that function as sensory surrogates, feeding pre-processed information into the core.
+#         model_providers: One or more model provider. These are listed in priority order, with the cognitive core ultimately
+#         deciding which model provider is used.
+#     """
+#     def __init__(
+#         self
+#     ):
+#         self.chat_effector = ChatEffector()
+#         self.core = ChatCognitiveCore(
+#             model_providers=[
+#                 # TODO: we need to confirm the model identifers here
+#                 # TODO: this probably ought to be a dict, with named lists for specific applications
+#                 LmStudioProvider(model="gemma-4-e4b-it-qat-nvfp4"),
+#                 LmStudioProvider(model="gemma-4-26b-a4b-it-qat"),
+#                 LlamaCppProvider(model="gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL", local=False),
+#                 LlamaCppProvider(model="gemma-4-E2B-it-qat-GGUF:UD-Q4_K_XL", local=True),
+#                 OllamaProvider(model="gemma4:e4b"),
+#                 ClaudeProvider(),
+#             ],
+#             effector_callbacks={"chat_effector_callback": self.chat_effector.respond_callback},
+#         )
+#         self.chat_observer = ChatObserver(
+#             orient_chat_message_callback=self.core.orient
+#         )
 
-    def run(self):
-        """Run the agent. This is the main entry point for the agent."""
-        while True:
-            self.chat_observer.observe_chat_message()
-
-
-def main() -> None:
-    Aldric().run()
+#     def run(self):
+#         """Run the agent. This is the main entry point for the agent."""
+#         while True:
+#             self.chat_observer.observe_chat_message()
 
 
-if __name__ == "__main__":
-    main()
+# def main() -> None:
+#     Aldric().run()
+
+
+# if __name__ == "__main__":
+#     main()
 
 
