@@ -11,7 +11,7 @@ from theseus.tools.tool import AssistantTurn, ToolCall, ToolResult
 
 
 class StubTool:
-    def __init__(self, name="terminal_chat"):
+    def __init__(self, name="terminal_chat", ends_turn=True):
         self.name = name
         self.description = "Send a chat message to George."
         self.parameters = {
@@ -19,11 +19,17 @@ class StubTool:
             "properties": {"message": {"type": "string"}},
             "required": ["message"],
         }
+        self.ends_turn = ends_turn
         self.executed_with = None
 
     def execute(self, **kwargs):
         self.executed_with = kwargs
-        return ToolResult("delivered", details={**kwargs})
+        return ToolResult(f"{self.name}-output", details={**kwargs})
+
+
+def instrumental(name="ls"):
+    """A non-terminal tool: running it should trigger another pass through the loop."""
+    return StubTool(name=name, ends_turn=False)
 
 
 def turn(*tool_calls, text=None):
@@ -43,7 +49,7 @@ def make_provider(turns):
     return provider
 
 
-def make_core(tmp_path, provider, tools=None, memory=None):
+def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10):
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
     return CognitiveCore(
         constitution="You are Tam.",
@@ -51,6 +57,7 @@ def make_core(tmp_path, provider, tools=None, memory=None):
         tools=tools or {},
         stimulus_log=stimulus_log,
         memory=memory,
+        max_loops=max_loops,
     )
 
 
@@ -121,9 +128,9 @@ class TestAct:
 
         assert tool.executed_with is None
         events = core.stimulus_log.read_all()
-        assert not [e for e in events if e.type == "action"]
+        assert not [e for e in events if e.type == "tool_result"]
 
-    def test_action_event_records_the_tool_result(self, tmp_path):
+    def test_tool_result_event_records_the_outcome(self, tmp_path):
         tool = StubTool()
         provider = make_provider([turn((tool.name, {"message": "Hello, George!"}))])
         core = make_core(tmp_path, provider, tools={tool.name: tool})
@@ -131,33 +138,70 @@ class TestAct:
         run_decide(core)
 
         events = core.stimulus_log.read_all()
-        action_events = [e for e in events if e.type == "action"]
-        assert len(action_events) == 1
-        assert action_events[0].content["action"] == tool.name
-        assert action_events[0].content["arguments"] == {"message": "Hello, George!"}
-        assert action_events[0].content["output"] == "delivered"
-        assert action_events[0].content["is_error"] is False
+        results = [e for e in events if e.type == "tool_result"]
+        assert len(results) == 1
+        assert results[0].content["tool"] == tool.name
+        assert results[0].content["arguments"] == {"message": "Hello, George!"}
+        assert results[0].content["output"] == "terminal_chat-output"
+        assert results[0].content["is_error"] is False
 
-    def test_unknown_tool_neither_raises_nor_executes(self, tmp_path, capsys):
-        tool = StubTool()
-        provider = make_provider([turn(("not_a_real_tool", {"message": "x"}))])
-        core = make_core(tmp_path, provider, tools={tool.name: tool})
-
-        run_decide(core)
-
-        assert tool.executed_with is None
-        events = core.stimulus_log.read_all()
-        assert not [e for e in events if e.type == "action"]
-
-    def test_only_one_model_call_per_cycle(self, tmp_path):
-        tool = StubTool()
+    def test_terminal_tool_ends_the_loop(self, tmp_path):
+        tool = StubTool()  # ends_turn=True
         provider = make_provider([turn((tool.name, {"message": "Hi!"}))])
         core = make_core(tmp_path, provider, tools={tool.name: tool})
 
         run_decide(core)
 
-        # Native tool-calling collapses Decide+Act into a single model call.
+        # A terminal tool ends the turn: exactly one model call, loop_memory reset.
         assert provider.complete_with_tools.call_count == 1
+        assert core.loop_memory == {}
+
+    def test_instrumental_tool_triggers_another_pass(self, tmp_path):
+        ls = instrumental("ls")
+        chat = StubTool("terminal_chat")  # terminal
+        provider = make_provider(
+            [
+                turn(("ls", {"path": "."})),
+                turn(("terminal_chat", {"message": "Here are the files."})),
+            ]
+        )
+        core = make_core(tmp_path, provider, tools={"ls": ls, "terminal_chat": chat})
+
+        run_decide(core)
+
+        # The ls result triggered a second Decide, which then replied and ended the turn.
+        assert provider.complete_with_tools.call_count == 2
+        assert ls.executed_with == {"path": "."}
+        assert chat.executed_with == {"message": "Here are the files."}
+        # The second Decide actually saw the ls output in its assembled context.
+        second_messages = provider.complete_with_tools.call_args_list[1].args[0]
+        assert "ls-output" in second_messages[1]["content"]
+        assert core.loop_memory == {}
+
+    def test_max_loops_caps_a_runaway_loop(self, tmp_path):
+        ls = instrumental("ls")
+        provider = make_provider([turn(("ls", {"path": "."}))] * 5)
+        core = make_core(tmp_path, provider, tools={"ls": ls}, max_loops=3)
+
+        run_decide(core)
+
+        # Never terminal, so only the cap stops it.
+        assert provider.complete_with_tools.call_count == 3
+        assert core.loop_memory == {}
+
+    def test_unknown_tool_logs_error_result(self, tmp_path):
+        tool = StubTool()
+        provider = make_provider([turn(("not_a_real_tool", {"message": "x"}))])
+        core = make_core(tmp_path, provider, tools={tool.name: tool}, max_loops=1)
+
+        run_decide(core)
+
+        assert tool.executed_with is None
+        events = core.stimulus_log.read_all()
+        results = [e for e in events if e.type == "tool_result"]
+        assert len(results) == 1
+        assert results[0].content["tool"] == "not_a_real_tool"
+        assert results[0].content["is_error"] is True
 
     def test_stimulus_log_actor_uses_core_name(self, tmp_path):
         tool = StubTool()
@@ -178,12 +222,11 @@ class TestAct:
 
 
 class TestLoopTermination:
-    def test_every_terminal_path_signals_memory_formation_once(self, tmp_path):
-        tool = StubTool()
+    def test_terminal_paths_signal_memory_formation_once(self, tmp_path):
+        tool = StubTool()  # terminal
         terminal_turns = [
-            turn(text="nothing to do"),                       # wait
-            turn(("not_a_real_tool", {"message": "x"})),      # unknown tool
-            turn((tool.name, {"message": "Hello!"})),         # real tool call
+            turn(text="nothing to do"),                  # wait
+            turn((tool.name, {"message": "Hello!"})),    # terminal tool
         ]
         for t in terminal_turns:
             provider = make_provider([t])
@@ -194,6 +237,18 @@ class TestLoopTermination:
             run_decide(core)
 
             assert memory.form.call_count == 1, f"path: {t}"
+
+    def test_max_loops_termination_forms_memory_once(self, tmp_path):
+        ls = instrumental("ls")
+        memory = MagicMock()
+        memory.retrieve.return_value = ""
+        provider = make_provider([turn(("ls", {"path": "."}))] * 3)
+        core = make_core(tmp_path, provider, tools={"ls": ls}, memory=memory, max_loops=2)
+
+        run_decide(core)
+
+        # Memory forms once for the whole multi-pass turn, not per pass.
+        assert memory.form.call_count == 1
 
     def test_termination_resets_loop_memory(self, tmp_path):
         provider = make_provider([turn(text="nothing to do")])

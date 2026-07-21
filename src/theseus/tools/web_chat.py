@@ -24,6 +24,7 @@ _STEP_SECONDS = 0.05
 
 class WebChat:
     name = "respond_in_web_chat"
+    ends_turn = True  # a chat reply completes the cognitive turn
     description = (
         "Send a chat message to George through the web chat UI. The message is delivered "
         "verbatim as your reply."

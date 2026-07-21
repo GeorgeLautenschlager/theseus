@@ -39,6 +39,7 @@ class CognitiveCore:
         stimulus_log: StimulusLog,
         memory: Memory | None = None,
         name: str = "Tam",
+        max_loops: int = 10,
     ):
         self.constitution = constitution
         self.model_providers = model_providers
@@ -48,6 +49,7 @@ class CognitiveCore:
         self.memory = memory
         self.context_assembler = ContextAssembler(stimulus_log=stimulus_log, memory=memory)
         self.name = name
+        self.max_loops = max_loops
 
     def _select_model_provider(self) -> ModelProvider:
         """Selects the first available provider, in priority order."""
@@ -107,31 +109,48 @@ class CognitiveCore:
             self.loop_termination()
             return
 
+        ends_turn = False
         for call in turn.tool_calls:
             tool = self.tools.get(call.name)
             if tool is None:
-                print(f"Unknown tool: {call.name}. No tool available to handle this call.")
+                # Record the miss as a stimulus so the next pass can see it and recover.
+                self.stimulus_log.append(
+                    actor=self.name,
+                    type="tool_result",
+                    content={
+                        "tool": call.name,
+                        "output": f"Unknown tool: {call.name}",
+                        "is_error": True,
+                    },
+                )
                 continue
 
             result = tool.execute(**call.arguments)
             self.stimulus_log.append(
                 actor=self.name,
-                type="action",
+                type="tool_result",
                 content={
-                    "action": call.name,
+                    "tool": call.name,
                     "arguments": call.arguments,
                     "output": result.content,
                     "is_error": result.is_error,
                 },
             )
+            if getattr(tool, "ends_turn", False):
+                ends_turn = True
 
-        # Nothing can request another cycle yet; when tools gain that power, this
-        # branch re-enters Orient and loop_termination is skipped.
-        loop_again = False
-        if loop_again:
-            self.orient()
-        else:
+        # The pass counter lives in loop_memory (reset by loop_termination), so it counts
+        # passes within a single turn and resets when the turn ends.
+        passes = self.loop_memory.get("passes", 0) + 1
+        self.loop_memory["passes"] = passes
+
+        # Terminate when a terminal tool ran (the agent responded) or the runaway cap is
+        # hit; otherwise re-enter Orient so the model can act on the tool results, which
+        # are now in the stimulus log.
+        if ends_turn or passes >= self.max_loops:
             self.loop_termination()
+        else:
+            self.orient()
 
     def loop_termination(self):
         """Runs once per cognitive loop, only when Act is actually terminating it —

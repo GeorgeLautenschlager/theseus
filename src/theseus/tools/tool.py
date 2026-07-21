@@ -55,11 +55,17 @@ class Tool(Protocol):
 
     Because that is exactly what an OpenAI-compatible `tools` field wants, serializing a
     tool for the wire is a near pass-through (see `to_openai_tool`).
+
+    `ends_turn` marks a *terminal* tool (a chat reply — `TerminalChat`, `WebChat`) whose
+    call completes the cognitive turn. Tools that omit it are non-terminal: running one
+    triggers another Orient→Decide→Act pass so the agent can act on the result. The core
+    reads it as `getattr(tool, "ends_turn", False)`, so only terminal tools declare it.
     """
 
     name: str
     description: str
     parameters: dict[str, Any]
+    ends_turn: bool = False
 
     def execute(self, **kwargs: Any) -> ToolResult:
         """Run the tool with the already-parsed argument object."""

@@ -15,6 +15,7 @@ from theseus.tools.tool import ToolResult
 
 class TerminalChat:
     name = "terminal_chat"
+    ends_turn = True  # a chat reply completes the cognitive turn
     description = (
         "Send a chat message through the terminal chat UI. The message is delivered "
         "verbatim as your reply."
