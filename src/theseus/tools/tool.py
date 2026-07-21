@@ -44,9 +44,8 @@ class AssistantTurn:
 class Tool(Protocol):
     """A structured capability the model can invoke with typed arguments.
 
-    Distinct from `Effector`: effectors are the agent's freeform "how I act" surface
-    (two-phase text), while tools are invoked with a validated argument object and
-    return a structured `ToolResult` the loop feeds back to the model.
+    A tool is invoked with a validated argument object and returns a structured
+    `ToolResult` that the loop feeds back to the model.
 
     `parameters` is a plain JSON Schema object describing the arguments, e.g.::
 

@@ -1,9 +1,10 @@
-"""WebEffector — delivers agent chat responses to the Theseus Chat web UI.
+"""WebChat — delivers agent chat responses to the Theseus Chat web UI.
 
-Pairs with `WebObserver` (see `web_observer.py`). Plays the same role as
-`ChatEffector.respond` — the `act` phase's mouth — but instead of `print`,
-it hands the reply to whichever browser tabs are connected, over
-Server-Sent Events.
+Pairs with `WebChatUIObserver` (see `web_chat_ui_observer.py`). Plays the same
+role as `TerminalChat.respond` — the agent's "mouth" — but instead of `print`,
+it hands the reply to whichever browser tabs are connected, over Server-Sent
+Events. Exposed to the cognitive core as a `Tool` the model can invoke during
+Decide.
 """
 
 from __future__ import annotations
@@ -11,7 +12,9 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
+
+from theseus.tools.tool import ToolResult
 
 if TYPE_CHECKING:
     from theseus.web_chat_ui_observer import WebChatUIObserver
@@ -19,25 +22,34 @@ if TYPE_CHECKING:
 _STEP_SECONDS = 0.05
 
 
-class WebChatUIEffector:
+class WebChat:
     name = "respond_in_web_chat"
     description = (
-        "Send a chat message to George through the web chat UI. Choose this when the recent "
-        "history contains a message or situation that calls for a reply from you."
+        "Send a chat message to George through the web chat UI. The message is delivered "
+        "verbatim as your reply."
     )
-    act_instruction = (
-        "Compose your chat message to George now. Your entire output is delivered verbatim as "
-        "your message in the web chat UI — output only the message itself, with no JSON, no "
-        "preamble, and no notes about these instructions."
-    )
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "The chat message to send, delivered verbatim.",
+            },
+        },
+        "required": ["message"],
+    }
 
     def __init__(self, web_observer: "WebChatUIObserver"):
         self.response = None
         self.web_observer = web_observer
 
-    def execute(self, payload: str) -> None:
-        """Satisfies the Effector protocol; delegates to respond()."""
-        self.respond(payload)
+    def execute(self, message: str) -> ToolResult:
+        """Satisfies the Tool protocol; delegates to respond()."""
+        self.respond(message)
+        return ToolResult(
+            "Message delivered to the web chat UI.",
+            details={"message": message},
+        )
 
     def respond(self, response: str) -> None:
         """Send the response to the chat UI, revealed in word-sized chunks.

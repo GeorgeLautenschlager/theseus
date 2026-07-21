@@ -1,51 +1,41 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Any
+
 from theseus.cognitive_prompts import (
-    WAIT_ACTION,
-    build_act_system_prompt,
-    build_act_user_prompt,
     build_decide_system_prompt,
     build_decide_user_prompt,
-    decision_json_schema,
 )
+from theseus.tools.tool import ToolResult
 
 
-class TestDecisionJsonSchema:
-    def test_returns_exact_schema_shape(self):
-        action_names = ["respond_in_web_chat", "wait"]
+@dataclass(frozen=True)
+class FakeTool:
+    name: str
+    description: str
+    parameters: dict[str, Any] = field(default_factory=dict)
 
-        schema = decision_json_schema(action_names)
-
-        assert schema == {
-            "type": "object",
-            "properties": {
-                "rationale": {"type": "string"},
-                "action": {"type": "string", "enum": action_names},
-            },
-            "required": ["rationale", "action"],
-            "additionalProperties": False,
-        }
-
-    def test_rationale_property_precedes_action(self):
-        schema = decision_json_schema(["wait"])
-
-        assert list(schema["properties"].keys()) == ["rationale", "action"]
-
-    def test_enum_matches_supplied_action_names(self):
-        action_names = ["respond_in_web_chat", "log_observation", "wait"]
-
-        schema = decision_json_schema(action_names)
-
-        assert schema["properties"]["action"]["enum"] == action_names
+    def execute(self, **kwargs: Any) -> ToolResult:
+        return ToolResult("")
 
 
 class TestBuildDecideSystemPrompt:
     def setup_method(self):
         self.constitution = "You are Tam, a machine intelligence."
-        self.options = [
-            ("respond_in_web_chat", "Send a chat message to George through the web chat UI."),
+        self.tools = [
+            FakeTool(
+                name="terminal_chat",
+                description="Send a chat message through the terminal chat UI.",
+                parameters={"type": "object", "properties": {"message": {"type": "string"}}},
+            ),
+            FakeTool(
+                name="read",
+                description="Read a file from disk.",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+            ),
         ]
-        self.prompt = build_decide_system_prompt(self.constitution, self.options)
+        self.prompt = build_decide_system_prompt(self.constitution, self.tools)
 
     def test_includes_constitution(self):
         assert self.constitution in self.prompt
@@ -53,30 +43,35 @@ class TestBuildDecideSystemPrompt:
     def test_identifies_decide_step(self):
         assert "Decide" in self.prompt
 
-    def test_instructs_not_to_carry_out_action(self):
-        assert "do not carry out the action" in self.prompt.lower()
+    def test_instructs_calling_a_tool_with_arguments(self):
+        # Native tool-calling: the model invokes the tool AND supplies the arguments in
+        # the same turn — there is no separate Act model call to compose them later.
+        lower = self.prompt.lower()
+        assert "call" in lower
+        assert "argument" in lower
 
-    def test_lists_each_effector_option(self):
-        for name, description in self.options:
-            assert name in self.prompt
-            assert description in self.prompt
+    def test_lists_each_tool_as_a_readable_action(self):
+        # A readable "- name: description" menu, in addition to the native tool schemas,
+        # so small local models still reliably see what is on offer.
+        for tool in self.tools:
+            assert f"- {tool.name}: {tool.description}" in self.prompt
 
-    def test_lists_wait_option(self):
-        assert WAIT_ACTION in self.prompt
-        assert "Take no action this cycle" in self.prompt
+    def test_frames_not_acting_as_calling_no_tool(self):
+        # The old explicit "wait" action is gone; declining to act is simply calling no tool.
+        assert "no tool" in self.prompt.lower()
 
-    def test_output_contract_is_double_quoted_json(self):
-        assert "code fences" in self.prompt.lower() or "no commentary" in self.prompt.lower()
-        assert '{"rationale"' in self.prompt
-        assert '"action"' in self.prompt
-        assert "'rationale'" not in self.prompt
-        assert "'action'" not in self.prompt
+    def test_defaults_to_engaging(self):
+        # Root-cause guard: the model was defaulting to inaction on a plain greeting. The
+        # prompt must positively encourage responding and frame not-acting as the exception.
+        lower = self.prompt.lower()
+        assert "respond" in lower
+        assert "only" in lower or "reserve" in lower
 
-    def test_example_places_rationale_before_action(self):
-        rationale_index = self.prompt.index('"rationale"')
-        action_index = self.prompt.index('"action"')
-
-        assert rationale_index < action_index
+    def test_no_json_output_contract(self):
+        # Regression guard: the old two-call flow asked for a {"rationale","action"} JSON
+        # blob. Native tool-calling must not — it fights the tool-call response format.
+        assert '{"rationale"' not in self.prompt
+        assert '"action"' not in self.prompt
 
 
 class TestBuildDecideUserPrompt:
@@ -94,40 +89,13 @@ class TestBuildDecideUserPrompt:
 
         assert "decide" in prompt.lower()
 
+    def test_includes_memories_when_present(self):
+        prompt = build_decide_user_prompt("ctx", "now", memories="George is the user.")
 
-class TestBuildActSystemPrompt:
-    def test_includes_constitution_and_identifies_act_step(self):
-        constitution = "You are Tam."
+        assert "<memories>" in prompt
+        assert "George is the user." in prompt
 
-        prompt = build_act_system_prompt(constitution)
+    def test_omits_memories_section_when_empty(self):
+        prompt = build_decide_user_prompt("ctx", "now")
 
-        assert constitution in prompt
-        assert "Act" in prompt
-
-    def test_states_decision_already_made(self):
-        prompt = build_act_system_prompt("constitution")
-
-        assert "already" in prompt.lower()
-
-
-class TestBuildActUserPrompt:
-    def setup_method(self):
-        self.context = '{"id":"1","actor":"user","type":"chat_message","content":{}}'
-        self.action = "respond_in_web_chat"
-        self.rationale = "George just said hello and is waiting on a reply."
-        self.act_instruction = "Compose your chat message to George now."
-        self.prompt = build_act_user_prompt(
-            self.context, self.action, self.rationale, self.act_instruction
-        )
-
-    def test_includes_context(self):
-        assert self.context in self.prompt
-
-    def test_includes_chosen_action(self):
-        assert self.action in self.prompt
-
-    def test_includes_rationale(self):
-        assert self.rationale in self.prompt
-
-    def test_includes_act_instruction_verbatim(self):
-        assert self.act_instruction in self.prompt
+        assert "<memories>" not in prompt

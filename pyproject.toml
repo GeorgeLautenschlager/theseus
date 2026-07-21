@@ -14,10 +14,11 @@ dependencies = [
     "uvicorn (>=0.29,<1)",
     "jinja2 (>=3.1,<4)",
     "python-multipart (>=0.0.9)",
+    "ipdb (>=0.13.13,<0.14.0)",
 ]
 
 [project.scripts]
-aldric = "theseus.agents.aldric:main"
+alty = "theseus.agents.alty_mcgee:main"
 
 [tool.poetry]
 packages = [{ include = "theseus", from = "src" }]

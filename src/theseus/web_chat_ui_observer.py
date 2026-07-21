@@ -1,7 +1,7 @@
-"""WebObserver — serves the Theseus Chat web UI and feeds user messages into the agent.
+"""WebChatUIObserver — serves the Theseus Chat web UI and feeds user messages into the agent.
 
-Pairs with `WebEffector` (see `web_effector.py`) the same way `ChatObserver`
-pairs with `ChatEffector`, but over HTTP/SSE instead of stdin/stdout.
+Pairs with `WebChat` (see `tools/web_chat.py`) the same way `ChatObserver`
+pairs with `TerminalChat`, but over HTTP/SSE instead of stdin/stdout.
 """
 
 from __future__ import annotations
@@ -45,9 +45,8 @@ class WebChatUIObserver:
     `orient_chat_message_callback` is invoked with the user's message text on
     a background thread, so the HTTP request returns immediately (the page
     shows a typing indicator while the agent works — the browser is never
-    left hanging on a slow LLM call). Wire it directly to a
-    `ChatCognitiveCore.orient(message)`-style core. For a zero-argument core
-    such as `CognitiveCore.orient()`, wrap it in the agent file:
+    left hanging on a slow LLM call). `CognitiveCore.orient()` takes no
+    argument, so wrap it in the agent file:
     `orient_chat_message_callback=lambda message: core.orient()` — the
     message has already been appended to the stimulus log by the time the
     callback fires, so a log-driven core still sees it.
@@ -79,7 +78,7 @@ class WebChatUIObserver:
         )
         self.app = self._build_app()
 
-    # -- called by WebEffector ---------------------------------------------
+    # -- called by WebChat -------------------------------------------------
 
     def publish_assistant_chunk(self, message_id: str, text: str, done: bool) -> None:
         """Broadcast one step of an in-progress (or completed) agent reply.

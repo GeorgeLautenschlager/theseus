@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Theseus is a **modular construction kit for cognitive language agents**, packaged as a conventional Poetry library (`theseus`, src layout, Python 3.12). Agents are composed from Theseus modules; the in-repo reference agent is `src/theseus/agents/aldric.py`. Production agents (e.g. Tam, at `/home/aldric/tam`) live in their own repos and depend on Theseus as a git dependency pinned to a release tag.
+Theseus is a **modular construction kit for cognitive language agents**, packaged as a conventional Poetry library (`theseus`, src layout, Python 3.12). Agents are composed from Theseus modules; the in-repo reference agent is `src/theseus/agents/alty_mcgee.py` (Alty). Production agents (e.g. Tam, at `/home/aldric/tam`) live in their own repos and depend on Theseus as a git dependency pinned to a release tag.
 
 ## Commands
 
@@ -14,7 +14,7 @@ poetry install --with eval   # also sentence-transformers/torch, needed by tests
 
 make test                    # poetry run pytest -q tests/
 poetry run pytest tests/test_cognitive_core.py -v   # single file
-poetry run aldric            # run the reference agent (needs a local LLM endpoint)
+poetry run alty              # run the reference agent Alty (needs a local LLM endpoint)
 ```
 
 The venv is in-project (`.venv`, via `poetry.toml`). Never activate it manually — use `poetry run`. `tests/test_fact_retention.py` needs a live LLM endpoint and the `eval` group; the rest of the suite is offline.
@@ -24,12 +24,12 @@ The venv is in-project (`.venv`, via `poetry.toml`). Never activate it manually 
 The README's Architecture section is the authoritative description. Short version:
 
 - **`StimulusLog`** (`stimulus_log.py`) — append-only JSONL event stream; everything the agent experiences or does is a `StimulusEvent`. The Turing-machine "tape".
-- **`CognitiveCore`** (`cognitive_core.py`) — the "head". Runs Orient → Decide → Act over the log. `orient(...)` is the entry point observers call. Decide uses `cognitive_prompts.py` and the configured `model_providers` (tried in priority order); Act dispatches to `effectors` by name and decides whether to loop again.
+- **`CognitiveCore`** (`cognitive_core.py`) — the "head". Runs Orient → Decide → Act over the log. `orient(...)` is the entry point observers call. Decide uses `cognitive_prompts.py` and the configured `model_providers` (tried in priority order) to make one native tool-calling turn; Act executes the model's chosen tool(s) with the arguments it supplied and decides whether to loop again.
 - **Observers** (`chat_observer.py`, `web_chat_ui_observer.py`) — feed stimuli in and trigger cognitive loops via the `orient` callback. The web observer is a FastAPI app serving the chat + debug UI from `web/templates` and `web/static` (packaged data files — they ship inside the wheel).
-- **Effectors** (`effector.py` base; `chat_effector.py`, `web_chat_ui_effector.py`) — how the agent acts on the world.
+- **Tools** (`tools/tool.py` — the `Tool` protocol + `ToolResult`) — structured capabilities the model invokes with typed arguments; each `execute(...)` returns a `ToolResult` the loop feeds back. Concrete tools live in `tools/` (file/shell tools like `read.py`, `bash.py`; the terminal chat "mouth" `terminal_chat.py`; the web-UI reply tool `web_chat.py`).
 - **Model providers** (`model_providers/`) — one class per backend (LM Studio, Ollama, llama.cpp, Claude...), all speaking an OpenAI-compatible interface.
 
-An agent file (see `agents/aldric.py`, or `tam.py` in the Tam repo) just composes these: build a `StimulusLog`, a `CognitiveCore` with providers + effectors, and observers wired to `core.orient`.
+An agent file (see `agents/alty_mcgee.py`, or `tam.py` in the Tam repo) just composes these: build a `StimulusLog`, a `CognitiveCore` with providers + tools, and observers wired to `core.orient`.
 
 ## Layout & conventions
 
@@ -40,7 +40,7 @@ src/theseus/             # the package — flat modules, no "modules" subdir
 tests/                   # imports `theseus.*`; no sys.path hacks — ever
 ```
 
-- Regular packages: every package dir has an `__init__.py`. The top-level `src/theseus/__init__.py` holds curated exports (`CognitiveCore`, `StimulusLog`, `StimulusEvent`, `Effector`) — add to it when a new module becomes part of the public API.
+- Regular packages: every package dir has an `__init__.py`. The top-level `src/theseus/__init__.py` holds curated exports (`CognitiveCore`, `StimulusLog`, `StimulusEvent`, `Tool`) — add to it when a new module becomes part of the public API.
 - Every module starts with `from __future__ import annotations`.
 - Imports are absolute: `from theseus.cognitive_core import CognitiveCore`.
 - New work goes through the spec → plan → implement flow under `docs/superpowers/`.
