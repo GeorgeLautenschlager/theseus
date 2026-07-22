@@ -190,3 +190,23 @@ class TestRetrieve:
         embedder.embed.side_effect = RuntimeError("embedding endpoint down")
 
         assert memory.retrieve("query") == ""
+
+    def test_query_truncated_to_budget_before_embed(self, tmp_path):
+        # Defence-in-depth: an oversized query must be capped to the tail before it
+        # reaches the embedding model, whatever the caller passes.
+        embedder = make_embedder([1.0, 0.0])
+        memory = AgenticMemory(
+            model_providers=[make_provider([])],
+            embedding_providers=[embedder],
+            store=MemoryStore(tmp_path / "memory.jsonl"),
+            stimulus_log=StimulusLog(tmp_path / "stimulus_log.jsonl"),
+            retrieval_query_chars=10,
+        )
+        seed_note(memory.store)  # non-empty store, so retrieval reaches the embedder
+        long_query = "x" * 500 + "TAILEND"
+
+        memory.retrieve(long_query)
+
+        embedded = embedder.embed.call_args.args[0]
+        assert len(embedded) <= 10
+        assert embedded == long_query[-10:]

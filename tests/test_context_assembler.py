@@ -56,3 +56,22 @@ class TestMemories:
 
         assert assembled.memories == ""
         memory.retrieve.assert_not_called()
+
+    def test_retrieval_query_bounded_while_prompt_window_stays_full(self, tmp_path):
+        # The prompt window can be huge (fine for the LLM), but the retrieval query is
+        # embedded, so it must stay within a configurable budget.
+        log = fill_log(tmp_path, 10)
+        memory = MagicMock()
+        memory.retrieve.return_value = ""
+
+        assembled = ContextAssembler(
+            stimulus_log=log, memory=memory, retrieval_query_chars=50
+        ).assemble_context()
+
+        # Every event is still in the prompt window...
+        assert "msg 0" in assembled.recent_events
+        assert "msg 9" in assembled.recent_events
+        # ...but retrieval only saw the most-recent tail, capped to the budget.
+        query = memory.retrieve.call_args.args[0]
+        assert len(query) <= 50
+        assert query == assembled.recent_events[-50:]

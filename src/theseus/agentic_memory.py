@@ -46,6 +46,7 @@ class AgenticMemory:
         stimulus_log: StimulusLog,
         k_neighbors: int = 5,
         k_retrieve: int = 5,
+        retrieval_query_chars: int = 2000,
     ):
         self.model_providers = model_providers
         self.embedding_providers = embedding_providers
@@ -53,6 +54,7 @@ class AgenticMemory:
         self.stimulus_log = stimulus_log
         self.k_neighbors = k_neighbors
         self.k_retrieve = k_retrieve
+        self.retrieval_query_chars = retrieval_query_chars
 
     @staticmethod
     def _first_available(providers: List[ModelProvider]) -> ModelProvider:
@@ -123,6 +125,8 @@ class AgenticMemory:
         """Top-k notes by embedding similarity, expanded one hop along links."""
         if len(self.store) == 0:
             return []
+        # Cap the embedding input to the most-recent tail so it fits the model's context.
+        query = query[-self.retrieval_query_chars:]
         try:
             embedding = self._select_embedding_provider().embed(query)
             hits = self.store.top_k(embedding, self.k_retrieve)

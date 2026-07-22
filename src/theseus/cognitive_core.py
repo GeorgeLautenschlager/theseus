@@ -40,6 +40,7 @@ class CognitiveCore:
         memory: Memory | None = None,
         name: str = "Tam",
         max_loops: int = 10,
+        retrieval_query_chars: int = 2000,
     ):
         self.constitution = constitution
         self.model_providers = model_providers
@@ -47,7 +48,9 @@ class CognitiveCore:
         self.tools = tools
         self.stimulus_log = stimulus_log
         self.memory = memory
-        self.context_assembler = ContextAssembler(stimulus_log=stimulus_log, memory=memory)
+        self.context_assembler = ContextAssembler(
+            stimulus_log=stimulus_log, memory=memory, retrieval_query_chars=retrieval_query_chars
+        )
         self.name = name
         self.max_loops = max_loops
 

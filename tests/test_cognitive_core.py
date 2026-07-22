@@ -339,3 +339,16 @@ class TestMemoryIntegration:
         assert provider.complete_with_tools.call_count == 1
         messages = provider.complete_with_tools.call_args.args[0]
         assert "<memories>" not in messages[1]["content"]
+
+
+def test_core_passes_retrieval_query_budget_to_assembler(tmp_path):
+    stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+    core = CognitiveCore(
+        constitution="You are Tam.",
+        model_providers=[MagicMock()],
+        tools={},
+        stimulus_log=stimulus_log,
+        retrieval_query_chars=123,
+    )
+
+    assert core.context_assembler.retrieval_query_chars == 123
