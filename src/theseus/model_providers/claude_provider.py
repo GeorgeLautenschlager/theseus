@@ -33,13 +33,19 @@ class ClaudeProvider(ModelProvider):
         # them the CLI loads this project's CLAUDE.md/skills and the model
         # responds as an interactive Claude Code session (e.g. offering to
         # invoke skills) instead of just answering the prompt.
-        cmd = ["claude", "-p", prompt, "--model", self.model, "--safe-mode", "--tools", ""]
+        #
+        # The prompt is fed on stdin, not as an argv. A large prompt (e.g. a full
+        # recent-events window) passed as a command-line argument overflows the OS
+        # single-argument limit (Linux MAX_ARG_STRLEN, 128 KiB) and raises
+        # OSError [Errno 7] "Argument list too long". `claude -p` reads the prompt
+        # from stdin when it isn't given positionally.
+        cmd = ["claude", "-p", "--model", self.model, "--safe-mode", "--tools", ""]
         if system_prompt:
             cmd += ["--system-prompt", system_prompt]
         if json_schema is not None:
             cmd += ["--json-schema", json.dumps(json_schema)]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)
         return result.stdout.strip()
 
     def complete_with_tools(

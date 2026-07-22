@@ -126,3 +126,33 @@ def test_no_tools_returns_plain_completion():
     assert turn.tool_calls == ()
     _, kwargs = provider.chat.call_args
     assert "json_schema" not in kwargs  # plain completion — no schema constraint
+
+
+def test_chat_feeds_prompt_via_stdin_not_argv(monkeypatch):
+    # A large prompt as a CLI argument overflows the OS single-argument limit
+    # (Linux MAX_ARG_STRLEN, 128 KiB) → OSError [Errno 7]. The prompt must go on stdin.
+    from theseus.model_providers import claude_provider
+
+    recorded = {}
+
+    class _Result:
+        stdout = "the reply\n"
+
+    def fake_run(cmd, **kwargs):
+        recorded["cmd"] = cmd
+        recorded["kwargs"] = kwargs
+        return _Result()
+
+    monkeypatch.setattr(claude_provider.subprocess, "run", fake_run)
+
+    provider = ClaudeProvider(model="claude-sonnet-4-6")
+    big_prompt = "A" * 200_000
+    out = provider.chat(big_prompt, system_prompt="you are tam")
+
+    assert out == "the reply"
+    # Prompt is fed on stdin, never as an argv...
+    assert recorded["kwargs"]["input"] == big_prompt
+    assert big_prompt not in recorded["cmd"]
+    # ...while the (bounded) system prompt stays a CLI argument.
+    assert "-p" in recorded["cmd"]
+    assert "you are tam" in recorded["cmd"]
