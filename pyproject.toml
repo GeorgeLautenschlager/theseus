@@ -1,6 +1,6 @@
 [project]
 name = "theseus"
-version = "0.3.0"
+version = "0.4.0"
 description = "A modular construction kit for cognitive language agents"
 authors = [
     { name = "George Lautenschlager", email = "georgelautenschlager@gmail.com" },
