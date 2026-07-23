@@ -47,7 +47,7 @@ tests/                   # imports `theseus.*`; no sys.path hacks — ever
 
 ## Releasing / consumers
 
-Deployed agents pin Theseus by tag: `theseus @ git+ssh://git@github.com/GeorgeLautenschlager/theseus.git@v0.1.0`. To ship a change to them: bump `version` in `pyproject.toml`, commit, `git tag vX.Y.Z && git push --tags`, then bump the pin in the consumer repo and `poetry update theseus` there. Merging to main does NOT affect deployed agents until their pin moves.
+Deployed agents pin Theseus by tag: `theseus @ git+ssh://git@github.com/GeorgeLautenschlager/theseus.git@v0.1.0`. To ship a change to them, from an up-to-date `main` run `make release VERSION=X.Y.Z` — it verifies the tree is clean and the offline suite passes, then bumps `pyproject.toml`, commits, tags `vX.Y.Z`, and pushes the branch + tag (add `SKIP_TESTS=1` to skip the test gate). Then bump the pin in the consumer repo (`poetry add "theseus @ git+ssh://…@vX.Y.Z"`) and restart it. Merging to main does NOT affect deployed agents until their pin moves.
 
 ## Reference docs
 
