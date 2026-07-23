@@ -1,5 +1,8 @@
 from __future__ import annotations
+from pathlib import Path
 
+from theseus.agentic_memory import AgenticMemory
+from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusLog
 from theseus.cognitive_core import CognitiveCore
 from theseus.chat_observer import ChatObserver
@@ -15,9 +18,25 @@ ALTY_CONSTITUTION = """You are the crash test dummy of Theseus Agents.
 
 
 class AltyMcGee:
-    def __init__(self, stimulus_log: StimulusLog | None = None):
+    def __init__(
+        self,
+        stimulus_log: StimulusLog | None = None,
+        memory_store: MemoryStore | None = None,
+    ):
         self.terminal_chat = TerminalChat()
-        self.stimulus_log = stimulus_log or StimulusLog('stimulus_log.jsonl')
+        # `is not None`, not `or`: an empty MemoryStore is falsy (it defines __len__),
+        # so `or` would silently fall back to the real on-disk store.
+        if stimulus_log is None:
+            stimulus_log = StimulusLog('stimulus_log.jsonl')
+        if memory_store is None:
+            memory_store = MemoryStore(Path(__file__).parent / "a_mem.jsonl")
+        self.stimulus_log = stimulus_log
+        self.memory = AgenticMemory(
+            model_providers=[OllamaProvider(model="gemma4:e4b")],
+            embedding_providers=[OllamaProvider(model="nomic-embed-text")],
+            store=memory_store,
+            stimulus_log=self.stimulus_log,
+        )
         self.core = CognitiveCore(
             stimulus_log=self.stimulus_log,
             constitution=ALTY_CONSTITUTION,
@@ -27,6 +46,7 @@ class AltyMcGee:
             ],
             tools=all_tools() | {self.terminal_chat.name: self.terminal_chat},
             name="Alty McGee",
+            memory=self.memory
         )
         self.chat_observer = ChatObserver(
             stimulus_log=self.stimulus_log,
