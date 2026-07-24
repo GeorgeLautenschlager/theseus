@@ -14,7 +14,7 @@ class TestFactRetention:
         self.encoder = CrossEncoder("dleemiller/ModernCE-base-nli")
 
     def _say(self, agent: AltyMcGee, message: str) -> str | None:
-        """Feed a user message the way ChatObserver would, run one cognitive loop,
+        """Feed a user message the way TerminalChatObserver would, run one cognitive loop,
         and return whatever Alty said back through the terminal_chat tool (None if
         it chose not to reply this cycle)."""
         agent.stimulus_log.append(

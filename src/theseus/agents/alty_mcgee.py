@@ -5,7 +5,7 @@ from theseus.agentic_memory import AgenticMemory
 from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusLog
 from theseus.cognitive_core import CognitiveCore
-from theseus.chat_observer import ChatObserver
+from theseus.chat_observer import TerminalChatObserver
 from theseus.model_providers.lm_studio_provider import LmStudioProvider
 from theseus.model_providers.ollama_provider import OllamaProvider
 from theseus.tools.registry import all_tools
@@ -48,7 +48,7 @@ class AltyMcGee:
             name="Alty McGee",
             memory=self.memory
         )
-        self.chat_observer = ChatObserver(
+        self.chat_observer = TerminalChatObserver(
             stimulus_log=self.stimulus_log,
             orient_chat_message_callback=self.core.orient
         )

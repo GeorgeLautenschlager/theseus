@@ -65,7 +65,7 @@ def alty(tmp_path) -> AltyMcGee:
 
 
 def say(alty: AltyMcGee, message: str) -> str | None:
-    """Feed a user message the way ChatObserver does, run one full cognitive loop,
+    """Feed a user message the way TerminalChatObserver does, run one full cognitive loop,
     and return what Alty said back (None if he chose not to reply)."""
     alty.stimulus_log.append(
         actor="user", type="chat_message", content={"message": message}

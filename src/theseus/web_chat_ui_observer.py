@@ -1,6 +1,6 @@
 """WebChatUIObserver — serves the Theseus Chat web UI and feeds user messages into the agent.
 
-Pairs with `WebChat` (see `tools/web_chat.py`) the same way `ChatObserver`
+Pairs with `WebChat` (see `tools/web_chat.py`) the same way `TerminalChatObserver`
 pairs with `TerminalChat`, but over HTTP/SSE instead of stdin/stdout.
 """
 
@@ -37,7 +37,7 @@ _DEBUG_POLL_INTERVAL_SECONDS = 1.0
 class WebChatUIObserver:
     """Serves the Theseus Chat web UI and feeds user messages into the agent.
 
-    Mirrors ChatObserver's role — append the incoming stimulus, then hand off
+    Mirrors TerminalChatObserver's role — append the incoming stimulus, then hand off
     to whatever triggers orientation — but the "blocking read" is an HTTP
     request instead of stdin, and replies are pushed back out over
     Server-Sent Events instead of a blocking function return.
@@ -273,7 +273,7 @@ class WebChatUIObserver:
         return app
 
     def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
-        """Run the web server. Blocks, the way ChatObserver's stdin loop
+        """Run the web server. Blocks, the way TerminalChatObserver's stdin loop
         blocks — call this from the agent's run() instead of looping
         `observe_chat_message()`-style calls."""
         import uvicorn

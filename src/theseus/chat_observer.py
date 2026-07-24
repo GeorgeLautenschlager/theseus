@@ -1,4 +1,4 @@
-class ChatObserver:
+class TerminalChatObserver:
     def __init__(self, stimulus_log, orient_chat_message_callback):
         self.stimulus_log = stimulus_log
         self.orient_chat_message_callback = orient_chat_message_callback

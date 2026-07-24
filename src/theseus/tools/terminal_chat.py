@@ -1,6 +1,6 @@
 """TerminalChat — delivers agent chat responses to the terminal chat UI.
 
-Pairs with `ChatObserver` (see `chat_observer.py`). Plays the same role as
+Pairs with `TerminalChatObserver` (see `chat_observer.py`). Plays the same role as
 `WebChat.respond` — the agent's "mouth" — but instead of Server-Sent
 Events, it just prints the reply to stdout. Exposed to the cognitive core as a
 `Tool` the model can invoke during Decide.
