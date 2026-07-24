@@ -4,7 +4,7 @@ from typing import Protocol
 
 
 class Memory(Protocol):
-    """A pluggable long-term memory module for a CognitiveCore.
+    """A pluggable long-term memory module for a OODACore.
 
     The core only ever signals a memory module; everything else — what to
     consolidate, how to store it, when it was last formed — is the module's

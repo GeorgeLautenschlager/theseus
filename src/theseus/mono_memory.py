@@ -12,7 +12,7 @@ class AssembledContext:
     memories: str        # rendered memories from the memory module; "" when none
 
 
-class ContextAssembler:
+class MonoMemory:
     """assembles context for Decide from the following sources:
     - StimulusLog: the last `window_size` events, verbatim
     - the agent's memory systems, if any are present: whatever the module's

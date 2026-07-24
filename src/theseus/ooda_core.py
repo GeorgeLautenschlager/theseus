@@ -7,7 +7,7 @@ from theseus.cognitive_prompts import (
     build_decide_system_prompt,
     build_decide_user_prompt,
 )
-from theseus.context_assembler import ContextAssembler
+from theseus.mono_memory import MonoMemory
 from theseus.memory import Memory
 from theseus.stimulus_log import StimulusLog
 from theseus.tools.tool import Tool
@@ -15,7 +15,7 @@ from theseus.tools.tool import Tool
 from .model_providers.model_provider import ModelProvider
 
 
-class CognitiveCore:
+class OODACore:
     """A truncated OODA loop that serves as the primary cognitive process for a Theseus agent.
 
     The core does Orient, Decide and Act, steps and internalizes the LLM. Steps never pass
@@ -27,7 +27,7 @@ class CognitiveCore:
         deciding which model provider is used.
         tools: List of available Tool objects.
         memory: Optional memory module, seen only through the Memory protocol: Orient pulls
-        `retrieve(...)` results into context (via the ContextAssembler), and loop termination
+        `retrieve(...)` results into context (via the MonoMemory), and loop termination
         signals `form()`. What and how the module consolidates is its own business.
         name: The core's own actor name, used when logging its decisions and actions.
     """
@@ -48,7 +48,7 @@ class CognitiveCore:
         self.tools = tools
         self.stimulus_log = stimulus_log
         self.memory = memory
-        self.context_assembler = ContextAssembler(
+        self.mono_memory = MonoMemory(
             stimulus_log=stimulus_log, memory=memory, retrieval_query_chars=retrieval_query_chars
         )
         self.name = name
@@ -63,7 +63,7 @@ class CognitiveCore:
 
     def orient(self):
         """Callback to be invoked by chat UI"""
-        assembled = self.context_assembler.assemble_context()
+        assembled = self.mono_memory.assemble_context()
         self.loop_memory["recent_events"] = assembled.recent_events
         self.loop_memory["memories"] = assembled.memories
 

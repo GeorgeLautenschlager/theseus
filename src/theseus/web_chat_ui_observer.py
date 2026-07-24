@@ -45,7 +45,7 @@ class WebChatUIObserver:
     `orient_chat_message_callback` is invoked with the user's message text on
     a background thread, so the HTTP request returns immediately (the page
     shows a typing indicator while the agent works — the browser is never
-    left hanging on a slow LLM call). `CognitiveCore.orient()` takes no
+    left hanging on a slow LLM call). `OODACore.orient()` takes no
     argument, so wrap it in the agent file:
     `orient_chat_message_callback=lambda message: core.orient()` — the
     message has already been appended to the stimulus log by the time the

@@ -4,7 +4,7 @@ from pathlib import Path
 from theseus.agentic_memory import AgenticMemory
 from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusLog
-from theseus.cognitive_core import CognitiveCore
+from theseus.ooda_core import OODACore
 from theseus.chat_observer import TerminalChatObserver
 from theseus.model_providers.lm_studio_provider import LmStudioProvider
 from theseus.model_providers.ollama_provider import OllamaProvider
@@ -37,7 +37,7 @@ class AltyMcGee:
             store=memory_store,
             stimulus_log=self.stimulus_log,
         )
-        self.core = CognitiveCore(
+        self.core = OODACore(
             stimulus_log=self.stimulus_log,
             constitution=ALTY_CONSTITUTION,
             model_providers=[

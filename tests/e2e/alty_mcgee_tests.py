@@ -137,7 +137,7 @@ class TestMemory:
         say(alty, GREETING)
         say(alty, E2E_PLAN)
 
-        assembled = alty.core.context_assembler.assemble_context()
+        assembled = alty.core.mono_memory.assemble_context()
 
         assert assembled.memories, "retrieval should surface notes from earlier turns"
 

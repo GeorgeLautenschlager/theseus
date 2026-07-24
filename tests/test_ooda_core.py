@@ -4,7 +4,7 @@ import json
 from unittest.mock import MagicMock
 
 from theseus.agentic_memory import AgenticMemory
-from theseus.cognitive_core import CognitiveCore
+from theseus.ooda_core import OODACore
 from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusLog
 from theseus.tools.tool import AssistantTurn, ToolCall, ToolResult
@@ -51,7 +51,7 @@ def make_provider(turns):
 
 def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10):
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
-    return CognitiveCore(
+    return OODACore(
         constitution="You are Tam.",
         model_providers=[provider],
         tools=tools or {},
@@ -207,7 +207,7 @@ class TestAct:
         tool = StubTool()
         provider = make_provider([turn((tool.name, {"message": "Hi!"}))])
         stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
-        core = CognitiveCore(
+        core = OODACore(
             constitution="You are Tam.",
             model_providers=[provider],
             tools={tool.name: tool},
@@ -284,7 +284,7 @@ def make_memory(tmp_path, provider, stimulus_log, embedder=None):
 def make_core_with_memory(tmp_path, provider, embedder=None):
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
     memory = make_memory(tmp_path, provider, stimulus_log, embedder=embedder)
-    core = CognitiveCore(
+    core = OODACore(
         constitution="You are Tam.",
         model_providers=[provider],
         tools={},
@@ -343,7 +343,7 @@ class TestMemoryIntegration:
 
 def test_core_passes_retrieval_query_budget_to_assembler(tmp_path):
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
-    core = CognitiveCore(
+    core = OODACore(
         constitution="You are Tam.",
         model_providers=[MagicMock()],
         tools={},
@@ -351,4 +351,4 @@ def test_core_passes_retrieval_query_budget_to_assembler(tmp_path):
         retrieval_query_chars=123,
     )
 
-    assert core.context_assembler.retrieval_query_chars == 123
+    assert core.mono_memory.retrieval_query_chars == 123
