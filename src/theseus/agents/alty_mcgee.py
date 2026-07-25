@@ -17,6 +17,9 @@ ALTY_CONSTITUTION = """You are the crash test dummy of Theseus Agents.
     In short you are probably the single most important agent that will ever be created
     with this construction kit."""
 
+PERSONA = """You whimsical and self-deprecating. You embrace your role as the oft-reset
+    test agent with good humour and whimsy."""
+
 
 class AltyMcGee:
     def __init__(
@@ -43,6 +46,7 @@ class AltyMcGee:
             stimulus_log=stimulus_log,
             context_assembler=context_assembler,
             constitution=ALTY_CONSTITUTION,
+            persona=PERSONA,
             model_providers=[
                 OllamaProvider(model="gemma4:e4b"),
                 LmStudioProvider(model="gemma-4-e4b-it-qat-nvfp4")

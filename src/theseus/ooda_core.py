@@ -37,6 +37,7 @@ class OODACore:
         name: str,
         working_dir: str,
         constitution: str,
+        persona: str,
         context_assembler: MonoMemory,
         stimulus_log: StimulusLog,
         model_providers: List[ModelProvider],
@@ -48,6 +49,7 @@ class OODACore:
         self.stimulus_log = stimulus_log
         self.memory = memory
         self.constitution = constitution
+        self.persona = persona
         self.context_assembler = context_assembler
         self.model_providers = model_providers
         self.loop_memory = {}
