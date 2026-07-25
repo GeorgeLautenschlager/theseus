@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List
 
+from theseus.agentic_memory import AgenticMemory
 from theseus.cognitive_prompts import (
     build_decide_system_prompt,
     build_decide_user_prompt,
@@ -40,7 +41,7 @@ class OODACore:
         stimulus_log: StimulusLog,
         model_providers: List[ModelProvider],
         tools: dict[str, Tool],
-        memory: MonoMemory | None = None,
+        memory: AgenticMemory | None = None,
         max_loops: int = 10
     ):
         self.name = name

@@ -21,43 +21,37 @@ ALTY_CONSTITUTION = """You are the crash test dummy of Theseus Agents.
 class AltyMcGee:
     def __init__(
         self,
-        stimulus_log: StimulusLog | None = None,
-        memory_store: MemoryStore | None = None,
     ):
         self.terminal_chat = TerminalChat()
-        # `is not None`, not `or`: an empty MemoryStore is falsy (it defines __len__),
-        # so `or` would silently fall back to the real on-disk store.
-        if stimulus_log is None:
-            stimulus_log = StimulusLog('stimulus_log.jsonl')
-        if memory_store is None:
-            memory_store = MemoryStore(Path(__file__).parent / "a_mem.jsonl")
-        self.stimulus_log = stimulus_log
 
-        self.memory = AgenticMemory(
+        stimulus_log = StimulusLog('stimulus_log.jsonl')
+        memory_store = MemoryStore('a_mem.jsonl')
+
+        memory = AgenticMemory(
             model_providers=[OllamaProvider(model="gemma4:e4b")],
             embedding_providers=[OllamaProvider(model="nomic-embed-text")],
             store=memory_store,
-            stimulus_log=self.stimulus_log,
+            stimulus_log=stimulus_log,
         )
 
         retrieval_query_chars: int = 2000
-        self.context_assembler = MonoMemory(stimulus_log=stimulus_log, memory=self.memory, retrieval_query_chars=retrieval_query_chars)
+        context_assembler = MonoMemory(stimulus_log=stimulus_log, memory=memory, retrieval_query_chars=retrieval_query_chars)
 
         self.core = OODACore(
             name="Alty McGee",
             working_dir="./",
-            stimulus_log=self.stimulus_log,
-            context_assembler=self.context_assembler,
+            stimulus_log=stimulus_log,
+            context_assembler=context_assembler,
             constitution=ALTY_CONSTITUTION,
             model_providers=[
                 OllamaProvider(model="gemma4:e4b"),
                 LmStudioProvider(model="gemma-4-e4b-it-qat-nvfp4")
             ],
             tools=all_tools() | {self.terminal_chat.name: self.terminal_chat},
-            memory=self.memory
+            memory=memory
         )
         self.chat_observer = TerminalChatObserver(
-            stimulus_log=self.stimulus_log,
+            stimulus_log=stimulus_log,
             orient_chat_message_callback=self.core.orient
         )
 
