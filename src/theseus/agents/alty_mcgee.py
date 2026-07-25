@@ -3,6 +3,7 @@ from pathlib import Path
 
 from theseus.agentic_memory import AgenticMemory
 from theseus.memory_store import MemoryStore
+from theseus.mono_memory import MonoMemory
 from theseus.stimulus_log import StimulusLog
 from theseus.ooda_core import OODACore
 from theseus.chat_observer import TerminalChatObserver
@@ -31,21 +32,28 @@ class AltyMcGee:
         if memory_store is None:
             memory_store = MemoryStore(Path(__file__).parent / "a_mem.jsonl")
         self.stimulus_log = stimulus_log
+
         self.memory = AgenticMemory(
             model_providers=[OllamaProvider(model="gemma4:e4b")],
             embedding_providers=[OllamaProvider(model="nomic-embed-text")],
             store=memory_store,
             stimulus_log=self.stimulus_log,
         )
+
+        retrieval_query_chars: int = 2000
+        self.context_assembler = MonoMemory(stimulus_log=stimulus_log, memory=self.memory, retrieval_query_chars=retrieval_query_chars)
+
         self.core = OODACore(
+            name="Alty McGee",
+            working_dir="./",
             stimulus_log=self.stimulus_log,
+            context_assembler=self.context_assembler,
             constitution=ALTY_CONSTITUTION,
             model_providers=[
                 OllamaProvider(model="gemma4:e4b"),
                 LmStudioProvider(model="gemma-4-e4b-it-qat-nvfp4")
             ],
             tools=all_tools() | {self.terminal_chat.name: self.terminal_chat},
-            name="Alty McGee",
             memory=self.memory
         )
         self.chat_observer = TerminalChatObserver(

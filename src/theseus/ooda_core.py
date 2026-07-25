@@ -33,25 +33,24 @@ class OODACore:
     """
     def __init__(
         self,
+        name: str,
+        working_dir: str,
         constitution: str,
+        context_assembler: MonoMemory,
+        stimulus_log: StimulusLog,
         model_providers: List[ModelProvider],
         tools: dict[str, Tool],
-        stimulus_log: StimulusLog,
-        memory: Memory | None = None,
-        name: str = "Tam",
-        max_loops: int = 10,
-        retrieval_query_chars: int = 2000,
+        memory: MonoMemory | None = None,
+        max_loops: int = 10
     ):
+        self.name = name
+        self.stimulus_log = stimulus_log
+        self.memory = memory
         self.constitution = constitution
+        self.context_assembler = context_assembler
         self.model_providers = model_providers
         self.loop_memory = {}
         self.tools = tools
-        self.stimulus_log = stimulus_log
-        self.memory = memory
-        self.mono_memory = MonoMemory(
-            stimulus_log=stimulus_log, memory=memory, retrieval_query_chars=retrieval_query_chars
-        )
-        self.name = name
         self.max_loops = max_loops
 
     def _select_model_provider(self) -> ModelProvider:
@@ -63,7 +62,7 @@ class OODACore:
 
     def orient(self):
         """Callback to be invoked by chat UI"""
-        assembled = self.mono_memory.assemble_context()
+        assembled = self.context_assembler.assemble_context()
         self.loop_memory["recent_events"] = assembled.recent_events
         self.loop_memory["memories"] = assembled.memories
 
