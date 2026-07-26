@@ -24,6 +24,7 @@ from starlette.concurrency import run_in_threadpool
 
 from theseus.web.debug_pagination import most_recent_page, older_batch
 from theseus.web.markdown import render_markdown
+from theseus.web.preview import notification_preview
 
 _WEB_DIR = Path(__file__).parent / "web"
 _TEMPLATES_DIR = _WEB_DIR / "templates"
@@ -87,8 +88,9 @@ class WebChatUIObserver:
         call for a given id creates the assistant's bubble in every open
         browser tab, later calls replace its contents, and the call with
         `done=True` finalizes it (restores "Online" status, re-enables the
-        composer, and records the reply in the transcript for future page
-        loads).
+        composer, records the reply in the transcript for future page loads,
+        and swaps in the `#chat-notify` signal the page turns into a desktop
+        notification when it is unfocused).
         """
         content_html = render_markdown(text)
         with self._lock:
@@ -106,6 +108,7 @@ class WebChatUIObserver:
             bubble_id=message_id,
             content_html=content_html,
             time=time_label,
+            notify_preview=notification_preview(text),
         )
         for queue in listeners:
             queue.put(fragment)

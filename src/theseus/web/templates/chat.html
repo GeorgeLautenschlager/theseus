@@ -19,7 +19,16 @@
       <div class="agent-name">Theseus</div>
       {{ status(thinking=False) }}
     </div>
-    <a href="/debug" class="debug-link">Debug →</a>
+    <div class="header-actions">
+      <button id="notify-toggle" class="notify-toggle" type="button" aria-label="Desktop notifications" aria-pressed="false">
+        <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+          <path class="bell-body" d="M12 3.5a4.5 4.5 0 0 0-4.5 4.5v3.2L6 14.5h12l-1.5-3.3V8A4.5 4.5 0 0 0 12 3.5Z"/>
+          <path class="bell-clapper" d="M10.2 16.8a2 2 0 0 0 3.6 0"/>
+          <line class="bell-slash" x1="4.5" y1="19.5" x2="19.5" y2="4.5"/>
+        </svg>
+      </button>
+      <a href="/debug" class="debug-link">Debug →</a>
+    </div>
   </header>
 
   <div id="messages" class="messages" hx-ext="sse" sse-connect="/events">
@@ -44,6 +53,8 @@
   </form>
 
 </div>
+<!-- Replaced out-of-band whenever a reply completes; carries the notification payload. -->
+<span id="chat-notify"></span>
 <script src="/static/chat.js"></script>
 </body>
 </html>

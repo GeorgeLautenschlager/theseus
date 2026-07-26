@@ -11,6 +11,7 @@
 <div hx-swap-oob="innerHTML:#bubble-{{ bubble_id }}">{{ content_html | safe }}</div>
 {%- endif %}
 {%- if is_done %}
+<span id="chat-notify" hx-swap-oob="true" data-msg-id="{{ bubble_id }}" data-preview="{{ notify_preview }}"></span>
 {{ status(thinking=False, oob=True) }}
 {{ composer_controls(disabled=False, oob=True) }}
 {%- endif %}

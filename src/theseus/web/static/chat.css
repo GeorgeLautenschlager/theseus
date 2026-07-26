@@ -95,8 +95,65 @@ body {
   color: var(--text-status);
 }
 
-.debug-link {
+#chat-notify { display: none; }
+
+.header-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.notify-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-status);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, opacity 0.15s;
+}
+
+.notify-toggle .bell-body,
+.notify-toggle .bell-clapper {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.notify-toggle .bell-slash {
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  display: none;
+}
+
+.notify-toggle.is-on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.notify-toggle.is-on .bell-body { fill: currentColor; }
+
+.notify-toggle.is-off:hover { color: var(--accent); border-color: var(--accent); }
+
+.notify-toggle.is-denied,
+.notify-toggle.is-unavailable {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.notify-toggle.is-denied .bell-slash,
+.notify-toggle.is-unavailable .bell-slash { display: inline; }
+
+.debug-link {
   font-size: 13px;
   color: var(--text-status);
   text-decoration: none;
