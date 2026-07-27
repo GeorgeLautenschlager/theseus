@@ -4,6 +4,7 @@ import json
 from unittest.mock import MagicMock
 
 from theseus.agentic_memory import AgenticMemory
+from theseus.mono_memory import MonoMemory
 from theseus.ooda_core import OODACore
 from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusLog
@@ -49,10 +50,14 @@ def make_provider(turns):
     return provider
 
 
-def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10):
+def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10, name="Tam"):
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
     return OODACore(
+        name=name,
+        working_dir=str(tmp_path),
         constitution="You are Tam.",
+        persona="Direct and curious.",
+        context_assembler=MonoMemory(stimulus_log=stimulus_log, memory=memory),
         model_providers=[provider],
         tools=tools or {},
         stimulus_log=stimulus_log,
@@ -206,14 +211,7 @@ class TestAct:
     def test_stimulus_log_actor_uses_core_name(self, tmp_path):
         tool = StubTool()
         provider = make_provider([turn((tool.name, {"message": "Hi!"}))])
-        stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
-        core = OODACore(
-            constitution="You are Tam.",
-            model_providers=[provider],
-            tools={tool.name: tool},
-            stimulus_log=stimulus_log,
-            name="Aldric",
-        )
+        core = make_core(tmp_path, provider, tools={tool.name: tool}, name="Aldric")
 
         run_decide(core)
 
@@ -285,7 +283,11 @@ def make_core_with_memory(tmp_path, provider, embedder=None):
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
     memory = make_memory(tmp_path, provider, stimulus_log, embedder=embedder)
     core = OODACore(
+        name="Tam",
+        working_dir=str(tmp_path),
         constitution="You are Tam.",
+        persona="Direct and curious.",
+        context_assembler=MonoMemory(stimulus_log=stimulus_log, memory=memory),
         model_providers=[provider],
         tools={},
         stimulus_log=stimulus_log,
@@ -339,16 +341,3 @@ class TestMemoryIntegration:
         assert provider.complete_with_tools.call_count == 1
         messages = provider.complete_with_tools.call_args.args[0]
         assert "<memories>" not in messages[1]["content"]
-
-
-def test_core_passes_retrieval_query_budget_to_assembler(tmp_path):
-    stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
-    core = OODACore(
-        constitution="You are Tam.",
-        model_providers=[MagicMock()],
-        tools={},
-        stimulus_log=stimulus_log,
-        retrieval_query_chars=123,
-    )
-
-    assert core.mono_memory.retrieval_query_chars == 123
