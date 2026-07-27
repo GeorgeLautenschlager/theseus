@@ -21,6 +21,7 @@ model, e.g. OllamaProvider(model="nomic-embed-text").
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import List
 
@@ -35,6 +36,7 @@ from theseus.memory_prompts import (
 from theseus.memory_store import MemoryStore
 from theseus.model_providers.model_provider import ModelProvider
 from theseus.stimulus_log import StimulusEvent, StimulusLog, new_id
+from theseus.tools.recall import RECALL_TOOL_NAME
 
 
 class AgenticMemory:
@@ -71,8 +73,9 @@ class AgenticMemory:
 
     def form(self) -> None:
         """Consolidate every stimulus event newer than the store's high-water
-        mark into one linked, embedded note. Signalled by the core at loop
-        termination; a no-op when nothing new has happened."""
+        mark into one linked, embedded note written from the first person.
+        Signalled by the core at loop termination; a no-op when nothing new
+        has happened."""
         try:
             high_water = self.store.last_consolidated_id()
             events = [
@@ -84,9 +87,27 @@ class AgenticMemory:
         except Exception as exc:
             print(f"Memory formation failed; skipping this batch: {exc}")
 
+    @staticmethod
+    def _elide_recollections(events: list[StimulusEvent]) -> list[StimulusEvent]:
+        """Blank the payload of recall results before consolidation.
+
+        Recall output is re-derived from the note store, so consolidating it would form
+        memories *of remembering* whose content is old notes — an echo that compounds
+        every loop. The recall event itself is kept (that the agent went looking, and
+        what for, is a real memory) and only its output is replaced. Eliding rather than
+        dropping also keeps the batch contiguous, so `source_span` still covers every
+        event consumed and the high-water mark cannot slide back over one.
+        """
+        return [
+            replace(e, content={**e.content, "output": "[recalled memories elided]"})
+            if e.type == "tool_result" and e.content.get("tool") == RECALL_TOOL_NAME
+            else e
+            for e in events
+        ]
+
     def _form(self, events: list[StimulusEvent]) -> MemoryNote:
         provider = self._select_model_provider()
-        events_text = "\n".join(e.to_json() for e in events)
+        events_text = "\n".join(e.to_json() for e in self._elide_recollections(events))
 
         raw = provider.chat(
             prompt=build_note_construction_prompt(events_text),
@@ -118,7 +139,11 @@ class AgenticMemory:
         return self.store.add(note)
 
     def retrieve(self, query: str) -> str:
-        """Memories relevant to `query`, rendered ready for a prompt; "" when none."""
+        """Memories relevant to `query`, rendered ready for a prompt; "" when none.
+
+        Pure: recall reaches the stimulus log by being *called* as a tool (see
+        `tools/recall.py`), so the recollection is logged by the core's ordinary
+        tool_result path rather than written from in here."""
         return "\n\n".join(note.render() for note in self._retrieve_notes(query))
 
     def _retrieve_notes(self, query: str) -> list[MemoryNote]:

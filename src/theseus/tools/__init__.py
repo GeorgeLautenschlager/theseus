@@ -6,6 +6,7 @@ from theseus.tools.find import FindTool
 from theseus.tools.grep import GrepTool
 from theseus.tools.ls import LsTool
 from theseus.tools.read import ReadTool
+from theseus.tools.recall import RecallTool
 from theseus.tools.registry import all_tools, coding_tools, read_only_tools
 from theseus.tools.terminal_chat import TerminalChat
 from theseus.tools.tool import AssistantTurn, Tool, ToolCall, ToolResult, to_openai_tool
@@ -21,6 +22,7 @@ __all__ = [
     "GrepTool",
     "LsTool",
     "ReadTool",
+    "RecallTool",
     "TerminalChat",
     "Tool",
     "ToolCall",

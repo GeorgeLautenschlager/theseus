@@ -145,6 +145,59 @@ class TestForm:
 
         assert memory.store.read_all()[-1].links == []
 
+    def test_recalled_memories_are_not_consolidated_back_into_new_notes(self, tmp_path):
+        # Recall output is re-derivable from the note store. Consolidating it would form
+        # memories of remembering, whose content is old notes — a compounding echo.
+        memory, provider, _ = make_memory(tmp_path, [ENRICHMENT])
+        memory.stimulus_log.append(actor="george", type="exchange", content={"message": "Hi."})
+        memory.stimulus_log.append(
+            actor="alty",
+            type="tool_result",
+            content={
+                "tool": "recall",
+                "arguments": {"query": "who is George?"},
+                "output": "[seed1] George introduced himself last week.",
+                "is_error": False,
+            },
+        )
+
+        memory.form()
+
+        events_text = provider.chat.call_args_list[0].kwargs["prompt"]
+        assert "George introduced himself last week." not in events_text
+        # The act of recalling survives — only its payload is dropped.
+        assert "who is George?" in events_text
+
+    def test_other_tool_results_are_consolidated_normally(self, tmp_path):
+        memory, provider, _ = make_memory(tmp_path, [ENRICHMENT])
+        memory.stimulus_log.append(
+            actor="alty",
+            type="tool_result",
+            content={"tool": "read", "output": "the file said something important"},
+        )
+
+        memory.form()
+
+        events_text = provider.chat.call_args_list[0].kwargs["prompt"]
+        assert "the file said something important" in events_text
+
+    def test_eliding_recall_leaves_the_source_span_intact(self, tmp_path):
+        # Elide rather than drop: the span must still cover every event consumed, or the
+        # high-water mark would skip back over the recall event on the next formation.
+        memory, provider, _ = make_memory(tmp_path, [ENRICHMENT])
+        first = memory.stimulus_log.append(
+            actor="george", type="exchange", content={"message": "Hi."}
+        )
+        last = memory.stimulus_log.append(
+            actor="alty",
+            type="tool_result",
+            content={"tool": "recall", "output": "[seed1] something recalled"},
+        )
+
+        memory.form()
+
+        assert memory.store.read_all()[0].source_span == (first.id, last.id)
+
     def test_malformed_llm_json_does_not_raise(self, tmp_path):
         memory, provider, _ = make_memory(tmp_path, ["this is not json"])
         memory.stimulus_log.append(actor="george", type="exchange", content={"message": "Hi."})

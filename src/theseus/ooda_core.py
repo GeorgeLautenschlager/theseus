@@ -27,9 +27,10 @@ class OODACore:
         model_providers: One or more model provider. These are listed in priority order, with the cognitive core ultimately
         deciding which model provider is used.
         tools: List of available Tool objects.
-        memory: Optional memory module, seen only through the Memory protocol: Orient pulls
-        `retrieve(...)` results into context (via the MonoMemory), and loop termination
-        signals `form()`. What and how the module consolidates is its own business.
+        memory: Optional memory module, seen only through the Memory protocol. The core's
+        one remaining tie to it is the `form()` signal at loop termination; retrieval is
+        the agent's own business, done by calling the `recall` tool, which reaches the
+        module directly. What and how the module consolidates is its own business.
         name: The core's own actor name, used when logging its decisions and actions.
     """
     def __init__(
@@ -66,18 +67,16 @@ class OODACore:
         """Callback to be invoked by chat UI"""
         assembled = self.context_assembler.assemble_context()
         self.loop_memory["recent_events"] = assembled.recent_events
-        self.loop_memory["memories"] = assembled.memories
 
         self.decide()
 
     def decide(self):
         model_provider = self._select_model_provider()
 
-        system_prompt = build_decide_system_prompt(self.constitution, self.tools.values())
+        system_prompt = build_decide_system_prompt(self.constitution, self.persona, self.tools.values())
         prompt = build_decide_user_prompt(
             self.loop_memory["recent_events"],
             str(datetime.now()),
-            memories=self.loop_memory["memories"],
         )
 
         messages = [

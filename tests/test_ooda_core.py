@@ -8,6 +8,7 @@ from theseus.mono_memory import MonoMemory
 from theseus.ooda_core import OODACore
 from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusLog
+from theseus.tools.recall import RecallTool
 from theseus.tools.tool import AssistantTurn, ToolCall, ToolResult
 
 
@@ -56,7 +57,7 @@ def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10, name="T
         name=name,
         constitution="You are Tam.",
         persona="Direct and curious.",
-        context_assembler=MonoMemory(stimulus_log=stimulus_log, memory=memory),
+        context_assembler=MonoMemory(stimulus_log=stimulus_log),
         model_providers=[provider],
         tools=tools or {},
         stimulus_log=stimulus_log,
@@ -65,10 +66,9 @@ def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10, name="T
     )
 
 
-def run_decide(core, recent_events="", memories=""):
+def run_decide(core, recent_events=""):
     """Enter the loop at Decide: steps read from loop_memory, never parameters."""
     core.loop_memory["recent_events"] = recent_events
-    core.loop_memory["memories"] = memories
     core.decide()
 
 
@@ -251,7 +251,7 @@ class TestLoopTermination:
         provider = make_provider([turn(text="nothing to do")])
         core = make_core(tmp_path, provider)
 
-        run_decide(core, recent_events="something", memories="a memory")
+        run_decide(core, recent_events="something")
 
         assert core.loop_memory == {}
 
@@ -278,16 +278,16 @@ def make_memory(tmp_path, provider, stimulus_log, embedder=None):
     )
 
 
-def make_core_with_memory(tmp_path, provider, embedder=None):
+def make_core_with_memory(tmp_path, provider, embedder=None, tools=None):
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
     memory = make_memory(tmp_path, provider, stimulus_log, embedder=embedder)
     core = OODACore(
         name="Tam",
         constitution="You are Tam.",
         persona="Direct and curious.",
-        context_assembler=MonoMemory(stimulus_log=stimulus_log, memory=memory),
+        context_assembler=MonoMemory(stimulus_log=stimulus_log),
         model_providers=[provider],
-        tools={},
+        tools=tools or {},
         stimulus_log=stimulus_log,
         memory=memory,
     )
@@ -313,10 +313,14 @@ class TestMemoryIntegration:
         decision_event = core.stimulus_log.read_all()[-1]
         assert notes[0].source_span == (stimulus.id, decision_event.id)
 
-    def test_decide_messages_contain_retrieved_memories(self, tmp_path):
-        provider = make_provider([WAIT_TURN, WAIT_TURN])
+    def test_calling_recall_puts_the_recollection_in_the_next_decide_prompt(self, tmp_path):
+        """The whole point of recall-as-a-tool: what the agent remembers re-enters the
+        loop through the stimulus log, on the same path as every other tool result, and
+        the non-terminal pass gives it a chance to act on what came back."""
+        provider = make_provider([turn(("recall", {"query": "who is George?"})), WAIT_TURN])
         provider.chat.side_effect = [ENRICHMENT, json.dumps({"links": []}), ENRICHMENT]
         core, memory = make_core_with_memory(tmp_path, provider)
+        core.tools = {"recall": RecallTool(memory)}
         # Seed one note through the real pipeline, then start a fresh cycle.
         core.stimulus_log.append(actor="george", type="exchange", content={"message": "I am George."})
         memory.form()
@@ -324,10 +328,29 @@ class TestMemoryIntegration:
 
         core.orient()
 
-        messages = provider.complete_with_tools.call_args.args[0]
-        decide_user_prompt = messages[1]["content"]
-        assert "<memories>" in decide_user_prompt
-        assert "George introduced himself." in decide_user_prompt
+        # Two Decide calls: the one that chose to recall, and the one that saw the result.
+        assert provider.complete_with_tools.call_count == 2
+        second_prompt = provider.complete_with_tools.call_args.args[0][1]["content"]
+        assert "<stimulus_log>" in second_prompt
+        assert "George introduced himself." in second_prompt
+        assert "<memories>" not in second_prompt
+
+    def test_recall_output_is_not_consolidated_into_a_new_note(self, tmp_path):
+        # Guards the compounding echo end to end: the note formed at loop termination
+        # must not contain the memories recalled during that same loop.
+        provider = make_provider([turn(("recall", {"query": "who is George?"})), WAIT_TURN])
+        provider.chat.side_effect = [ENRICHMENT, json.dumps({"links": []}), ENRICHMENT]
+        core, memory = make_core_with_memory(tmp_path, provider)
+        core.tools = {"recall": RecallTool(memory)}
+        core.stimulus_log.append(actor="george", type="exchange", content={"message": "I am George."})
+        memory.form()
+        core.stimulus_log.append(actor="george", type="exchange", content={"message": "Who am I?"})
+
+        core.orient()
+
+        formation_prompt = provider.chat.call_args_list[-1].kwargs["prompt"]
+        assert "who is George?" in formation_prompt  # the act of recalling is kept
+        assert "George introduced himself." not in formation_prompt  # its payload is not
 
     def test_without_memory_behaves_as_before(self, tmp_path):
         provider = make_provider([WAIT_TURN])

@@ -33,6 +33,23 @@ class TestNoteConstruction:
         assert '{"actor":"george","type":"exchange"}' in prompt
         assert "<events>" in prompt
 
+    def test_prompt_asks_for_a_first_person_account(self):
+        # `context` is the only field rendered into a recollection and the only field
+        # retrieval embeds, so it has to carry the substance — in the agent's own voice,
+        # since it is what the agent will read back as its own memory.
+        prompt = build_note_construction_prompt("events")
+        assert "first person" in prompt.lower()
+
+    def test_prompt_says_whose_voice_the_first_person_is(self):
+        """Asking for "the first person" alone makes the model adopt whichever voice is
+        loudest in the events — it wrote "I learned that my name is George" about the
+        *user's* name. The prompt has to pin "I" to the agent and push the user into the
+        third person, using a cue the model can check against the events themselves."""
+        prompt = build_note_construction_prompt("events").lower()
+
+        assert "third person" in prompt, "the user must be named, not voiced"
+        assert "decision" in prompt, "the actor on 'decision' events identifies the agent"
+
 
 class TestLinkDecision:
     def test_schema_constrains_links_to_candidate_ids(self):

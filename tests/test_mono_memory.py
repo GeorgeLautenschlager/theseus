@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import inspect
 
 from theseus.mono_memory import MonoMemory
 from theseus.stimulus_log import StimulusLog
@@ -31,47 +31,26 @@ class TestRecentEventsWindow:
         assert "msg 4" in assembled.recent_events
 
 
-class TestMemories:
-    def test_empty_without_memory_system(self, tmp_path):
+class TestNoInvoluntaryRetrieval:
+    """The assembler no longer reaches into memory behind the agent's back. Recall is a
+    tool the agent calls; its result reaches the next prompt through the stimulus log
+    like any other tool_result, so there is nothing for the assembler to do."""
+
+    def test_assembler_takes_only_the_log_and_a_window(self):
+        # `constitution` used to sit here unread — the same dead-parameter trap that hid
+        # persona from the system prompt. The assembler assembles the window; nothing else.
+        params = set(inspect.signature(MonoMemory.__init__).parameters) - {"self"}
+        assert params == {"stimulus_log", "window_size"}
+
+    def test_assembled_context_carries_only_the_event_window(self, tmp_path):
         log = fill_log(tmp_path, 1)
+
         assembled = MonoMemory(stimulus_log=log).assemble_context()
 
-        assert assembled.memories == ""
-
-    def test_uses_module_rendered_memories(self, tmp_path):
-        log = fill_log(tmp_path, 1)
-        memory = MagicMock()
-        memory.retrieve.return_value = "George prefers tea."
-
-        assembled = MonoMemory(stimulus_log=log, memory=memory).assemble_context()
-
-        assert assembled.memories == "George prefers tea."
-        memory.retrieve.assert_called_once_with(assembled.recent_events)
-
-    def test_skips_retrieval_on_empty_log(self, tmp_path):
-        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
-        memory = MagicMock()
-
-        assembled = MonoMemory(stimulus_log=log, memory=memory).assemble_context()
-
-        assert assembled.memories == ""
-        memory.retrieve.assert_not_called()
-
-    def test_retrieval_query_bounded_while_prompt_window_stays_full(self, tmp_path):
-        # The prompt window can be huge (fine for the LLM), but the retrieval query is
-        # embedded, so it must stay within a configurable budget.
-        log = fill_log(tmp_path, 10)
-        memory = MagicMock()
-        memory.retrieve.return_value = ""
-
-        assembled = MonoMemory(
-            stimulus_log=log, memory=memory, retrieval_query_chars=50
-        ).assemble_context()
-
-        # Every event is still in the prompt window...
+        assert not hasattr(assembled, "memories")
         assert "msg 0" in assembled.recent_events
-        assert "msg 9" in assembled.recent_events
-        # ...but retrieval only saw the most-recent tail, capped to the budget.
-        query = memory.retrieve.call_args.args[0]
-        assert len(query) <= 50
-        assert query == assembled.recent_events[-50:]
+
+    def test_empty_log_assembles_empty_context(self, tmp_path):
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+
+        assert MonoMemory(stimulus_log=log).assemble_context().recent_events == ""

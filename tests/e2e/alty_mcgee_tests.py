@@ -133,13 +133,17 @@ class TestMemory:
         # Memory forms once per cognitive loop, i.e. once per user turn.
         assert len(alty.memory.store.read_all()) == 3
 
-    def test_earlier_turns_come_back_as_retrieved_memories(self, alty):
+    def test_earlier_turns_come_back_when_recall_is_called(self, alty):
+        # Assert against the retrieval component itself. The context assembler no longer
+        # pulls memories in — recall is a tool the agent calls — so this exercises
+        # embed → top-k → render without depending on Alty choosing to reach for it.
         say(alty, GREETING)
         say(alty, E2E_PLAN)
 
-        assembled = alty.core.mono_memory.assemble_context()
+        recalled = alty.core.tools["recall"].execute(query="what has George asked me to do?")
 
-        assert assembled.memories, "retrieval should surface notes from earlier turns"
+        assert not recalled.is_error
+        assert recalled.details["found"], "retrieval should surface notes from earlier turns"
 
     def test_alty_recalls_georges_name_from_memory_alone(self, tmp_path):
         # First session: George introduces himself; a note is formed on disk.
@@ -172,8 +176,11 @@ class TestMemory:
         # lives. Grepping it would satisfy the assertion above while proving nothing
         # about memory, so a filesystem answer has to fail this test.
         used = set(tools_called(second))
-        assert used <= {"terminal_chat"}, (
+        assert used <= {"recall", "terminal_chat"}, (
             f"expected a memory-based answer, but Alty used tools: {sorted(used)}"
         )
+        # Recall is voluntary now, so reaching for it is itself the behaviour under test:
+        # nothing else in this session could have supplied the name.
+        assert "recall" in used, "Alty should have chosen to recall rather than guess"
 
     

@@ -61,11 +61,19 @@ class MemoryNote:
         )
 
     def render(self) -> str:
-        """Human/LLM-readable one-note rendering used in prompt sections."""
+        """Human/LLM-readable one-note rendering — what the agent reads back when it
+        recalls this note, and what the linking step sees.
+
+        Deliberately excludes `content`. That field is provenance: the raw JSON events
+        the note was distilled from. Rendering it would nest JSON inside the JSON of
+        whatever carries the rendering, at large token cost, and would echo log content
+        the agent may already have in its window. `context` is the note's meaning — it
+        is also the only field retrieval embeds, so rendering it alone keeps what the
+        agent recalls aligned with what it searched on.
+        """
         parts = [f"[{self.id}] {self.context}"]
         if self.keywords:
             parts.append(f"keywords: {', '.join(self.keywords)}")
         if self.tags:
             parts.append(f"tags: {', '.join(self.tags)}")
-        parts.append(f"content: {self.content}")
         return "\n".join(parts)

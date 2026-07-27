@@ -5,6 +5,7 @@ from theseus.memory_note import MemoryNote
 from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.tools import (
+    RecallTool,
     Tool,
     ToolCall,
     ToolResult,
@@ -22,6 +23,7 @@ __all__ = [
     "MemoryStore",
     "StimulusEvent",
     "StimulusLog",
+    "RecallTool",
     "Tool",
     "ToolCall",
     "ToolResult",
