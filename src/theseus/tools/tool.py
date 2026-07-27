@@ -35,10 +35,20 @@ class ToolCall:
 
 @dataclass(frozen=True)
 class AssistantTurn:
-    """One assistant response: free text, tool calls, or both."""
+    """One assistant response: free text, tool calls, or both.
+
+    `prompt_tokens` is the backend's own count of what the prompt cost, taken from the
+    response's `usage`. It is the only reliable signal we get about context consumption —
+    the OpenAI-compatible `/v1/models` endpoint does not report a context window, and the
+    vendor-native endpoints that do mostly report the model's *trained* maximum rather
+    than the window the server actually loaded. So instead of predicting the budget we
+    measure the spend: `MonoMemory.observe` feeds this back to calibrate the next window.
+    `None` when the provider reports no usage (the Claude CLI, or a server that omits it).
+    """
 
     text: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
+    prompt_tokens: int | None = None
 
 
 class Tool(Protocol):

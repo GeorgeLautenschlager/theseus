@@ -85,6 +85,11 @@ class ModelProvider(ABC):
         non-streamed, which both simplifies parsing and sidesteps Ollama's streamed
         multi-tool-call `index` bug. Any tool calls in the response are normalized to
         `ToolCall` (arguments JSON-decoded to a dict).
+
+        `usage.prompt_tokens` is carried out on the `AssistantTurn` so the context
+        assembler can size the next window against what this one actually cost. It is
+        read defensively: `usage` is part of the OpenAI response shape but not every
+        compatible server populates it.
         """
         extra_kwargs: dict[str, Any] = {}
         if tools:
@@ -107,7 +112,11 @@ class ModelProvider(ABC):
             except json.JSONDecodeError:
                 arguments = {}
             calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=arguments))
-        return AssistantTurn(text=message.content, tool_calls=tuple(calls))
+        return AssistantTurn(
+            text=message.content,
+            tool_calls=tuple(calls),
+            prompt_tokens=getattr(getattr(response, "usage", None), "prompt_tokens", None),
+        )
 
     def embed(self, text: str) -> list[float]:
         response = self._client.embeddings.create(model=self.model, input=text)

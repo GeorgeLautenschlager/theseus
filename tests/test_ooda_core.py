@@ -67,8 +67,13 @@ def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10, name="T
 
 
 def run_decide(core, recent_events=""):
-    """Enter the loop at Decide: steps read from loop_memory, never parameters."""
+    """Enter the loop at Decide: steps read from loop_memory, never parameters.
+
+    Seeds exactly what Orient would have left behind, `window_chars` included — Decide
+    reports that back to the assembler to calibrate the next window.
+    """
     core.loop_memory["recent_events"] = recent_events
+    core.loop_memory["window_chars"] = len(recent_events)
     core.decide()
 
 
@@ -111,6 +116,36 @@ class TestDecide:
         assert decision_events[0].content["tool_calls"] == [
             {"name": tool.name, "arguments": {"message": "Hi!"}}
         ]
+
+    def test_reports_prompt_cost_back_to_the_assembler(self, tmp_path):
+        # The window is sized closed-loop: no OpenAI-compatible endpoint will tell us the
+        # context window it loaded, but every response reports what the prompt cost, so
+        # Decide hands that measurement back for the next window to be sized against.
+        tool = StubTool()
+        provider = make_provider([AssistantTurn(text="ok", prompt_tokens=250)])
+        core = make_core(tmp_path, provider, tools={tool.name: tool})
+
+        run_decide(core, recent_events="George said hi.")
+
+        messages = provider.complete_with_tools.call_args.args[0]
+        sent_chars = sum(len(m["content"]) for m in messages)
+        assembler = core.context_assembler
+        assert assembler.chars_per_token == sent_chars / 250
+        # Everything that wasn't the window is overhead: constitution, persona, schemas.
+        assert assembler.overhead_tokens == (
+            sent_chars - len("George said hi.")
+        ) / assembler.chars_per_token
+
+    def test_a_provider_without_usage_leaves_the_estimate_alone(self, tmp_path):
+        # ClaudeProvider shells out to the CLI and reports no usage.
+        tool = StubTool()
+        provider = make_provider([AssistantTurn(text="ok", prompt_tokens=None)])
+        core = make_core(tmp_path, provider, tools={tool.name: tool})
+        seeded = core.context_assembler.chars_per_token
+
+        run_decide(core, recent_events="George said hi.")
+
+        assert core.context_assembler.chars_per_token == seeded
 
 
 class TestAct:

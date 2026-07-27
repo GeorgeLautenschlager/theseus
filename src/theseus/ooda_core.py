@@ -67,6 +67,7 @@ class OODACore:
         """Callback to be invoked by chat UI"""
         assembled = self.context_assembler.assemble_context()
         self.loop_memory["recent_events"] = assembled.recent_events
+        self.loop_memory["window_chars"] = assembled.window_chars
 
         self.decide()
 
@@ -88,6 +89,16 @@ class OODACore:
         # come back together, so there is no separate Act model call.
         turn = model_provider.complete_with_tools(messages, list(self.tools.values()))
         self.loop_memory["decision"] = turn
+
+        # Close the context-sizing loop: the backend just told us what this prompt really
+        # cost, which is the only trustworthy signal about the window we get. Act() may
+        # re-enter orient() on a non-terminal tool, so a multi-pass turn corrects itself
+        # partway through rather than waiting for the next one.
+        self.context_assembler.observe(
+            prompt_tokens=turn.prompt_tokens,
+            prompt_chars=sum(len(message["content"]) for message in messages),
+            window_chars=self.loop_memory["window_chars"],
+        )
 
         self.stimulus_log.append(
             actor=self.name,
