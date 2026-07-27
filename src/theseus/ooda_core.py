@@ -35,7 +35,6 @@ class OODACore:
     def __init__(
         self,
         name: str,
-        working_dir: str,
         constitution: str,
         persona: str,
         context_assembler: MonoMemory,

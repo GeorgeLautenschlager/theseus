@@ -26,7 +26,6 @@ class MonoMemory:
         stimulus_log: StimulusLog,
         memory: Memory | None = None,
         window_size: int = 50,
-        persona: str | None = None,
         constitution: str | None = None,
         retrieval_query_chars: int = 2000,
     ):
