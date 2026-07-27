@@ -42,7 +42,6 @@ class AltyMcGee:
 
         self.core = OODACore(
             name="Alty McGee",
-            working_dir="./",
             stimulus_log=stimulus_log,
             context_assembler=context_assembler,
             constitution=ALTY_CONSTITUTION,
