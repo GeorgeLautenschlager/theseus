@@ -54,7 +54,6 @@ def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10, name="T
     stimulus_log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
     return OODACore(
         name=name,
-        working_dir=str(tmp_path),
         constitution="You are Tam.",
         persona="Direct and curious.",
         context_assembler=MonoMemory(stimulus_log=stimulus_log, memory=memory),
@@ -284,7 +283,6 @@ def make_core_with_memory(tmp_path, provider, embedder=None):
     memory = make_memory(tmp_path, provider, stimulus_log, embedder=embedder)
     core = OODACore(
         name="Tam",
-        working_dir=str(tmp_path),
         constitution="You are Tam.",
         persona="Direct and curious.",
         context_assembler=MonoMemory(stimulus_log=stimulus_log, memory=memory),
