@@ -43,14 +43,13 @@ class WebChatUIObserver:
     request instead of stdin, and replies are pushed back out over
     Server-Sent Events instead of a blocking function return.
 
-    `orient_chat_message_callback` is invoked with the user's message text on
-    a background thread, so the HTTP request returns immediately (the page
-    shows a typing indicator while the agent works — the browser is never
-    left hanging on a slow LLM call). `OODACore.orient()` takes no
-    argument, so wrap it in the agent file:
-    `orient_chat_message_callback=lambda message: core.orient()` — the
-    message has already been appended to the stimulus log by the time the
-    callback fires, so a log-driven core still sees it.
+    `orient_chat_message_callback` is invoked with no arguments on a background
+    thread, so the HTTP request returns immediately (the page shows a typing
+    indicator while the agent works — the browser is never left hanging on a slow
+    LLM call). The user's message has already been appended to the stimulus log by
+    the time the callback fires, so a log-driven core sees it without being passed
+    anything. Wire it to the Core's gated entry point (see below), never to
+    `OODACore.orient()` directly.
 
     Only one cognitive cycle runs at a time, now enforced by the Core's cycle gate
     rather than by the disabled composer alone. Wire this observer's callback to
@@ -61,7 +60,7 @@ class WebChatUIObserver:
 
     def __init__(
         self,
-        orient_chat_message_callback: Callable[[str], None],
+        orient_chat_message_callback: Callable[[], None],
         stimulus_log=None,
     ):
         self.orient_chat_message_callback = orient_chat_message_callback
