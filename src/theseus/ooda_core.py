@@ -83,6 +83,18 @@ class OODACore:
         finally:
             self._cycle_lock.release()
 
+    def orient_and_wait(self) -> None:
+        """Wait-on-contention entry point. Blocking acquire of the cycle gate: wait for
+        any in-flight cycle to finish, then run one. Safe only from a thread with
+        nothing else to do while it waits — TerminalChatObserver's dedicated stdin
+        thread, or WebChatUIObserver's per-message background thread. Never call this
+        from a coroutine on an event loop."""
+        self._cycle_lock.acquire()
+        try:
+            self.orient()
+        finally:
+            self._cycle_lock.release()
+
     def orient(self):
         """Run one cognitive cycle. Un-gated on purpose: it assumes the caller already
         holds the cycle gate (via try_orient / orient_and_wait) or is a single-threaded
