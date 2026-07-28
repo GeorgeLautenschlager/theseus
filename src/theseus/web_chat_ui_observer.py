@@ -52,11 +52,11 @@ class WebChatUIObserver:
     message has already been appended to the stimulus log by the time the
     callback fires, so a log-driven core still sees it.
 
-    Only one `orient` call is ever in flight at a time: the composer is
-    disabled for the duration of a reply, both because the design calls for
-    it and because the cognitive cores in this codebase keep loop-scoped
-    state (`loop_memory`, `WorkingMemory`) that isn't safe for concurrent
-    orientation.
+    Only one cognitive cycle runs at a time, now enforced by the Core's cycle gate
+    rather than by the disabled composer alone. Wire this observer's callback to
+    `OODACore.orient_and_wait` (wait-on-contention): the callback runs on the
+    per-message background `_run_core` thread, so its blocking acquire waits out any
+    in-flight cycle without ever touching the event loop.
     """
 
     def __init__(

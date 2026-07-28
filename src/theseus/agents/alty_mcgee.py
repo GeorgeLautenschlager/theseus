@@ -71,7 +71,7 @@ class AltyMcGee:
         self.memory = memory
         self.chat_observer = TerminalChatObserver(
             stimulus_log=stimulus_log,
-            orient_chat_message_callback=self.core.orient
+            orient_chat_message_callback=self.core.orient_and_wait
         )
 
     def run(self):
