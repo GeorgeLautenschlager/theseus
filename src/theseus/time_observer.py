@@ -76,18 +76,24 @@ class TimeObserver:
 
     def _tick(self) -> None:
         """One wake: fire the Core iff a new, externally-authored entry has appeared
-        since the last checkpoint, then advance the checkpoint to the current tip so the
-        same entries never count twice. The Core's own output from the cycle this may
-        trigger lands beyond the checkpoint but is excluded by the self_actor filter."""
+        since the last checkpoint. The checkpoint only advances past entries the observer
+        is done with — everything read when a cycle actually ran, or the whole log when
+        there was nothing external to act on. On contention (try_orient returns False) it
+        is left untouched, so the skipped entries are retried on the next wake rather than
+        silently dropped. The Core's own output is excluded by the self_actor filter, so a
+        triggered cycle never re-triggers the next wake."""
         events = self.stimulus_log.read_all()
         if not events:
             return
         checkpoint = self._checkpoint
-        has_new_external = any(
+        new_external = any(
             (checkpoint is None or event.id > checkpoint)
             and event.actor != self.self_actor
             for event in events
         )
-        self._checkpoint = events[-1].id
-        if has_new_external:
-            self.try_orient()
+        tip = max(event.id for event in events)
+        if not new_external:
+            self._checkpoint = tip
+            return
+        if self.try_orient():
+            self._checkpoint = tip

@@ -71,3 +71,22 @@ def test_stop_interrupts_the_interval_promptly(tmp_path):
 
     assert elapsed < 1.0
     assert obs._thread is not None and not obs._thread.is_alive()
+
+
+def test_contention_leaves_the_event_for_the_next_wake(tmp_path):
+    # try_orient returns False (a cycle was already in flight): the event must NOT be
+    # consumed — the next wake retries it rather than dropping it.
+    obs, log, try_orient = make(tmp_path)
+    try_orient.return_value = False
+    obs.start()
+    obs.stop(timeout=1)
+
+    log.append(actor="user", type="chat_message", content={"message": "hi"})
+    obs._tick()  # contention: try_orient called but returned False
+    assert try_orient.call_count == 1
+
+    # Cycle finished; the Core is free now. The same event must still trigger.
+    try_orient.return_value = True
+    obs._tick()
+    assert try_orient.call_count == 2
+
