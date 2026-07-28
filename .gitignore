@@ -226,3 +226,6 @@ stimulus_log.jsonl
 .claude/worktrees/
 *.code-workspace
 *.jsonl
+
+# Steward run artifacts (ephemeral: runlogs/ledgers folded into the PR, not tracked)
+.steward/

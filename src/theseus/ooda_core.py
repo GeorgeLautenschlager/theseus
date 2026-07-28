@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from typing import List
 
@@ -55,6 +56,12 @@ class OODACore:
         self.loop_memory = {}
         self.tools = tools
         self.max_loops = max_loops
+        # One gate guarding cognitive-cycle execution, shared across every Observer
+        # regardless of concurrency model, so exactly one cycle runs at a time across
+        # the whole process. threading.Lock (not asyncio.Lock) because it is held from
+        # plain OS threads in every case: TerminalChatObserver's stdin thread, and
+        # WebChatUIObserver's per-message background thread.
+        self._cycle_lock = threading.Lock()
 
     def _select_model_provider(self) -> ModelProvider:
         """Selects the first available provider, in priority order."""
@@ -63,8 +70,37 @@ class OODACore:
                 return provider
         raise RuntimeError("No model providers are currently available.")
 
+    def try_orient(self) -> bool:
+        """Skip-on-contention entry point. Non-blocking acquire of the cycle gate: run
+        one cognitive cycle iff no other cycle is in flight, and report whether one
+        actually ran. A False return is the ordinary outcome of contention, never an
+        error. Observers that must not block (TimeObserver) call this."""
+        if not self._cycle_lock.acquire(blocking=False):
+            return False
+        try:
+            self.orient()
+            return True
+        finally:
+            self._cycle_lock.release()
+
+    def orient_and_wait(self) -> None:
+        """Wait-on-contention entry point. Blocking acquire of the cycle gate: wait for
+        any in-flight cycle to finish, then run one. Safe only from a thread with
+        nothing else to do while it waits — TerminalChatObserver's dedicated stdin
+        thread, or WebChatUIObserver's per-message background thread. Never call this
+        from a coroutine on an event loop."""
+        self._cycle_lock.acquire()
+        try:
+            self.orient()
+        finally:
+            self._cycle_lock.release()
+
     def orient(self):
-        """Callback to be invoked by chat UI"""
+        """Run one cognitive cycle. Un-gated on purpose: it assumes the caller already
+        holds the cycle gate (via try_orient / orient_and_wait) or is a single-threaded
+        test. Act() re-enters this method directly to process tool results, so it must
+        never take the gate itself. Observers must NOT call orient() directly — they go
+        through try_orient() or orient_and_wait()."""
         assembled = self.context_assembler.assemble_context()
         self.loop_memory["recent_events"] = assembled.recent_events
         self.loop_memory["window_chars"] = assembled.window_chars
