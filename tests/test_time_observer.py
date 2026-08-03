@@ -238,3 +238,225 @@ def test_malformed_line_is_skipped_without_blocking_valid_lines(tmp_path):
 
     contents = obs.schedule_path.read_text()
     assert "- [ ] this is not a valid schedule line" in contents
+
+
+def test_every_seconds_task_fires_immediately_then_waits_for_interval(tmp_path):
+    t = {"now": datetime(2026, 8, 3, 9, 5, 0, tzinfo=timezone.utc)}
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] every 10 seconds: Poll sensor\n",
+        now=lambda: t["now"],
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()  # never fired -> due immediately
+
+    try_orient.assert_called_once_with()
+    events = log.read_all()
+    assert len(events) == 1
+    assert events[0].content == {"message": "Time to Poll sensor"}
+    assert "last-fired: 2026-08-03T09:05:00+00:00" in obs.schedule_path.read_text()
+
+    obs._tick()  # same instant, interval hasn't elapsed -> must not refire
+    assert try_orient.call_count == 1
+
+    t["now"] = datetime(2026, 8, 3, 9, 5, 10, tzinfo=timezone.utc)
+    obs._tick()  # interval elapsed -> refires
+
+    assert try_orient.call_count == 2
+    assert len(log.read_all()) == 2
+
+
+def test_every_minutes_and_hours_units_are_parsed(tmp_path):
+    now = datetime(2026, 8, 3, 9, 5, tzinfo=timezone.utc)
+    schedule_text = (
+        "- [ ] every 30 minutes: Check queue depth\n"
+        "- [ ] every 4 hours: Rotate logs\n"
+    )
+    obs, log, try_orient = make(tmp_path, schedule_text=schedule_text, now=lambda: now)
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+
+    try_orient.assert_called_once_with()  # one tick, two due tasks -> one orient call
+    events = log.read_all()
+    assert {e.content["message"] for e in events} == {
+        "Time to Check queue depth",
+        "Time to Rotate logs",
+    }
+
+
+def test_monthly_task_fires_and_refires_next_month(tmp_path):
+    t = {"now": datetime(2026, 8, 5, 9, 5, tzinfo=timezone.utc)}
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] monthly @ 5 09:00: Pay rent\n",
+        now=lambda: t["now"],
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+    try_orient.assert_called_once_with()
+
+    t["now"] = datetime(2026, 8, 20, 9, 5, tzinfo=timezone.utc)
+    obs._tick()  # same month, already fired -> must not refire
+    assert try_orient.call_count == 1
+
+    t["now"] = datetime(2026, 9, 5, 9, 5, tzinfo=timezone.utc)
+    obs._tick()  # next month -> refires
+    assert try_orient.call_count == 2
+    assert len(log.read_all()) == 2
+
+
+def test_monthly_day_of_month_overflow_clamps(tmp_path):
+    now = datetime(2026, 4, 30, 9, 5, tzinfo=timezone.utc)  # April has 30 days
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] monthly @ 31 09:00: Rotate logs\n",
+        now=lambda: now,
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+
+    try_orient.assert_called_once_with()
+    assert log.read_all()[0].content == {"message": "Time to Rotate logs"}
+
+
+def test_monthly_day_of_month_overflow_clamps_in_february(tmp_path):
+    now = datetime(2026, 2, 28, 9, 5, tzinfo=timezone.utc)  # 2026 is not a leap year
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] monthly @ 30 09:00: Rotate logs\n",
+        now=lambda: now,
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+
+    try_orient.assert_called_once_with()
+    assert log.read_all()[0].content == {"message": "Time to Rotate logs"}
+
+
+def test_quarterly_fires_only_at_quarter_start_and_not_other_months(tmp_path):
+    t = {"now": datetime(2026, 1, 1, 9, 5, tzinfo=timezone.utc)}
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] quarterly @ 1 09:00: File quarterly report\n",
+        now=lambda: t["now"],
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()  # Q1 start
+    try_orient.assert_called_once_with()
+
+    t["now"] = datetime(2026, 2, 1, 9, 5, tzinfo=timezone.utc)
+    obs._tick()  # still Q1 -> must not refire
+    assert try_orient.call_count == 1
+
+    t["now"] = datetime(2026, 3, 15, 9, 5, tzinfo=timezone.utc)
+    obs._tick()  # still Q1 -> must not refire
+    assert try_orient.call_count == 1
+
+    t["now"] = datetime(2026, 4, 1, 9, 5, tzinfo=timezone.utc)
+    obs._tick()  # Q2 start -> refires
+    assert try_orient.call_count == 2
+    assert len(log.read_all()) == 2
+
+
+def test_quarterly_day_of_month_overflow_clamps_in_april(tmp_path):
+    now = datetime(2026, 4, 30, 9, 5, tzinfo=timezone.utc)  # April is a quarter-start
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] quarterly @ 31 09:00: File quarterly report\n",
+        now=lambda: now,
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+
+    try_orient.assert_called_once_with()
+    assert log.read_all()[0].content == {"message": "Time to File quarterly report"}
+
+
+def test_annually_fires_on_right_date_and_not_again_same_year(tmp_path):
+    t = {"now": datetime(2026, 12, 25, 9, 5, tzinfo=timezone.utc)}
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] annually @ 12-25 09:00: Send holiday cards\n",
+        now=lambda: t["now"],
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+    try_orient.assert_called_once_with()
+
+    t["now"] = datetime(2026, 12, 26, 9, 5, tzinfo=timezone.utc)
+    obs._tick()  # same year, already fired -> must not refire
+    assert try_orient.call_count == 1
+
+    t["now"] = datetime(2027, 12, 25, 9, 5, tzinfo=timezone.utc)
+    obs._tick()  # next year -> refires
+    assert try_orient.call_count == 2
+    assert len(log.read_all()) == 2
+
+
+def test_annually_looks_back_to_last_years_date_when_this_years_hasnt_happened(tmp_path):
+    now = datetime(2026, 1, 5, 9, 5, tzinfo=timezone.utc)  # before this year's Jan 10
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] annually @ 01-10 09:00: Renew domain\n",
+        now=lambda: now,
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+
+    try_orient.assert_called_once_with()
+    assert log.read_all()[0].content == {"message": "Time to Renew domain"}
+
+
+def test_annually_day_of_month_overflow_clamps(tmp_path):
+    now = datetime(2026, 2, 28, 9, 5, tzinfo=timezone.utc)  # 2026 is not a leap year
+    obs, log, try_orient = make(
+        tmp_path,
+        schedule_text="- [ ] annually @ 02-30 09:00: Weird anniversary\n",
+        now=lambda: now,
+    )
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+
+    try_orient.assert_called_once_with()
+    assert log.read_all()[0].content == {"message": "Time to Weird anniversary"}
+
+
+def test_malformed_every_line_is_skipped_without_blocking_valid_lines(tmp_path):
+    now = datetime(2026, 8, 3, 9, 5, tzinfo=timezone.utc)
+    schedule_text = (
+        "- [ ] every ten minutes: Bad interval\n"
+        "- [ ] every 30 minutes: Check queue depth\n"
+    )
+    obs, log, try_orient = make(tmp_path, schedule_text=schedule_text, now=lambda: now)
+    obs.start()
+    obs.stop(timeout=1)
+
+    obs._tick()
+
+    try_orient.assert_called_once_with()
+    events = log.read_all()
+    assert len(events) == 1
+    assert events[0].content == {"message": "Time to Check queue depth"}
+
+    contents = obs.schedule_path.read_text()
+    assert "- [ ] every ten minutes: Bad interval" in contents
