@@ -16,12 +16,12 @@ def _render_stimulus_log_section(context: str) -> str:
     )
 
 
-def _render_tools_section(tools: list[Tool]) -> str:
+def render_tools_section(tools: list[Tool]) -> str:
     tool_lines = "\n".join(f"- {tool.name}: {tool.description}" for tool in tools)
     return f"# Available tools\n{tool_lines}\n"
 
 
-def _render_recall_section(tools: list[Tool]) -> str:
+def render_recall_section(tools: list[Tool]) -> str:
     """Only rendered for agents that actually hold the recall tool — telling an agent
     without a memory module to remember things would just invite it to confabulate.
 
@@ -61,8 +61,8 @@ def build_decide_system_prompt(constitution: str, persona: str, tools: List[Tool
         "on a response from you, the right action is almost always to respond — call the tool "
         "that sends them a message. Only when your recent history genuinely contains nothing "
         "that calls for a response or action should you call no tool at all.\n\n"
-        f"{_render_recall_section(tools)}"
-        f"{_render_tools_section(tools)}"
+        f"{render_recall_section(tools)}"
+        f"{render_tools_section(tools)}"
     )
 
 

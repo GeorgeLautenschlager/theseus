@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 alty = "theseus.agents.alty_mcgee:main"
+autobot = "theseus.agents.autobot:main"
 
 [tool.poetry]
 packages = [{ include = "theseus", from = "src" }]
