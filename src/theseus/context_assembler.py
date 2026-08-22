@@ -20,7 +20,7 @@ class AssembledContext:
     window_chars: int = 0
 
 
-class MonoMemory:
+class ContextAssembler:
     """Assembles context for Decide from the tail of the stimulus log, verbatim.
 
     Deliberately the *only* source. Long-term memory used to be pulled in here, behind

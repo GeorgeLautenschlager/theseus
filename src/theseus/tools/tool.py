@@ -42,7 +42,7 @@ class AssistantTurn:
     the OpenAI-compatible `/v1/models` endpoint does not report a context window, and the
     vendor-native endpoints that do mostly report the model's *trained* maximum rather
     than the window the server actually loaded. So instead of predicting the budget we
-    measure the spend: `MonoMemory.observe` feeds this back to calibrate the next window.
+    measure the spend: `ContextAssembler.observe` feeds this back to calibrate the next window.
     `None` when the provider reports no usage (the Claude CLI, or a server that omits it).
     """
 

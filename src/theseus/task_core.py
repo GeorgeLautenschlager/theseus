@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import List
 
 from theseus.agentic_memory import AgenticMemory
-from theseus.mono_memory import MonoMemory
+from theseus.context_assembler import ContextAssembler
 from theseus.stimulus_log import StimulusLog
 from theseus.tools.tool import Tool
 
@@ -17,7 +17,7 @@ class TaskCore:
         name: str,
         constitution: str,
         persona: str,
-        context_assembler: MonoMemory,
+        context_assembler: ContextAssembler,
         stimulus_log: StimulusLog,
         model_providers: Dict[str, List[ModelProvider]],
         tools: dict[str, Tool],

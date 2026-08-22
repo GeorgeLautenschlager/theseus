@@ -4,7 +4,7 @@ import threading
 import time
 from unittest.mock import MagicMock
 
-from theseus.mono_memory import MonoMemory
+from theseus.context_assembler import ContextAssembler
 from theseus.ooda_core import OODACore
 from theseus.stimulus_log import StimulusLog
 from theseus.tools.tool import AssistantTurn
@@ -16,7 +16,7 @@ def make_core(tmp_path, provider):
         name="Tam",
         constitution="You are Tam.",
         persona="Direct.",
-        context_assembler=MonoMemory(stimulus_log=log),
+        context_assembler=ContextAssembler(stimulus_log=log),
         model_providers=[provider],
         tools={},
         stimulus_log=log,
