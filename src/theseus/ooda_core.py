@@ -9,7 +9,7 @@ from theseus.cognitive_prompts import (
     build_decide_system_prompt,
     build_decide_user_prompt,
 )
-from theseus.mono_memory import MonoMemory
+from theseus.context_assembler import ContextAssembler
 from theseus.memory import Memory
 from theseus.stimulus_log import StimulusLog
 from theseus.tools.tool import Tool
@@ -39,7 +39,7 @@ class OODACore:
         name: str,
         constitution: str,
         persona: str,
-        context_assembler: MonoMemory,
+        context_assembler: ContextAssembler,
         stimulus_log: StimulusLog,
         model_providers: List[ModelProvider],
         tools: dict[str, Tool],

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 
-from theseus.mono_memory import MonoMemory
+from theseus.context_assembler import ContextAssembler
 from theseus.stimulus_log import StimulusLog
 
 
@@ -26,7 +26,7 @@ def event_tokens(log, chars_per_token=4.0) -> float:
 class TestRecentEventsWindow:
     def test_includes_all_events_when_under_window(self, tmp_path):
         log = fill_log(tmp_path, 3)
-        assembled = MonoMemory(stimulus_log=log, window_size=50).assemble_context()
+        assembled = ContextAssembler(stimulus_log=log, window_size=50).assemble_context()
 
         assert assembled.recent_events.count("\n") == 2
         assert "msg 0" in assembled.recent_events
@@ -34,7 +34,7 @@ class TestRecentEventsWindow:
 
     def test_truncates_to_most_recent_window(self, tmp_path):
         log = fill_log(tmp_path, 5)
-        assembled = MonoMemory(stimulus_log=log, window_size=2).assemble_context()
+        assembled = ContextAssembler(stimulus_log=log, window_size=2).assemble_context()
 
         assert "msg 2" not in assembled.recent_events
         assert "msg 3" in assembled.recent_events
@@ -55,7 +55,7 @@ class TestTokenBudget:
         # Room for three events and change; the count cap is nowhere near binding.
         budget = int(event_tokens(log) * 3.5)
 
-        assembled = MonoMemory(
+        assembled = ContextAssembler(
             stimulus_log=log, window_size=200, token_budget=budget
         ).assemble_context()
 
@@ -66,7 +66,7 @@ class TestTokenBudget:
     def test_count_cap_still_binds_when_events_are_small(self, tmp_path):
         log = fill_log(tmp_path, 10)
 
-        assembled = MonoMemory(
+        assembled = ContextAssembler(
             stimulus_log=log, window_size=2, token_budget=100_000
         ).assemble_context()
 
@@ -78,7 +78,7 @@ class TestTokenBudget:
         # asked to decide with no stimulus at all.
         log = fill_log(tmp_path, 3, message="x" * 4000)
 
-        assembled = MonoMemory(
+        assembled = ContextAssembler(
             stimulus_log=log, window_size=200, token_budget=1
         ).assemble_context()
 
@@ -88,7 +88,7 @@ class TestTokenBudget:
     def test_no_budget_is_pure_count_behaviour(self, tmp_path):
         log = fill_log(tmp_path, 10, message="x" * 4000)
 
-        assembled = MonoMemory(
+        assembled = ContextAssembler(
             stimulus_log=log, window_size=4, token_budget=None
         ).assemble_context()
 
@@ -97,7 +97,7 @@ class TestTokenBudget:
     def test_window_chars_reports_the_assembled_size(self, tmp_path):
         log = fill_log(tmp_path, 5)
 
-        assembled = MonoMemory(stimulus_log=log).assemble_context()
+        assembled = ContextAssembler(stimulus_log=log).assemble_context()
 
         assert assembled.window_chars == len(assembled.recent_events)
 
@@ -111,52 +111,52 @@ class TestCalibration:
 
     def test_observe_corrects_chars_per_token(self, tmp_path):
         log = fill_log(tmp_path, 1)
-        memory = MonoMemory(stimulus_log=log, chars_per_token=4.0)
+        assembler = ContextAssembler(stimulus_log=log, chars_per_token=4.0)
 
         # 900 chars actually cost 300 tokens -> 3.0 chars per token, not the 4.0 seed.
-        memory.observe(prompt_tokens=300, prompt_chars=900, window_chars=900)
+        assembler.observe(prompt_tokens=300, prompt_chars=900, window_chars=900)
 
-        assert memory.chars_per_token == 3.0
+        assert assembler.chars_per_token == 3.0
 
     def test_observe_derives_prompt_overhead(self, tmp_path):
         log = fill_log(tmp_path, 1)
-        memory = MonoMemory(stimulus_log=log)
+        assembler = ContextAssembler(stimulus_log=log)
 
         # 900 chars at 300 tokens, of which only 300 chars were the window: the other
         # 600 chars (200 tokens) are constitution + persona + tool schemas.
-        memory.observe(prompt_tokens=300, prompt_chars=900, window_chars=300)
+        assembler.observe(prompt_tokens=300, prompt_chars=900, window_chars=300)
 
-        assert memory.overhead_tokens == 200
+        assert assembler.overhead_tokens == 200
 
     def test_derived_overhead_shrinks_the_window_budget(self, tmp_path):
         log = fill_log(tmp_path, 10, message="x" * 400)
         per_event = event_tokens(log)
-        memory = MonoMemory(
+        assembler = ContextAssembler(
             stimulus_log=log, window_size=200, token_budget=int(per_event * 5.5)
         )
 
-        assert memory.assemble_context().recent_events.count("\n") + 1 == 5
+        assert assembler.assemble_context().recent_events.count("\n") + 1 == 5
 
         # Two events' worth of fixed overhead now has to come out of the same budget.
         overhead_chars = int(per_event * 2 * 4.0)
-        memory.observe(
+        assembler.observe(
             prompt_tokens=int(overhead_chars / 4.0),
             prompt_chars=overhead_chars,
             window_chars=0,
         )
 
-        assert memory.assemble_context().recent_events.count("\n") + 1 == 3
+        assert assembler.assemble_context().recent_events.count("\n") + 1 == 3
 
     def test_observe_ignores_a_provider_that_reports_no_usage(self, tmp_path):
         # ClaudeProvider shells out to the CLI and gets no usage back; the seed estimate
         # must survive rather than blow up on a division by zero.
         log = fill_log(tmp_path, 1)
-        memory = MonoMemory(stimulus_log=log, chars_per_token=4.0)
+        assembler = ContextAssembler(stimulus_log=log, chars_per_token=4.0)
 
-        memory.observe(prompt_tokens=None, prompt_chars=900, window_chars=300)
+        assembler.observe(prompt_tokens=None, prompt_chars=900, window_chars=300)
 
-        assert memory.chars_per_token == 4.0
-        assert memory.overhead_tokens == 0
+        assert assembler.chars_per_token == 4.0
+        assert assembler.overhead_tokens == 0
 
 
 class TestNoInvoluntaryRetrieval:
@@ -170,14 +170,14 @@ class TestNoInvoluntaryRetrieval:
         # nothing else. Deliberately not an equality check on the whole signature: the
         # guard is against retrieval creeping back in, not against the window gaining
         # knobs for how big it should be.
-        params = set(inspect.signature(MonoMemory.__init__).parameters) - {"self"}
+        params = set(inspect.signature(ContextAssembler.__init__).parameters) - {"self"}
         assert params.isdisjoint({"memory", "retrieval_query_chars", "embedding_provider"})
         assert "stimulus_log" in params
 
     def test_assembled_context_carries_only_the_event_window(self, tmp_path):
         log = fill_log(tmp_path, 1)
 
-        assembled = MonoMemory(stimulus_log=log).assemble_context()
+        assembled = ContextAssembler(stimulus_log=log).assemble_context()
 
         assert not hasattr(assembled, "memories")
         assert "msg 0" in assembled.recent_events
@@ -185,4 +185,4 @@ class TestNoInvoluntaryRetrieval:
     def test_empty_log_assembles_empty_context(self, tmp_path):
         log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
 
-        assert MonoMemory(stimulus_log=log).assemble_context().recent_events == ""
+        assert ContextAssembler(stimulus_log=log).assemble_context().recent_events == ""

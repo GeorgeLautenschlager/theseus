@@ -10,10 +10,10 @@ from theseus.model_providers.unsloth_provider import UnslothProvider
 from theseus.tools.registry import all_tools
 from theseus.stimulus_log import StimulusLog
 from theseus.cognitive_prompts import render_tools_section
-from theseus.mono_memory import MonoMemory
+from theseus.context_assembler import ContextAssembler
 
 stimulus_log = StimulusLog('stimulus_log.jsonl')
-mono_memory = MonoMemory(stimulus_log=stimulus_log)
+context_assembler = ContextAssembler(stimulus_log=stimulus_log)
 # model = LmStudioProvider(model="gemma-4-26b-a4b-it-qat")
 # model = OllamaProvider(model="gemma4:e4b")
 # model = ClaudeProvider(model="claude-sonnet-4-6")

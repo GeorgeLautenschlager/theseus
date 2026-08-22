@@ -4,7 +4,7 @@ import json
 from unittest.mock import MagicMock
 
 from theseus.agentic_memory import AgenticMemory
-from theseus.mono_memory import MonoMemory
+from theseus.context_assembler import ContextAssembler
 from theseus.ooda_core import OODACore
 from theseus.memory_store import MemoryStore
 from theseus.stimulus_log import StimulusLog
@@ -57,7 +57,7 @@ def make_core(tmp_path, provider, tools=None, memory=None, max_loops=10, name="T
         name=name,
         constitution="You are Tam.",
         persona="Direct and curious.",
-        context_assembler=MonoMemory(stimulus_log=stimulus_log),
+        context_assembler=ContextAssembler(stimulus_log=stimulus_log),
         model_providers=[provider],
         tools=tools or {},
         stimulus_log=stimulus_log,
@@ -320,7 +320,7 @@ def make_core_with_memory(tmp_path, provider, embedder=None, tools=None):
         name="Tam",
         constitution="You are Tam.",
         persona="Direct and curious.",
-        context_assembler=MonoMemory(stimulus_log=stimulus_log),
+        context_assembler=ContextAssembler(stimulus_log=stimulus_log),
         model_providers=[provider],
         tools=tools or {},
         stimulus_log=stimulus_log,

@@ -3,7 +3,7 @@ from pathlib import Path
 
 from theseus.agentic_memory import AgenticMemory
 from theseus.memory_store import MemoryStore
-from theseus.mono_memory import MonoMemory
+from theseus.context_assembler import ContextAssembler
 from theseus.stimulus_log import StimulusLog
 from theseus.ooda_core import OODACore
 from theseus.chat_observer import TerminalChatObserver
@@ -46,7 +46,7 @@ class AltyMcGee:
             stimulus_log=stimulus_log,
         )
 
-        context_assembler = MonoMemory(stimulus_log=stimulus_log)
+        context_assembler = ContextAssembler(stimulus_log=stimulus_log)
 
         # Recall is a tool rather than something the assembler does behind Alty's back,
         # so it needs the memory module and is composed here, not in the registry.
