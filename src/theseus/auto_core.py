@@ -1,12 +1,69 @@
-from typing import Any, Dict, List
-from time import sleep
-from pathlib import Path
+from __future__ import annotations
 
-from theseus.model_providers.model_provider import ModelProvider
-from theseus.context_assembler import ContextAssembler
-from theseus.stimulus_log import StimulusLog
-from theseus.tools.tool import AssistantTurn, Tool, ToolCall
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+from time import sleep
+from typing import Any, Dict, List, Tuple
+
+from theseus.cadence import DEFAULT_TICK_SECONDS, Cadence
 from theseus.cognitive_prompts import render_tools_section
+from theseus.context_assembler import ContextAssembler
+from theseus.model_providers import PROVIDER_REGISTRY
+from theseus.model_providers.model_provider import ModelProvider
+from theseus.schedule import Schedule
+from theseus.stimulus_log import StimulusLog
+from theseus.tools.tool import AssistantTurn, Tool
+
+SLEEP_FLOOR_SECONDS = 5
+
+# Shown to the agent when a config line fails the grammar, and embedded in the seed
+# files. The grammars are deterministic on purpose: interpreting these files costs
+# zero model calls per turn; the agent itself rewrites any line that doesn't parse.
+CONFIG_GRAMMAR_HELP = (
+    "SCHEDULE.md task lines, one per line, times UTC: "
+    "'- [ ] once @ YYYY-MM-DD HH:MM: task', '- [ ] daily @ HH:MM: task', "
+    "'- [ ] weekly @ Weekday HH:MM: task', '- [ ] monthly @ D HH:MM: task', "
+    "'- [ ] quarterly @ D HH:MM: task', '- [ ] annually @ MM-DD HH:MM: task', "
+    "'- [ ] every N seconds|minutes|hours: task'. "
+    "CADENCE.md rule lines, matched against server time: "
+    "'- HH:MM-HH:MM: provider model[, tick every N seconds|minutes|hours]' "
+    "(windows may wrap midnight; first match wins) and "
+    "'- default: provider model[, tick every N ...]'. "
+    f"Providers: {', '.join(sorted(PROVIDER_REGISTRY))}."
+)
+
+# Grammar examples are backtick-quoted so the seeds themselves never parse (or lint)
+# as live entries.
+SCHEDULE_SEED = """\
+# Schedule
+
+One-time and repeated tasks, one per line. Times are UTC. The grammar (examples in
+backticks so they stay inert — remove the backticks to activate a line):
+
+`- [ ] once @ 2026-08-05 14:00: Water the plants`
+`- [ ] daily @ 09:00: Check email`
+`- [ ] weekly @ Monday 09:00: Submit timesheet`
+`- [ ] monthly @ 1 09:00: Pay rent`
+`- [ ] quarterly @ 1 09:00: File quarterly report`
+`- [ ] annually @ 12-25 09:00: Send holiday cards`
+`- [ ] every 30 minutes: Check queue depth`
+
+Anything else in this file is prose and is ignored.
+"""
+
+CADENCE_SEED = """\
+# Cadence
+
+Which model to think with at which time of day, and how often to take an autonomous
+turn. Rules are matched against server time; the first matching window wins and the
+`default` line is both the off-hours rule and the fallback when a provider is down.
+Example (backtick-quoted so it stays inert):
+
+`- 22:00-08:00: lm_studio qwen/qwen3-32b, tick every 15 minutes`
+
+- default: lm_studio local-model, tick every 5 minutes
+"""
 
 
 class Autocore:
@@ -33,17 +90,21 @@ class Autocore:
             self.persona: str = file.read()
 
         self.loop_memory: Dict[str, Any] = {}
+        self.sleep_duration: float = DEFAULT_TICK_SECONDS
+        self.model_providers: Dict[Tuple[str, str], ModelProvider] = {}
+        self.unknown_providers: List[str] = []
+        self._cadence_hash: str | None = None
 
     def loop(self) -> None:
         while True:
             self.goals = self._read_goals()
             self.tasks = self._read_tasks()
             self.current_task = self._read_current_task()
-            self.schedule = self._read_schedule()
-            self.cadence = self._read_cadence()
+            self.schedule = Schedule(self.home_directory / "SCHEDULE.md")
 
             # load history from stimulus log
-            self.context_assembler.assemble_context()
+            context = self.context_assembler.assemble_context()
+            self.loop_memory["window_chars"] = context.window_chars
 
             # assemble system prompt
             system_prompt = self._assemble_system_prompt()
@@ -51,6 +112,7 @@ class Autocore:
             # assemble autonomous prompt
             autonomous_prompt = (
                 f"{self._current_goals_and_tasks()}"
+                f"<stimulus_log>\n{context.recent_events}\n</stimulus_log>\n\n"
                 f"{self._automated_prompt_instructions()}"
             )
 
@@ -81,13 +143,25 @@ class Autocore:
 
     def _initialize_home_directory(self, home_directory: Path) -> None:
         self.home_directory = home_directory
-        self.home_directory.mkdir(exist_ok=True)
-        (self.home_directory / "stimulus_log.jsonl").mkdir(exist_ok=True)
-        (self.home_directory / "constitution.md").mkdir(exist_ok=True)
-        (self.home_directory / "persona.md").mkdir(exist_ok=True)
-        (self.home_directory / "GOALS.md").mkdir(exist_ok=True)
-        (self.home_directory / "TASKS.md").mkdir(exist_ok=True)
-        (self.home_directory / "CURRENT_TASK.md").mkdir(exist_ok=True)
+        self.home_directory.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "stimulus_log.jsonl",
+            "constitution.md",
+            "persona.md",
+            "GOALS.md",
+            "TASKS.md",
+            "CURRENT_TASK.md",
+        ):
+            (self.home_directory / name).touch(exist_ok=True)
+        self._seed_config("SCHEDULE.md", SCHEDULE_SEED)
+        self._seed_config("CADENCE.md", CADENCE_SEED)
+
+    def _seed_config(self, name: str, seed: str) -> None:
+        """Write the template only when the file is missing or empty — a config the
+        agent (or George) has edited is never clobbered."""
+        path = self.home_directory / name
+        if not path.exists() or not path.read_text(encoding="utf-8").strip():
+            path.write_text(seed, encoding="utf-8")
 
     # All of these files need to be converted over to JSONL. There's little reason to
     # introduce markdown lists when JSONL is working great in akk other cases.
@@ -107,18 +181,6 @@ class Autocore:
         with (self.home_directory / "CURRENT_TASK.md").open("r") as file:
             return file.readlines()
 
-    def _read_schedule(self) -> List[str]:
-        with (self.home_directory / "SCHEDULE.md").open("r") as file:
-            return [
-                line.strip() for line in file.readlines() if line.strip()
-            ]
-
-    def _read_cadence(self) -> List[str]:
-        with (self.home_directory / "CADENCE.md").open("r") as file:
-            return [
-                line.strip() for line in file.readlines() if line.strip()
-            ]
-
     def _assemble_system_prompt(self) -> str:
         system_prompt = (
             f"{self.constitution}\n\n"
@@ -133,7 +195,7 @@ class Autocore:
         return system_prompt
 
     def _automated_prompt_instructions(self) -> str:
-        return f"""### Autonomouse Prompts"
+        return f"""### Autonomous Prompts
             You are being prompted autonomously with a gap of {self.sleep_duration} seconds
             between your response and the next prompt. That means you will have plenty of opportunity
             for self-directed work - make the most of that time. Communication with other minds
@@ -204,17 +266,91 @@ class Autocore:
               },
           )
 
-    def _construct_model_providers(self):
-        # read self.cadence and instantiate all of the model providers referenced in that file
+    def _construct_model_providers(self) -> None:
+        """Parse CADENCE.md and instantiate one provider per unique (provider, model).
+
+        Content-hash guarded: instances (and their HTTP clients) are reused across
+        ticks until the file actually changes. An unknown provider name must not
+        crash the loop — it is recorded so _append_reminders can surface it to the
+        agent as a lint."""
+        text = (self.home_directory / "CADENCE.md").read_text(encoding="utf-8")
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest == self._cadence_hash:
+            return
+
+        cadence = Cadence.parse(text)
+        providers: Dict[Tuple[str, str], ModelProvider] = {}
+        unknown: List[str] = []
+        for rule in cadence.rules:
+            key = (rule.provider_key, rule.model)
+            if key in providers:
+                continue
+            provider_class = PROVIDER_REGISTRY.get(rule.provider_key)
+            if provider_class is None:
+                message = f"unknown provider '{rule.provider_key}' in CADENCE.md"
+                if message not in unknown:
+                    unknown.append(message)
+                continue
+            providers[key] = provider_class(model=rule.model)
+
+        self.cadence = cadence
+        self.model_providers = providers
+        self.unknown_providers = unknown
+        self._cadence_hash = digest
 
     def _select_model_provider(self) -> ModelProvider:
-        if not hasattr(self, "model_providers"):
-            self._construct_model_providers()
+        """First available provider for this moment's cadence rules, in priority
+        order: matching windows in file order, then the default rule. Cadence is
+        matched against naive server time on purpose — it describes this machine's
+        day, while SCHEDULE.md stays UTC."""
+        self._construct_model_providers()
+        for rule in self.cadence.candidates_for(datetime.now()):
+            provider = self.model_providers.get((rule.provider_key, rule.model))
+            if provider is not None and provider.is_available():
+                self.loop_memory["tick_seconds"] = rule.tick_seconds
+                return provider
+        raise RuntimeError("No model providers are currently available.")
 
-        # use cadence.md to figure out which provider to use for this turn
+    def _append_reminders(self) -> None:
+        """Fire due SCHEDULE.md tasks into the stimulus log, then surface any config
+        lines that failed the grammar so the agent rewrites them itself. The lint is
+        appended only when the set of bad lines changes — a standing mistake nags
+        once, not every tick."""
+        self.schedule.fire_due(self.stimulus_log)
 
-    def _append_reminders(self):
-        # Use schedule.md to determine if the next turn should address a given task in that file
+        bad = (
+            self.schedule.lint_lines()
+            + self.cadence.lint_lines()
+            + self.unknown_providers
+        )
+        if not bad:
+            self.loop_memory.pop("last_lint", None)
+            return
+        if bad == self.loop_memory.get("last_lint"):
+            return
+        self.stimulus_log.append(
+            actor="schedule",
+            type="schedule_lint",
+            content={
+                "message": (
+                    "These lines in your SCHEDULE.md/CADENCE.md look like entries but "
+                    "are not machine-readable, so they will never take effect. Rewrite "
+                    "them with your edit tool to match the grammar. "
+                    + CONFIG_GRAMMAR_HELP
+                ),
+                "lines": bad,
+            },
+        )
+        self.loop_memory["last_lint"] = bad
 
-    def _sleep(self):
-        # Use schedule.md to determine how long to sleep for
+    def _sleep(self) -> None:
+        """Sleep the current cadence tick, waking early if a scheduled task comes due
+        sooner, and never busier than the floor."""
+        duration = float(self.loop_memory.get("tick_seconds", DEFAULT_TICK_SECONDS))
+        next_due = self.schedule.next_occurrence()
+        if next_due is not None:
+            until_due = (next_due - datetime.now(timezone.utc)).total_seconds()
+            duration = min(duration, until_due)
+        duration = max(SLEEP_FLOOR_SECONDS, duration)
+        self.sleep_duration = duration
+        sleep(duration)
