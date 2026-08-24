@@ -56,6 +56,14 @@ class WebChatUIObserver:
     `OODACore.orient_and_wait` (wait-on-contention): the callback runs on the
     per-message background `_run_core` thread, so its blocking acquire waits out any
     in-flight cycle without ever touching the event loop.
+
+    In front of an `Autocore` none of that applies: it is already looping on its own
+    thread, so there is no cycle to enter and nothing to gate. It hears the appended
+    message through its own StimulusLog subscription and cuts its sleep short by
+    itself — pass `core.wake` as the callback (harmless and idempotent; the
+    subscription has usually fired first) or a bare `lambda: None`. What you must not
+    do is hand it something that runs a cognitive turn on this thread, which would put
+    two turns in flight at once.
     """
 
     def __init__(
