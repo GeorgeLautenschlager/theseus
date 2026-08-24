@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from time import sleep
-from typing import Any, Dict, List, Tuple
+from time import monotonic
+from typing import Any, Callable, Dict, List, Tuple
 
 from theseus.cadence import DEFAULT_TICK_SECONDS, Cadence
 from theseus.cognitive_prompts import render_tools_section
@@ -12,7 +13,7 @@ from theseus.context_assembler import ContextAssembler
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.model_providers.model_provider import ModelProvider
 from theseus.schedule import Schedule
-from theseus.stimulus_log import StimulusLog
+from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.tools.tool import AssistantTurn, Tool
 
 SLEEP_FLOOR_SECONDS = 5
@@ -67,11 +68,49 @@ Example (backtick-quoted so it stays inert):
 
 
 class Autocore:
+    """A self-driving cognitive loop: think, act, sleep, repeat.
+
+    Unlike OODACore — which is *driven*, sitting inert until an observer calls
+    `orient` — Autocore owns its own thread and paces itself from CADENCE.md. Each
+    turn assembles context from the StimulusLog, takes one native tool-calling turn,
+    executes whatever the model chose, fires due SCHEDULE.md tasks, and sleeps until
+    the next tick.
+
+    ### Waking early
+
+    Autonomy on its own makes an agent that acts on its own schedule but cannot be
+    *reached*: a message arriving ten minutes into a thirty-minute sleep would wait out
+    the other twenty. So the sleep is not `time.sleep`, which nothing can cancel — it is
+    `threading.Event.wait`, which is a sleep another thread can cut short. Anything that
+    wants the loop to come around now calls `wake()`; the core also subscribes to its own
+    StimulusLog, so in practice any externally-authored event — a chat message from
+    George, a fired reminder — wakes it without the appender needing to know Autocore
+    exists at all.
+
+    Only the *sleep* is interruptible. A turn already in flight runs to completion and
+    the wake is consumed by the turn after it, so cognition never overlaps itself and —
+    unlike OODACore — Autocore needs no cycle lock. Observers only ever flip a flag;
+    every model call, tool execution and file read stays on the loop thread.
+
+    Args:
+        name: the core's own actor name. Its `decision` and `tool_result` events are
+            logged under it, and events by this actor are exactly what the default wake
+            filter ignores — a core that woke itself would never sleep again.
+        home_directory: where the log, config and identity files live. Created and
+            seeded on construction.
+        tools: the tools the model may call, keyed by name.
+        wake_on: predicate deciding which appended events cut a sleep short. Defaults to
+            "anything this core did not write itself". Pass something narrower (say
+            `lambda event: event.type == "chat_message"`) to be woken only by
+            conversation.
+    """
+
     def __init__(
         self,
         name: str,
         home_directory: Path,
         tools: Dict[str, Tool], #TODO: why not pull this from config as well?
+        wake_on: Callable[[StimulusEvent], bool] | None = None,
     ):
         self.name: str = name
         self._initialize_home_directory(home_directory)
@@ -95,8 +134,25 @@ class Autocore:
         self.unknown_providers: List[str] = []
         self._cadence_hash: str | None = None
 
+        # The interrupt. `_wake` is the flag `_sleep` waits on; `_wake_trigger` is what
+        # set it, kept for the prompt. Both are touched from other threads, so every
+        # read-modify-write of the pair goes through `_wake_lock` — otherwise a wake
+        # landing between "read trigger" and "clear flag" would be silently swallowed.
+        self._wake_on: Callable[[StimulusEvent], bool] = wake_on or self._is_external
+        self._wake: threading.Event = threading.Event()
+        self._wake_trigger: StimulusEvent | str | None = None
+        self._wake_lock: threading.Lock = threading.Lock()
+        self.stimulus_log.subscribe(self._on_stimulus)
+
     def loop(self) -> None:
         while True:
+            # Take the pending wake *before* reading any state. Everything this turn
+            # goes on to see was appended before this line, so anything landing after
+            # it re-arms the flag and is answered by the next turn instead of idling
+            # out a full tick. The race costs at worst one redundant turn; the other
+            # ordering costs a dropped message.
+            self.loop_memory["wake_trigger"] = self._consume_wake()
+
             self.goals = self._read_goals()
             self.tasks = self._read_tasks()
             self.current_task = self._read_current_task()
@@ -140,6 +196,48 @@ class Autocore:
             )
 
             self._sleep()
+
+    def wake(self, trigger: StimulusEvent | str | None = None) -> None:
+        """Cut short any sleep in progress so the next turn starts now.
+
+        Safe to call from any thread, at any time, as often as you like: it sets a flag,
+        it does not run cognition. A wake raised while a turn is already running is not
+        lost — the flag survives the turn, and the `_sleep` that follows returns without
+        waiting at all.
+
+        `trigger` is recorded so the prompt can tell the agent what pulled it out of its
+        sleep. The first one after a turn boundary wins, since that is the one that
+        actually did the waking; later ones are along for the ride and show up in
+        context anyway.
+        """
+        with self._wake_lock:
+            if self._wake_trigger is None:
+                self._wake_trigger = trigger
+            self._wake.set()
+
+    def _consume_wake(self) -> StimulusEvent | str | None:
+        """Take and clear the pending wake, returning whatever caused it (None if the
+        loop simply came round on the clock)."""
+        with self._wake_lock:
+            trigger = self._wake_trigger
+            self._wake_trigger = None
+            self._wake.clear()
+        return trigger
+
+    def _on_stimulus(self, event: StimulusEvent) -> None:
+        """StimulusLog listener: something landed — is it worth interrupting a sleep
+        for? Runs on whichever thread did the append (an HTTP handler, the stdin
+        reader, the loop itself), so it does the least work possible and touches
+        nothing the loop thread owns."""
+        if self._wake_on(event):
+            self.wake(event)
+
+    def _is_external(self, event: StimulusEvent) -> bool:
+        """The default wake filter: anything this core did not write itself. Its own
+        `decision` and `tool_result` events must not count — every turn writes several,
+        so counting them would re-wake the loop that just finished and the agent would
+        never sleep at all."""
+        return event.actor != self.name
 
     def _initialize_home_directory(self, home_directory: Path) -> None:
         self.home_directory = home_directory
@@ -203,7 +301,7 @@ class Autocore:
             includes events from recent history such as tool calls and results, memories recalled,
             messages from George, etc. That history is how youperceive your environment and other minds
             so pay close attention to it, especially the most recent events which may require a timely
-            response.
+            response.{self._wake_notice()}
 
             ### Self Directed Action
              ---\n\n
@@ -212,6 +310,32 @@ class Autocore:
             If you have tasks, but not a current task, select one and put it in {self.home_directory}/CURRENT_TASK.md.
             If you have a current task, do something to advance it. If that task is complete, remove it from {self.home_directory}/TASKS.md and clear {self.home_directory}/CURRENT_TASK.md.
             Pay close attention to your recent history in <stimulus_log> as that's where you can see the results of your previous actions."""
+
+    def _wake_notice(self) -> str:
+        """The line that tells the agent this turn was asked for rather than scheduled.
+
+        Without it the prompt insists it is on a fixed cadence with time to spare, which
+        is exactly the wrong posture for a turn that exists because someone is waiting
+        on a reply."""
+        trigger = self.loop_memory.get("wake_trigger")
+        if trigger is None:
+            return ""
+        if isinstance(trigger, StimulusEvent):
+            source = f"a '{trigger.type}' event from '{trigger.actor}'"
+        else:
+            source = str(trigger)
+        slept = self.loop_memory.get("slept_seconds")
+        if self.loop_memory.get("woke_early") and isinstance(slept, (int, float)):
+            cause = f"your sleep was cut short after {slept:.0f} seconds by {source}"
+        else:
+            # The wake landed in the gap between the tick elapsing and this turn
+            # starting — nothing was actually interrupted, so don't claim it was.
+            cause = f"it was triggered by {source}"
+        return (
+            f" That gap does not apply to this turn: {cause}. Something outside you"
+            f" wants attention now, so read the end of <stimulus_log> first and deal"
+            f" with it before returning to self-directed work."
+        )
 
     def _current_goals_and_tasks(self) -> str:
         return (
@@ -227,7 +351,7 @@ class Autocore:
 
     def _log_decision(self, turn: AssistantTurn):
         self.stimulus_log.append(
-            actor="autobot",
+            actor=self.name,
             type="decision",
             content={
                 "text": turn.text,
@@ -244,7 +368,7 @@ class Autocore:
           if tool is None:
               # Record the miss as a stimulus so the next pass can see it and recover.
               self.stimulus_log.append(
-                  actor="autobot",
+                  actor=self.name,
                   type="tool_result",
                   content={
                       "tool": call.name,
@@ -256,7 +380,7 @@ class Autocore:
 
           result = tool.execute(**call.arguments)
           self.stimulus_log.append(
-              actor="autobot",
+              actor=self.name,
               type="tool_result",
               content={
                   "tool": call.name,
@@ -343,14 +467,30 @@ class Autocore:
         )
         self.loop_memory["last_lint"] = bad
 
-    def _sleep(self) -> None:
-        """Sleep the current cadence tick, waking early if a scheduled task comes due
-        sooner, and never busier than the floor."""
+    def _next_tick_seconds(self) -> float:
+        """How long this turn's sleep should last: the current cadence tick, shortened
+        if a scheduled task comes due sooner, and never busier than the floor."""
         duration = float(self.loop_memory.get("tick_seconds", DEFAULT_TICK_SECONDS))
         next_due = self.schedule.next_occurrence()
         if next_due is not None:
             until_due = (next_due - datetime.now(timezone.utc)).total_seconds()
             duration = min(duration, until_due)
-        duration = max(SLEEP_FLOOR_SECONDS, duration)
+        return max(SLEEP_FLOOR_SECONDS, duration)
+
+    def _sleep(self) -> bool:
+        """Sleep until the next tick or until something wakes us, whichever comes first.
+        Returns True if the sleep was cut short.
+
+        `Event.wait(timeout)` is the whole trick: a `time.sleep` another thread can
+        cancel. It returns True the instant the flag is set and False when the full
+        duration elapses, so the loop can tell "the clock came round" from "somebody
+        wants me now" — and a wake raised during the preceding turn is still pending
+        here, so it returns immediately rather than sleeping on an unanswered message.
+        """
+        duration = self._next_tick_seconds()
         self.sleep_duration = duration
-        sleep(duration)
+        started = monotonic()
+        woke_early = self._wake.wait(duration)
+        self.loop_memory["slept_seconds"] = monotonic() - started
+        self.loop_memory["woke_early"] = woke_early
+        return woke_early

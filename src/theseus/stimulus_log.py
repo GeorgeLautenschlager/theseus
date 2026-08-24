@@ -9,17 +9,24 @@ A record is a typed StimulusEvent — NOT a "turn", NOT a prompt/response pair.
 A conversational exchange is just one `type` whose payload lives in `content`.
 An egocentric capture or a game observation is another. All three agents can
 therefore share one log.
+
+Appends are also announced to in-process listeners (`subscribe`) — how a running
+loop learns that something landed without polling the file. The notification
+carries no policy: it is a bare "this happened", fired after the write is durable,
+so the log still assumes nothing about who is listening or what they do about it.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 # --- Sortable IDs (minimal ULID) ------------------------------------------------
 # 48-bit ms timestamp + 80-bit randomness, Crockford base32. Lexically sortable
@@ -85,12 +92,43 @@ class StimulusLog:
     line is dropped on read, never raised. Corruption of an *interior* line is
     a real error and is raised, because that should never happen to an
     append-only file and silently skipping it would hide data loss.
+
+    Listeners registered with `subscribe` are called with each appended event, on
+    the appending thread, once the write is durable.
     """
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
+        self._listeners: list[Callable[[StimulusEvent], None]] = []
+        self._listener_lock = threading.Lock()
+
+    def subscribe(
+        self, listener: Callable[[StimulusEvent], None]
+    ) -> Callable[[], None]:
+        """Call `listener` with every event appended from here on; returns a callable
+        that unsubscribes it again.
+
+        Notification is synchronous, on whichever thread did the append, and happens
+        only after the record is fsynced — a listener can never see an event that a
+        crash would un-append. It runs inside `append`, so listeners must be cheap and
+        must not block: the canonical one sets a `threading.Event` (see `Autocore.wake`)
+        and returns. Anything heavier belongs on its own thread.
+
+        This is an in-process signal, not a file watch. A writer in another process
+        appends to the same file without anyone here hearing about it; readers that
+        must survive that keep polling `read_all`.
+        """
+        with self._listener_lock:
+            self._listeners.append(listener)
+
+        def unsubscribe() -> None:
+            with self._listener_lock:
+                if listener in self._listeners:
+                    self._listeners.remove(listener)
+
+        return unsubscribe
 
     def append(
         self,
@@ -106,7 +144,21 @@ class StimulusLog:
             f.write(event.to_json() + "\n")
             f.flush()
             os.fsync(f.fileno())
+        self._notify(event)
         return event
+
+    def _notify(self, event: StimulusEvent) -> None:
+        """Fan the event out to listeners, snapshotting the list so a listener may
+        subscribe or unsubscribe from inside its own callback."""
+        with self._listener_lock:
+            listeners = list(self._listeners)
+        for listener in listeners:
+            try:
+                listener(event)
+            except Exception:
+                # The log is the bedrock: a buggy listener must never turn a durable
+                # append into a raise, nor stop the other listeners hearing about it.
+                traceback.print_exc()
 
     def read_all(self) -> list[StimulusEvent]:
         events: list[StimulusEvent] = []

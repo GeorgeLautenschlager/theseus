@@ -1,4 +1,5 @@
 from theseus.agentic_memory import AgenticMemory
+from theseus.auto_core import Autocore
 from theseus.ooda_core import OODACore
 from theseus.memory import Memory
 from theseus.memory_note import MemoryNote
@@ -19,6 +20,7 @@ from theseus.tools import (
 
 __all__ = [
     "AgenticMemory",
+    "Autocore",
     "OODACore",
     "Memory",
     "MemoryNote",
