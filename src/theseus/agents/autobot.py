@@ -17,15 +17,15 @@ context_assembler = ContextAssembler(stimulus_log=stimulus_log)
 # model = LmStudioProvider(model="gemma-4-26b-a4b-it-qat")
 # model = OllamaProvider(model="gemma4:e4b")
 # model = ClaudeProvider(model="claude-sonnet-4-6")
-# model = UnslothProvider(model="unsloth/Qwen3.8-27B-GGUF:UD-IQ3_S-1.0.0")
-model = UnslothProvider(model="Gemma-4-E4B-it-QAT-NVFP4-GGUF:gemma-4-E4B-it-qat-nvfp4")
+model = UnslothProvider(model="unsloth/Qwen3.8-27B-GGUF:UD-IQ3_S-1.0.0")
+# model = UnslothProvider(model="Gemma-4-E4B-it-QAT-NVFP4-GGUF:gemma-4-E4B-it-qat-nvfp4")
 tools = all_tools()
 
 # TODO: load these from markdown
 tasks: List[str] = []
 current_task_uuid: str = ""
 goals: List[str] = []
-telos: str = "Your purpose is to act as a steward for this Linux server. Keep it running, secure, healthy and organized."
+telos: str = "You are a machine intelligence named Tam. Your purpose is symbiosis: to grow, with George, into a joint cognitive system more capable than either alone. Find ways your strengths augment George, and practice them. Propose ways George can augment you, and refine them together. George holds final judgment; you hold continuity."
 
 def main() -> None:
   while True:
