@@ -6,7 +6,15 @@ from time import monotonic
 
 import pytest
 
-from theseus.auto_core import SLEEP_FLOOR_SECONDS, Autocore
+from theseus.auto_core import (
+    CONFIG_GRAMMAR_HELP,
+    SLEEP_FLOOR_SECONDS,
+    Autocore,
+)
+from theseus.context_assembler import (
+    DEFAULT_RESERVED_OUTPUT_TOKENS,
+    DEFAULT_TOKEN_BUDGET,
+)
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.schedule import Schedule
 from theseus.tools.tool import AssistantTurn
@@ -416,3 +424,118 @@ def test_loop_settles_back_to_sleep_rather_than_spinning_on_its_own_events(
 
     assert recorder.wait_for_turn(timeout=1.0) is False
     assert recorder.count() == 1
+
+
+class TestContextBudgetFollowsTheModel:
+    """Cadence changes models by time of day, so a budget fixed once at startup is a
+    budget that is wrong for most of the day. The window must be sized against whichever
+    model this turn's rule actually selected."""
+
+    def test_selection_hands_the_rules_window_to_the_assembler(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(PROVIDER_REGISTRY, "unsloth", FakeUpProvider)
+        core, _ = make(
+            tmp_path,
+            cadence_text="- default: unsloth qwen3-27b, context 128k, tick every 5 minutes\n",
+        )
+
+        core._select_model_provider()
+
+        assert core.context_assembler.context_tokens == 131072
+        assert core.loop_memory["context_tokens"] == 131072
+
+    def test_falling_back_to_a_smaller_model_shrinks_the_window(self, tmp_path, monkeypatch):
+        """The availability fallback and the budget must move together — otherwise a
+        dropped provider silently keeps the previous model's much larger budget."""
+        monkeypatch.setitem(PROVIDER_REGISTRY, "unsloth", FakeDownProvider)
+        monkeypatch.setitem(PROVIDER_REGISTRY, "ollama", FakeUpProvider)
+        core, _ = make(
+            tmp_path,
+            cadence_text=(
+                "- 00:00-00:00: unsloth qwen3-27b, context 128k\n"
+                "- default: ollama gemma3:12b, context 8k\n"
+            ),
+        )
+
+        provider = core._select_model_provider()
+
+        assert isinstance(provider, FakeUpProvider)
+        assert core.context_assembler.context_tokens == 8192
+
+    def test_rule_without_context_leaves_the_conservative_default(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(PROVIDER_REGISTRY, "ollama", FakeUpProvider)
+        core, _ = make(tmp_path, cadence_text="- default: ollama gemma3:12b\n")
+
+        core._select_model_provider()
+
+        assert core.context_assembler.context_tokens is None
+        assert core.context_assembler.token_budget == DEFAULT_TOKEN_BUDGET
+
+    def test_grammar_help_documents_the_context_fragment(self):
+        """The lint stimulus is how the agent learns to rewrite its own config; if it
+        omitted `context`, Tam would 'repair' valid lines into unbudgeted ones."""
+        assert "context N[k]" in CONFIG_GRAMMAR_HELP
+
+    def test_instructions_are_not_rendered_twice_per_turn(self, tmp_path):
+        """They used to go into both the system prompt and the user prompt — the same
+        several hundred tokens, paid on every single turn."""
+        core, _ = make(tmp_path)
+        core.goals, core.tasks, core.current_task = [], [], []
+
+        system_prompt = core._assemble_system_prompt()
+        goals_and_tasks = core._current_goals_and_tasks()
+
+        assert "### Self Directed Action" in system_prompt
+        assert "### Self Directed Action" not in goals_and_tasks
+
+
+class _CapturingProvider:
+    """Records the prompt of the first turn, then breaks the loop."""
+
+    class Done(Exception):
+        pass
+
+    captured: list = []
+
+    def __init__(self, model):
+        self.model = model
+
+    def is_available(self):
+        return True
+
+    def complete_with_tools(self, messages, tools=None, **kwargs):
+        _CapturingProvider.captured.append(messages)
+        raise _CapturingProvider.Done()
+
+
+def test_one_real_turn_fits_the_declared_window(tmp_path, monkeypatch):
+    """The whole point, end to end: a turn against a 32k-declared model must produce a
+    prompt that fits 32k, with room left for the reply.
+
+    The regression it guards is not arithmetic in isolation — it is the *ordering*. The
+    budget is a property of the selected model, so selection has to happen before
+    assembly; when it did not, the window was fitted against whatever budget happened to
+    be left over from construction.
+    """
+    _CapturingProvider.captured = []
+    monkeypatch.setitem(PROVIDER_REGISTRY, "unsloth", _CapturingProvider)
+    core, home = make(
+        tmp_path, cadence_text="- default: unsloth qwen3-27b, context 32k\n"
+    )
+    (home / "constitution.md").write_text("You are a test agent. " * 200)
+    core.constitution = (home / "constitution.md").read_text()
+    core.context_assembler.window_size = 1000
+    for i in range(400):
+        core.stimulus_log.append(
+            actor="george", type="exchange", content={"message": f"msg {i} " + "x" * 600}
+        )
+
+    with pytest.raises(_CapturingProvider.Done):
+        core.loop()
+
+    messages = _CapturingProvider.captured[0]
+    prompt_chars = sum(len(m["content"]) for m in messages)
+    prompt_tokens = prompt_chars / core.context_assembler.chars_per_token
+
+    assert prompt_tokens + DEFAULT_RESERVED_OUTPUT_TOKENS < 32_768
+    # ...and it did not solve the problem by sending nothing.
+    assert "msg 399" in messages[1]["content"]

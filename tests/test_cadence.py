@@ -131,3 +131,94 @@ def test_provider_registry_maps_short_names():
         "openrouter": OpenRouterProvider,
         "unsloth": UnslothProvider,
     }
+
+
+class TestContextDeclaration:
+    """`context N[k]` on a rule: the model's window, declared rather than guessed.
+
+    No OpenAI-compatible endpoint reports the window the server actually loaded, and the
+    vendor-native ones that answer at all tend to report the model's trained maximum. So
+    the number is stated in the file, next to the model it belongs to.
+    """
+
+    def test_parses_k_suffix_as_1024(self):
+        rule = Cadence.parse(
+            "- 00:00-16:00: unsloth qwen3-27b, context 128k, tick every 5 minutes"
+        ).rules[0]
+        assert rule.context_tokens == 131072
+        assert rule.tick_seconds == 300
+        assert rule.model == "qwen3-27b"
+
+    def test_parses_bare_token_count(self):
+        rule = Cadence.parse("- default: ollama gemma3:12b, context 8000").rules[0]
+        assert rule.context_tokens == 8000
+
+    def test_context_without_tick_keeps_default_tick(self):
+        rule = Cadence.parse("- 08:00-09:00: ollama x, context 16k").rules[0]
+        assert rule.context_tokens == 16384
+        assert rule.tick_seconds == DEFAULT_TICK_SECONDS
+
+    def test_rules_without_context_still_parse(self):
+        """The regression that matters: every CADENCE.md already deployed omits
+        `context`, and a rule that stopped parsing would fall into lint_lines and nag
+        the agent to 'fix' a line that was never broken."""
+        cadence = Cadence.parse(EXAMPLE)
+
+        assert cadence.lint_lines() == []
+        assert len(cadence.rules) == 3
+        assert all(rule.context_tokens is None for rule in cadence.rules)
+
+    def test_undeclared_context_is_none_not_a_guess(self):
+        rule = Cadence.parse("- default: claude claude-sonnet-4-6").rules[0]
+        assert rule.context_tokens is None
+
+    def test_zero_context_is_rejected_as_lint(self):
+        cadence = Cadence.parse("- default: ollama x, context 0\n")
+        assert cadence.rules == ()
+        assert cadence.lint_lines() == ["- default: ollama x, context 0"]
+
+    def test_context_must_precede_tick(self):
+        """One canonical order, so the lint can name a single correct form."""
+        cadence = Cadence.parse("- default: ollama x, tick every 5 minutes, context 8k\n")
+        assert cadence.rules == ()
+        assert cadence.lint_lines() != []
+
+
+class TestEndOfDaySpelling:
+    """`24:00` means midnight. `datetime.time` has no hour 24, so the rule used to fail
+    the grammar — and a rule that fails the grammar is skipped, which silently ran the
+    next matching rule's model instead. Observed live: a `16:00-24:00` Claude window that
+    never once took effect, falling through to a 4k-context local fallback."""
+
+    def test_end_of_day_window_wraps_to_midnight(self):
+        rule = Cadence.parse("- 16:00-24:00: claude claude-opus-5-0").rules[0]
+
+        assert rule.start == time(16, 0)
+        assert rule.end == time(0, 0)
+        assert rule.contains(time(16, 0))
+        assert rule.contains(time(23, 59))
+        assert not rule.contains(time(15, 59))
+
+    def test_full_day_window_spelled_with_24(self):
+        rule = Cadence.parse("- 00:00-24:00: ollama gemma3:12b").rules[0]
+
+        assert rule.contains(time(0, 0))
+        assert rule.contains(time(12, 0))
+        assert rule.contains(time(23, 59))
+
+    def test_end_of_day_rule_is_selected_at_the_right_hours(self):
+        cadence = Cadence.parse(
+            "- 00:00-16:00: unsloth qwen3-27b, context 128k\n"
+            "- 16:00-24:00: claude claude-opus-5-0, context 200k\n"
+            "- default: ollama gemma3:12b, context 4k\n"
+        )
+
+        assert cadence.lint_lines() == []
+        assert cadence.rule_for(at(10)).provider_key == "unsloth"
+        assert cadence.rule_for(at(17)).provider_key == "claude"
+        assert cadence.rule_for(at(23)).provider_key == "claude"
+
+    def test_only_2400_exactly_is_forgiven(self):
+        assert Cadence.parse("- 10:00-24:30: ollama x").lint_lines() != []
+        assert Cadence.parse("- 10:00-25:00: ollama x").lint_lines() != []
+        assert Cadence.parse("- 10:00-23:61: ollama x").lint_lines() != []

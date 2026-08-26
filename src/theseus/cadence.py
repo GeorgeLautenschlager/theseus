@@ -4,17 +4,27 @@ day, and how fast to tick.
 A CADENCE.md file is ordinary markdown; freeform prose is allowed anywhere and is inert.
 Only lines matching one of two rule forms do anything:
 
-    - 08:00-22:00: ollama gemma3:12b, tick every 2 minutes
+    - 08:00-22:00: ollama gemma3:12b, context 8k, tick every 2 minutes
     - 22:00-08:00: lm_studio qwen/qwen3-32b, tick every 15 minutes
-    - default: claude claude-sonnet-4-6, tick every 5 minutes
+    - default: claude claude-sonnet-4-6, context 200k, tick every 5 minutes
 
 Window rules match on time of day, start-inclusive, end-exclusive, and may wrap midnight
 (`22:00-08:00` means "from 22:00, through midnight, until 08:00"); `start == end` covers
-the whole day. When several windows contain a time, file order is priority — first match
+the whole day, and `24:00` is accepted as a spelling of midnight (so `16:00-24:00` is
+"16:00 until end of day" and `00:00-24:00` is all day). When several windows contain a time, file order is priority — first match
 wins. The `default` rule applies outside all windows and doubles as the availability
 fallback: callers walk `candidates_for` in order and take the first provider that is
 actually reachable. `tick every N seconds|minutes|hours` sets how long the agent sleeps
 between autonomous turns inside that window; omitted, it is DEFAULT_TICK_SECONDS.
+
+`context N` (or `N k`) declares the model's context window in tokens, and is what the
+caller sizes its prompt against. It belongs on the rule rather than on the provider class
+because it is a property of *this server serving this model right now*: a GGUF's window is
+chosen when the server loads it, so the same model may be 8k on one box and 128k on
+another, and no endpoint reliably reports which. Omitted, the caller keeps its own
+conservative default rather than guessing high -- guessing high overruns, guessing low
+merely underfills. Both fragments are optional and, when both appear, `context` comes
+first.
 
 This module is pure parsing and selection over datetimes it is handed — it never reads
 the clock and knows nothing about timezones or provider availability. Lines that look
@@ -31,11 +41,17 @@ from datetime import time as dtime
 
 DEFAULT_TICK_SECONDS = 300
 
+_CONTEXT_FRAGMENT = r"(?:,\s*context (\d+)([kK])?)?"
 _TICK_FRAGMENT = r"(?:,\s*tick every (\d+) (seconds?|minutes?|hours?))?"
 _WINDOW_RULE_RE = re.compile(
-    r"^- (\d{2}):(\d{2})-(\d{2}):(\d{2}): (\S+) (\S+)" + _TICK_FRAGMENT + r"$"
+    r"^- (\d{2}):(\d{2})-(\d{2}):(\d{2}): (\S+) (\S+)"
+    + _CONTEXT_FRAGMENT
+    + _TICK_FRAGMENT
+    + r"$"
 )
-_DEFAULT_RULE_RE = re.compile(r"^- default: (\S+) (\S+)" + _TICK_FRAGMENT + r"$")
+_DEFAULT_RULE_RE = re.compile(
+    r"^- default: (\S+) (\S+)" + _CONTEXT_FRAGMENT + _TICK_FRAGMENT + r"$"
+)
 _TICK_UNIT_SECONDS = {"second": 1, "minute": 60, "hour": 3600}
 
 
@@ -46,6 +62,7 @@ class CadenceRule:
     tick_seconds: int
     start: dtime | None = None  # None on the default rule
     end: dtime | None = None
+    context_tokens: int | None = None  # None when the rule doesn't declare one
 
     def contains(self, t: dtime) -> bool:
         """Whether time-of-day `t` falls in this window. False for the default rule —
@@ -117,23 +134,58 @@ class Cadence:
     def _parse_rule(stripped: str) -> CadenceRule | None:
         match = _WINDOW_RULE_RE.match(stripped)
         if match:
-            sh, sm, eh, em, provider_key, model, n, unit = match.groups()
+            sh, sm, eh, em, provider_key, model, ctx, ctx_unit, n, unit = match.groups()
             try:
-                start = dtime(int(sh), int(sm))
-                end = dtime(int(eh), int(em))
+                start = _parse_clock(sh, sm)
+                end = _parse_clock(eh, em)
                 tick = _parse_tick(n, unit)
+                context = _parse_context(ctx, ctx_unit)
             except ValueError:
                 return None
-            return CadenceRule(provider_key, model, tick, start, end)
+            return CadenceRule(provider_key, model, tick, start, end, context)
         match = _DEFAULT_RULE_RE.match(stripped)
         if match:
-            provider_key, model, n, unit = match.groups()
+            provider_key, model, ctx, ctx_unit, n, unit = match.groups()
             try:
                 tick = _parse_tick(n, unit)
+                context = _parse_context(ctx, ctx_unit)
             except ValueError:
                 return None
-            return CadenceRule(provider_key, model, tick, None, None)
+            return CadenceRule(provider_key, model, tick, None, None, context)
         return None
+
+
+def _parse_clock(hh: str, mm: str) -> dtime:
+    """`HH:MM`, accepting `24:00` as a spelling of end-of-day.
+
+    `datetime.time` has no hour 24, but "until 24:00" is how people write "until
+    midnight" -- and the failure was silent in the worst way: the rule didn't parse, so
+    it was skipped, so the agent quietly ran the *next* matching rule's model on a
+    fraction of the context window it expected. Normalizing to 00:00 gives the right
+    reading in both places it can appear: `16:00-24:00` wraps to "16:00 onward", and
+    `00:00-24:00` collapses to start == end, which `contains` already treats as all day.
+
+    Only `24:00` exactly; `24:30` is still an error, as is any other out-of-range time.
+    """
+    hour, minute = int(hh), int(mm)
+    if hour == 24 and minute == 0:
+        return dtime(0, 0)
+    return dtime(hour, minute)
+
+
+def _parse_context(n: str | None, unit: str | None) -> int | None:
+    """`context 128k` -> 131072, `context 8000` -> 8000, absent -> None.
+
+    A bare `k` is 1024, not 1000: context windows are powers of two everywhere they are
+    actually configured (llama.cpp's `--ctx-size`, Ollama's `num_ctx`), so 128k meaning
+    128000 would quietly under-declare by 1072 tokens on every rule.
+    """
+    if n is None:
+        return None
+    count = int(n)
+    if count < 1:
+        raise ValueError(f"invalid context size: {n!r}")
+    return count * 1024 if unit else count
 
 
 def _parse_tick(n: str | None, unit: str | None) -> int:
