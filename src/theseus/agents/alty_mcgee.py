@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from theseus.agentic_memory import AgenticMemory
+from theseus.auto_core import Autocore
 from theseus.memory_store import MemoryStore
 from theseus.context_assembler import ContextAssembler
 from theseus.stimulus_log import StimulusLog
@@ -79,8 +80,46 @@ class AltyMcGee:
         while True:
             self.chat_observer.observe_chat_message()
 
+
+class AutoAlty:
+    """Alty's autonomous sibling: the crash test dummy for `Autocore`.
+
+    Where AltyMcGee waits for chat messages, AutoAlty ticks on its own cadence.
+    TerminalChat is its mouth — replies land on stdout."""
+
+    def __init__(self, home_directory: Path | None = None):
+        """The home directory defaults to `auto_alty/` in the working directory,
+        which is what running it by hand wants. Tests inject a tmp path so a run
+        cannot scribble on the repo."""
+        home_directory = Path("auto_alty") if home_directory is None else home_directory
+
+        self.terminal_chat = TerminalChat()
+        self.core = Autocore(
+            name="Auto Alty",
+            home_directory=home_directory,
+            tools=all_tools() | {self.terminal_chat.name: self.terminal_chat},
+        )
+
+        # Autocore touches these empty on first boot; seed Alty's identity into
+        # them without clobbering a file the agent (or George) has since edited.
+        for name, text in (
+            ("constitution.md", ALTY_CONSTITUTION),
+            ("persona.md", PERSONA),
+        ):
+            path = home_directory / name
+            if not path.read_text(encoding="utf-8").strip():
+                path.write_text(text, encoding="utf-8")
+                setattr(self.core, name.removesuffix(".md"), text)
+
+        self.stimulus_log = self.core.stimulus_log
+
+    def run(self):
+        """Run the agent's autonomous loop. Blocks forever."""
+        self.core.loop()
+
+
 def main() -> None:
-    AltyMcGee().run()
+    AutoAlty().run()
 
 if __name__ == "__main__":
     main()
