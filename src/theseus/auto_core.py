@@ -28,9 +28,11 @@ CONFIG_GRAMMAR_HELP = (
     "'- [ ] quarterly @ D HH:MM: task', '- [ ] annually @ MM-DD HH:MM: task', "
     "'- [ ] every N seconds|minutes|hours: task'. "
     "CADENCE.md rule lines, matched against server time: "
-    "'- HH:MM-HH:MM: provider model[, tick every N seconds|minutes|hours]' "
+    "'- HH:MM-HH:MM: provider model[, context N[k]][, tick every N seconds|minutes|hours]' "
     "(windows may wrap midnight; first match wins) and "
-    "'- default: provider model[, tick every N ...]'. "
+    "'- default: provider model[, context N[k]][, tick every N ...]'. "
+    "'context' is that model's context window in tokens ('context 128k'); omit it only "
+    "if you don't know, since omitting it means assuming a very small window. "
     f"Providers: {', '.join(sorted(PROVIDER_REGISTRY))}."
 )
 
@@ -61,7 +63,11 @@ turn. Rules are matched against server time; the first matching window wins and 
 `default` line is both the off-hours rule and the fallback when a provider is down.
 Example (backtick-quoted so it stays inert):
 
-`- 22:00-08:00: lm_studio qwen/qwen3-32b, tick every 15 minutes`
+`- 22:00-08:00: lm_studio qwen/qwen3-32b, context 32k, tick every 15 minutes`
+
+`context` declares that model's context window, and is what your prompt gets sized
+against. Leave it off and a deliberately small window is assumed — safe, but you will
+think with far less history than the model could actually hold.
 
 - default: lm_studio local-model, tick every 5 minutes
 """
@@ -158,22 +164,31 @@ class Autocore:
             self.current_task = self._read_current_task()
             self.schedule = Schedule(self.home_directory / "SCHEDULE.md")
 
-            # load history from stimulus log
-            context = self.context_assembler.assemble_context()
-            self.loop_memory["window_chars"] = context.window_chars
+            # Pick the model *first*: the context budget is a property of whichever
+            # model this turn's cadence rule selected, so there is nothing to fit the
+            # window against until that is decided. _select_model_provider hands the
+            # rule's declared window to the assembler on the way through.
+            model = self._select_model_provider()
 
             # assemble system prompt
             system_prompt = self._assemble_system_prompt()
 
+            # load history from stimulus log, fitted around everything else in the
+            # prompt. Measuring the overhead beats inferring it from the previous turn:
+            # the inferred value is zero on the first turn, which is precisely when a
+            # mis-sized budget overruns.
+            goals_and_tasks = self._current_goals_and_tasks()
+            context = self.context_assembler.assemble_context(
+                overhead_chars=len(system_prompt) + len(goals_and_tasks)
+            )
+            self.loop_memory["window_chars"] = context.window_chars
+
             # assemble autonomous prompt
             autonomous_prompt = (
-                f"{self._current_goals_and_tasks()}"
+                f"{goals_and_tasks}"
                 f"<stimulus_log>\n{context.recent_events}\n</stimulus_log>\n\n"
-                f"{self._automated_prompt_instructions()}"
             )
 
-            # prompt model with tool calling
-            model = self._select_model_provider()
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": autonomous_prompt},
@@ -432,6 +447,12 @@ class Autocore:
             provider = self.model_providers.get((rule.provider_key, rule.model))
             if provider is not None and provider.is_available():
                 self.loop_memory["tick_seconds"] = rule.tick_seconds
+                self.loop_memory["context_tokens"] = rule.context_tokens
+                # The budget travels with the rule, so falling back to a smaller model
+                # shrinks the window in the same breath that selects it. A rule that
+                # declares no `context` leaves the assembler on its own conservative
+                # default rather than inheriting the previous rule's larger one.
+                self.context_assembler.set_context_limit(rule.context_tokens)
                 return provider
         raise RuntimeError("No model providers are currently available.")
 

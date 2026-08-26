@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import inspect
+import json
 
-from theseus.context_assembler import ContextAssembler
+from theseus.context_assembler import (
+    DEFAULT_CHARS_PER_TOKEN,
+    DEFAULT_RESERVED_OUTPUT_TOKENS,
+    ContextAssembler,
+)
 from theseus.stimulus_log import StimulusLog
 
 
@@ -14,7 +19,7 @@ def fill_log(tmp_path, n, message=None) -> StimulusLog:
     return log
 
 
-def event_tokens(log, chars_per_token=4.0) -> float:
+def event_tokens(log, chars_per_token=DEFAULT_CHARS_PER_TOKEN) -> float:
     """Estimated cost of one event in `log`, by the same rule the assembler uses.
 
     Tests derive budgets from this rather than hardcoding token counts, so they keep
@@ -138,9 +143,9 @@ class TestCalibration:
         assert assembler.assemble_context().recent_events.count("\n") + 1 == 5
 
         # Two events' worth of fixed overhead now has to come out of the same budget.
-        overhead_chars = int(per_event * 2 * 4.0)
+        overhead_chars = int(per_event * 2 * DEFAULT_CHARS_PER_TOKEN)
         assembler.observe(
-            prompt_tokens=int(overhead_chars / 4.0),
+            prompt_tokens=int(overhead_chars / DEFAULT_CHARS_PER_TOKEN),
             prompt_chars=overhead_chars,
             window_chars=0,
         )
@@ -186,3 +191,176 @@ class TestNoInvoluntaryRetrieval:
         log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
 
         assert ContextAssembler(stimulus_log=log).assemble_context().recent_events == ""
+
+
+class TestContextLimitBudget:
+    """The budget is derived from the model's declared window, not hand-set per agent.
+
+    The bug this replaces: a 120k budget hardcoded for Claude stayed in force after
+    CADENCE.md started routing the same agent to a 128k local model. The whole log fit
+    the budget, so nothing trimmed it, and every turn overran.
+    """
+
+    def test_context_limit_reserves_room_for_the_completion(self, tmp_path):
+        log = fill_log(tmp_path, 1)
+        assembler = ContextAssembler(stimulus_log=log, context_tokens=128_000)
+
+        budget = assembler._budget_tokens()
+
+        # The window holds prompt *and* completion; the prompt may not have all of it.
+        assert budget < 128_000 - DEFAULT_RESERVED_OUTPUT_TOKENS
+        assert budget > 100_000
+
+    def test_context_limit_overrides_the_conservative_default(self, tmp_path):
+        log = fill_log(tmp_path, 200, message="x" * 400)
+        assembler = ContextAssembler(stimulus_log=log, window_size=500)
+
+        small = assembler.assemble_context().recent_events.count("\n")
+        assembler.set_context_limit(200_000)
+        large = assembler.assemble_context().recent_events.count("\n")
+
+        assert large > small
+
+    def test_set_context_limit_ignores_none(self, tmp_path):
+        """A cadence rule that declares no `context` must leave the budget where it was,
+        not inherit whatever the previous rule happened to be."""
+        log = fill_log(tmp_path, 1)
+        assembler = ContextAssembler(stimulus_log=log, context_tokens=128_000)
+
+        assembler.set_context_limit(None)
+
+        assert assembler.context_tokens == 128_000
+
+    def test_measured_overhead_shrinks_the_window_on_the_very_first_turn(self, tmp_path):
+        # Enough history to overflow the budget either way, so the only thing separating
+        # the two assemblies is whether the overhead was accounted for.
+        log = fill_log(tmp_path, 200, message="x" * 400)
+        assembler = ContextAssembler(
+            stimulus_log=log, window_size=500, context_tokens=32_000
+        )
+
+        # No observe() has ever run: the inferred overhead is 0.0 and always will be
+        # under a provider that reports no usage. Passing it explicitly is what keeps
+        # the first turn honest.
+        uninformed = assembler.assemble_context().recent_events.count("\n")
+        informed = assembler.assemble_context(overhead_chars=40_000).recent_events.count("\n")
+
+        assert informed < uninformed
+
+    def test_a_declared_window_actually_fits_a_real_sized_log(self, tmp_path):
+        """End-to-end shape of the original failure, in miniature."""
+        log = fill_log(tmp_path, 300, message="x" * 1200)
+        assembler = ContextAssembler(
+            stimulus_log=log, window_size=1000, context_tokens=32_000
+        )
+
+        assembled = assembler.assemble_context(overhead_chars=8_000)
+
+        assert len(assembled.recent_events) / DEFAULT_CHARS_PER_TOKEN < 32_000
+        assert assembled.recent_events  # but not empty
+
+
+class TestOversizedEventClamp:
+    """One event must not be able to eat the window.
+
+    `_fit_to_budget` guarantees at least one event, which is right — an empty window asks
+    the model to decide with no stimulus. But the guarantee is only affordable if a single
+    event is bounded: a `read` result carrying a whole file is one event.
+    """
+
+    def test_huge_event_is_truncated_and_marked(self, tmp_path):
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        log.append(actor="tam", type="tool_result",
+                   content={"tool": "read", "output": "y" * 200_000})
+
+        assembled = ContextAssembler(
+            stimulus_log=log, context_tokens=32_000
+        ).assemble_context()
+
+        assert "truncated" in assembled.recent_events
+        assert len(assembled.recent_events) < 200_000
+
+    def test_truncated_event_is_still_valid_json_with_its_metadata(self, tmp_path):
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        log.append(actor="tam", type="tool_result",
+                   content={"tool": "read", "output": "y" * 200_000, "is_error": False})
+
+        line = ContextAssembler(
+            stimulus_log=log, context_tokens=32_000
+        ).assemble_context().recent_events
+
+        event = json.loads(line)
+        assert event["actor"] == "tam"
+        assert event["type"] == "tool_result"
+        assert event["content"]["tool"] == "read"      # small fields survive intact
+        assert event["content"]["is_error"] is False
+        assert "truncated" in event["content"]["output"]
+
+    def test_the_log_itself_is_never_modified(self, tmp_path):
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        log.append(actor="tam", type="tool_result",
+                   content={"tool": "read", "output": "y" * 200_000})
+
+        ContextAssembler(stimulus_log=log, context_tokens=32_000).assemble_context()
+
+        assert len(log.read_all()[0].content["output"]) == 200_000
+
+    def test_one_huge_event_does_not_crowd_out_recent_history(self, tmp_path):
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        log.append(actor="tam", type="tool_result",
+                   content={"tool": "read", "output": "y" * 400_000})
+        for i in range(5):
+            log.append(actor="george", type="exchange", content={"message": f"msg {i}"})
+
+        assembled = ContextAssembler(
+            stimulus_log=log, context_tokens=32_000
+        ).assemble_context()
+
+        for i in range(5):
+            assert f"msg {i}" in assembled.recent_events
+
+    def test_clamp_never_shaves_an_event_to_nothing(self, tmp_path):
+        # Budget of 1 token: without the floor the guaranteed event would be trimmed
+        # away entirely, which is the empty window the guarantee exists to prevent.
+        log = fill_log(tmp_path, 3, message="x" * 4000)
+
+        assembled = ContextAssembler(
+            stimulus_log=log, window_size=200, token_budget=1
+        ).assemble_context()
+
+        assert "msg 2" in assembled.recent_events
+
+    def test_trims_the_bulk_not_the_reasoning_on_a_decision_event(self, tmp_path):
+        """A `decision` keeps its bulk nested in `tool_calls[].arguments`, not at the top
+        level. A top-level-only scan cut the short `text` — the agent's stated reasoning —
+        and left the actual payload untouched, so the line stayed over budget too."""
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        log.append(actor="tam", type="decision", content={
+            "text": "Writing the file now.",
+            "tool_calls": [{"name": "write", "arguments": {"content": "z" * 200_000}}],
+        })
+
+        line = ContextAssembler(
+            stimulus_log=log, context_tokens=32_000
+        ).assemble_context().recent_events
+        event = json.loads(line)
+
+        assert event["content"]["text"] == "Writing the file now."   # reasoning intact
+        assert "truncated" in event["content"]["tool_calls"][0]["arguments"]["content"]
+        assert len(line) < 200_000
+
+    def test_many_medium_strings_are_trimmed_until_the_line_fits(self, tmp_path):
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        log.append(actor="tam", type="decision", content={
+            "tool_calls": [
+                {"name": "write", "arguments": {"content": "z" * 30_000}}
+                for _ in range(6)
+            ],
+        })
+
+        line = ContextAssembler(
+            stimulus_log=log, context_tokens=16_000
+        ).assemble_context().recent_events
+
+        assert json.loads(line)["type"] == "decision"
+        assert len(line) < 30_000
