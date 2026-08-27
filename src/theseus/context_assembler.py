@@ -6,14 +6,18 @@ from typing import Any
 
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 
-# Seed ratio for English-ish JSON, used until the first real measurement lands. Measured
-# at 3.46 over a real agent log (dense JSONL: ISO timestamps, ULIDs, escaped tool output),
-# and deliberately set *below* that rather than at it, so the first uncalibrated pass
-# over-charges itself slightly. The error is asymmetric: too low merely underfills the
-# window, too high overruns the model and the turn is lost. A seed only has to be wrong
-# in the safe direction — and under a provider that reports no usage (the Claude CLI) it
-# is never corrected at all, so the seed is the permanent answer, not just the first one.
-DEFAULT_CHARS_PER_TOKEN = 3.4
+# Seed ratio for English-ish JSON, used until the first real measurement lands. The error
+# is asymmetric: too low merely underfills the window, too high under-charges every event
+# and overruns the model, losing the turn. And under a provider that reports no usage (the
+# Claude CLI) `observe` never corrects it, so the seed is the permanent answer rather than
+# just the first one.
+#
+# It was 3.4, from a 3.46 measurement over an early agent log. That log was not dense
+# enough to be representative: Tam's, measured 2026-08-26 against a backend that does
+# report usage, ran 417,546 chars to 150,305 prompt tokens — 2.78. Real logs are mostly
+# ULIDs, ISO timestamps, escaped JSON and file paths, none of which tokenize like prose,
+# so 3.4 was under-charging every event by ~22% in exactly the unsafe direction.
+DEFAULT_CHARS_PER_TOKEN = 2.78
 
 # The smallest context window we can actually expect to be running against: Ollama's
 # default `num_ctx`. Deliberately conservative — a rule that knows its model declares

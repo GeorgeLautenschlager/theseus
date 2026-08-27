@@ -17,7 +17,7 @@ from theseus.context_assembler import (
 )
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.schedule import Schedule
-from theseus.tools.tool import AssistantTurn
+from theseus.tools.tool import AssistantTurn, ToolCall, ToolResult
 
 
 class FakeUpProvider:
@@ -539,3 +539,120 @@ def test_one_real_turn_fits_the_declared_window(tmp_path, monkeypatch):
     assert prompt_tokens + DEFAULT_RESERVED_OUTPUT_TOKENS < 32_768
     # ...and it did not solve the problem by sending nothing.
     assert "msg 399" in messages[1]["content"]
+
+
+# --- delivering a reply the model wrote as prose ---
+#
+# Observed live (Tam, 2026-08-27): both Qwen3.8-27B and Gemma-4-31b answered George in
+# `content` instead of calling `respond_in_web_chat`. The text reached the stimulus log
+# and stopped there, because `_execute_tool_calls` walks `tool_calls` and nothing walks
+# `text` — so George saw the replies only in the debug tab. It then compounded: the
+# orphaned prose sat in the context window as a worked example of a decision with an
+# empty `tool_calls`, and the next turn imitated it, verbatim, for half an hour.
+
+
+class Mouth:
+    """A stand-in for WebChat/TerminalChat: the tool that ends a turn."""
+
+    name = "say"
+    ends_turn = True
+    description = "Say something."
+    parameters = {
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"],
+    }
+
+    def __init__(self):
+        self.said: list[str] = []
+
+    def execute(self, message):
+        self.said.append(message)
+        return ToolResult("delivered")
+
+
+class Hands:
+    """A non-terminal tool, to prove recovery picks the mouth and not just any tool."""
+
+    name = "dig"
+    description = "Dig."
+    parameters = {"type": "object", "properties": {}, "required": []}
+
+    def execute(self):
+        return ToolResult("dug")
+
+
+def with_tools(tmp_path, **tools):
+    core, home = make(tmp_path)
+    core.tools = tools
+    return core, home
+
+
+def decisions(core):
+    return [e for e in core.stimulus_log.read_all() if e.type == "decision"]
+
+
+def test_prose_reply_is_delivered_through_the_terminal_tool(tmp_path):
+    mouth = Mouth()
+    core, _ = with_tools(tmp_path, say=mouth, dig=Hands())
+    turn = AssistantTurn(text="Hey George, I'm here.", tool_calls=())
+
+    core._take_action(turn)
+
+    assert mouth.said == ["Hey George, I'm here."]
+
+
+def test_recovered_turn_is_logged_as_the_call_the_model_should_have_made(tmp_path):
+    """The log is what the next turn reads. If the prose stays in it as a tool-less
+    decision, the pattern that caused this is still sitting in the window."""
+    mouth = Mouth()
+    core, _ = with_tools(tmp_path, say=mouth)
+
+    core._take_action(AssistantTurn(text="delivered anyway", tool_calls=()))
+
+    (logged,) = decisions(core)
+    assert logged.content["tool_calls"] == [
+        {"name": "say", "arguments": {"message": "delivered anyway"}}
+    ]
+    assert logged.content["text"] is None
+    assert logged.content["text_recovered"] is True
+
+
+def test_a_turn_that_called_a_tool_is_left_alone(tmp_path):
+    mouth = Mouth()
+    hands = Hands()
+    core, _ = with_tools(tmp_path, say=mouth, dig=hands)
+    turn = AssistantTurn(
+        text="thinking out loud", tool_calls=(ToolCall(id="1", name="dig", arguments={}),)
+    )
+
+    core._take_action(turn)
+
+    assert mouth.said == [], "commentary alongside a real tool call is not a reply"
+    (logged,) = decisions(core)
+    assert logged.content["text"] == "thinking out loud"
+    assert "text_recovered" not in logged.content
+
+
+def test_blank_text_and_no_tool_call_stays_a_deliberate_no_op(tmp_path):
+    """`text=None, tool_calls=[]` is the model choosing to do nothing this tick. There
+    is no reply to rescue, and inventing an empty one would spam George every turn."""
+    mouth = Mouth()
+    core, _ = with_tools(tmp_path, say=mouth)
+
+    core._take_action(AssistantTurn(text=None, tool_calls=()))
+    core._take_action(AssistantTurn(text="   \n ", tool_calls=()))
+
+    assert mouth.said == []
+
+
+def test_an_agent_with_no_mouth_logs_the_prose_and_moves_on(tmp_path):
+    """An agent composed without a chat tool has nowhere to put a stray reply. It must
+    keep the text in the log rather than crash the loop."""
+    core, _ = with_tools(tmp_path, dig=Hands())
+
+    core._take_action(AssistantTurn(text="nobody is listening", tool_calls=()))
+
+    (logged,) = decisions(core)
+    assert logged.content["text"] == "nobody is listening"
+    assert logged.content["tool_calls"] == []

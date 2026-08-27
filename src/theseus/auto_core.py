@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Dict, List, Tuple
+from uuid import uuid4
 
 from theseus.cadence import DEFAULT_TICK_SECONDS, Cadence
 from theseus.cognitive_prompts import render_tools_section
@@ -14,7 +16,7 @@ from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.model_providers.model_provider import ModelProvider
 from theseus.schedule import Schedule
 from theseus.stimulus_log import StimulusEvent, StimulusLog
-from theseus.tools.tool import AssistantTurn, Tool
+from theseus.tools.tool import AssistantTurn, Tool, ToolCall
 
 SLEEP_FLOOR_SECONDS = 5
 
@@ -194,11 +196,10 @@ class Autocore:
                 {"role": "user", "content": autonomous_prompt},
             ]
             turn = model.complete_with_tools(messages, list(self.tools.values()))
-            self._log_decision(turn)
 
-            # execute tool calls, if any
-            self._execute_tool_calls(turn)
-                # commit results to stimulus log
+            # log the decision and execute whatever it chose, rescuing a reply the
+            # model wrote as prose instead of as a call to its chat tool
+            self._take_action(turn)
 
             # check schedule and append reminders
             self._append_reminders()
@@ -259,8 +260,8 @@ class Autocore:
         self.home_directory.mkdir(parents=True, exist_ok=True)
         for name in (
             "stimulus_log.jsonl",
-            "constitution.md",
-            "persona.md",
+            "CONSTITUTION.md",
+            "PERSONA.md",
             "GOALS.md",
             "TASKS.md",
             "CURRENT_TASK.md",
@@ -364,18 +365,68 @@ class Autocore:
             "---\n\n"
         )
 
-    def _log_decision(self, turn: AssistantTurn):
-        self.stimulus_log.append(
-            actor=self.name,
-            type="decision",
-            content={
-                "text": turn.text,
-                "tool_calls": [
-                    {"name": call.name, "arguments": call.arguments}
-                    for call in turn.tool_calls
-                ],
-            },
+    def _take_action(self, turn: AssistantTurn) -> None:
+        """Commit one decision to the log and carry it out."""
+        recovered = self._recover_stray_text(turn)
+        self._log_decision(recovered or turn, recovered=recovered is not None)
+        self._execute_tool_calls(recovered or turn)
+
+    def _terminal_tool(self) -> Tool | None:
+        """The agent's mouth: the tool whose call completes a turn (`WebChat`,
+        `TerminalChat`). None for an agent composed without one."""
+        for tool in self.tools.values():
+            if getattr(tool, "ends_turn", False):
+                return tool
+        return None
+
+    def _recover_stray_text(self, turn: AssistantTurn) -> AssistantTurn | None:
+        """Turn a reply the model wrote as prose into the call it should have made.
+
+        A model that answers George in `content` rather than by calling its chat tool
+        has said something nobody will ever read: `_log_decision` files the text in the
+        stimulus log and `_execute_tool_calls` walks `tool_calls`, which is empty. The
+        text is visible in the debug view and nowhere else.
+
+        Left alone it also compounds, which is the worse half. The orphaned decision
+        stays in the context window as a worked example — `{"text": "...",
+        "tool_calls": []}` — authored by the agent itself, so the next turn imitates it
+        and the one after that imitates them both. Observed live: the same reply
+        regenerated verbatim across four turns while George waited.
+
+        So the prose is delivered rather than dropped, and what lands in the log is the
+        call, not the pattern that caused this. `text_recovered` keeps the record
+        honest about the substitution. Returns None when there is nothing to recover.
+
+        Commentary alongside a real tool call is not a stray reply — the model chose an
+        action and narrated it — and neither is empty text, which is how a native
+        tool-calling model says "nothing to do this tick".
+        """
+        if turn.tool_calls or not (turn.text or "").strip():
+            return None
+        tool = self._terminal_tool()
+        if tool is None:
+            return None
+        # The mouth takes one string; read its name off the schema rather than assuming
+        # "message", so a differently-shaped chat tool still works.
+        required = tool.parameters.get("required") or ["message"]
+        call = ToolCall(
+            id=f"recovered-{uuid4().hex}",
+            name=tool.name,
+            arguments={required[0]: turn.text},
         )
+        return replace(turn, text=None, tool_calls=(call,))
+
+    def _log_decision(self, turn: AssistantTurn, recovered: bool = False):
+        content: Dict[str, Any] = {
+            "text": turn.text,
+            "tool_calls": [
+                {"name": call.name, "arguments": call.arguments}
+                for call in turn.tool_calls
+            ],
+        }
+        if recovered:
+            content["text_recovered"] = True
+        self.stimulus_log.append(actor=self.name, type="decision", content=content)
 
     def _execute_tool_calls(self, turn: AssistantTurn):
         for call in turn.tool_calls:
