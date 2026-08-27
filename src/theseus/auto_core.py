@@ -130,7 +130,7 @@ class Autocore:
             stimulus_log=self.stimulus_log
         )
 
-        with (self.home_directory / "constitution.md").open("r") as file:
+        with (self.home_directory / "CONSTITUTION.md").open("r") as file:
             self.constitution: str = file.read()
 
         with (self.home_directory / "persona.md").open("r") as file:

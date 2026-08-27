@@ -56,7 +56,7 @@ def test_initialize_creates_files_not_directories(tmp_path):
     _, home = make(tmp_path)
     for name in [
         "stimulus_log.jsonl",
-        "constitution.md",
+        "CONSTITUTION.md",
         "persona.md",
         "GOALS.md",
         "TASKS.md",
@@ -521,8 +521,8 @@ def test_one_real_turn_fits_the_declared_window(tmp_path, monkeypatch):
     core, home = make(
         tmp_path, cadence_text="- default: unsloth qwen3-27b, context 32k\n"
     )
-    (home / "constitution.md").write_text("You are a test agent. " * 200)
-    core.constitution = (home / "constitution.md").read_text()
+    (home / "CONSTITUTION.md").write_text("You are a test agent. " * 200)
+    core.constitution = (home / "CONSTITUTION.md").read_text()
     core.context_assembler.window_size = 1000
     for i in range(400):
         core.stimulus_log.append(

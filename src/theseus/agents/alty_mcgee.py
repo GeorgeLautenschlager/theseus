@@ -103,7 +103,7 @@ class AutoAlty:
         # Autocore touches these empty on first boot; seed Alty's identity into
         # them without clobbering a file the agent (or George) has since edited.
         for name, text in (
-            ("constitution.md", ALTY_CONSTITUTION),
+            ("CONSTITUTION.md", ALTY_CONSTITUTION),
             ("persona.md", PERSONA),
         ):
             path = home_directory / name
