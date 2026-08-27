@@ -133,7 +133,7 @@ class Autocore:
         with (self.home_directory / "CONSTITUTION.md").open("r") as file:
             self.constitution: str = file.read()
 
-        with (self.home_directory / "persona.md").open("r") as file:
+        with (self.home_directory / "PERSONA.md").open("r") as file:
             self.persona: str = file.read()
 
         self.loop_memory: Dict[str, Any] = {}

@@ -104,7 +104,7 @@ class AutoAlty:
         # them without clobbering a file the agent (or George) has since edited.
         for name, text in (
             ("CONSTITUTION.md", ALTY_CONSTITUTION),
-            ("persona.md", PERSONA),
+            ("PERSONA.md", PERSONA),
         ):
             path = home_directory / name
             if not path.read_text(encoding="utf-8").strip():

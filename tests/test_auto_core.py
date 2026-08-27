@@ -57,7 +57,7 @@ def test_initialize_creates_files_not_directories(tmp_path):
     for name in [
         "stimulus_log.jsonl",
         "CONSTITUTION.md",
-        "persona.md",
+        "PERSONA.md",
         "GOALS.md",
         "TASKS.md",
         "CURRENT_TASK.md",
