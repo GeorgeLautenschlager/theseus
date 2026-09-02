@@ -1,0 +1,79 @@
+{
+  "queries": 50,
+  "episodes": 15,
+  "systems": {
+    "layered": {
+      "hit_rate_pct": 8.0,
+      "judge_answer_found_pct": 8.0,
+      "judge_best_rank_mean": 1.25,
+      "sentinel_last_pct": 74.0,
+      "recall_p50_ms": 64.4,
+      "recall_p95_ms": 446.0,
+      "consolidation_wall_s": 5066.8,
+      "consolidation_tokens_in": 12944,
+      "consolidation_tokens_out": 2704,
+      "store": {
+        "bytes": 557694,
+        "records": {
+          "knowledge": 0,
+          "memory": 16,
+          "wisdom": 7
+        }
+      },
+      "quality": {
+        "episodes": 15,
+        "candidates_extracted": 51,
+        "schema_failures": 43,
+        "schema_failure_rate_pct": 84.3,
+        "routed": {
+          "knowledge": 0,
+          "memory_assertions": 8,
+          "wisdom": 7,
+          "episode_records": 15
+        }
+      }
+    },
+    "agentic": {
+      "hit_rate_pct": 18.0,
+      "judge_answer_found_pct": 18.0,
+      "judge_best_rank_mean": 1.33,
+      "sentinel_last_pct": 86.0,
+      "recall_p50_ms": 43.0,
+      "recall_p95_ms": 51.6,
+      "consolidation_wall_s": null,
+      "consolidation_tokens_in": 0,
+      "consolidation_tokens_out": 0,
+      "store": {
+        "bytes": 67392,
+        "records": {
+          "notes": 3
+        }
+      },
+      "note": "consolidation cost not instrumented (pre-existing module, untouched per goal constraints); store holds 3 notes for 15 episodes"
+    },
+    "flat": {
+      "hit_rate_pct": 80.0,
+      "judge_answer_found_pct": 68.0,
+      "judge_best_rank_mean": 1.71,
+      "sentinel_last_pct": 80.0,
+      "recall_p50_ms": 34.3,
+      "recall_p95_ms": 58.1,
+      "consolidation_wall_s": 25.77,
+      "consolidation_tokens_in": 0,
+      "consolidation_tokens_out": 0,
+      "store": {
+        "bytes": 32198,
+        "records": {
+          "episode_records": 15
+        }
+      }
+    }
+  },
+  "notes": {
+    "latency": "recall p50/p95 in ms; recall includes embedding of query (and records for layered)",
+    "hit_rate": "deterministic: golden answer text appears verbatim in a top-3 candidate",
+    "judge": "gemma4:e4b ranks shuffled candidates + sentinel per query across all three systems (one call/query); ranking only, never thresholds; best_rank is 1-indexed position of the best answer-bearing candidate",
+    "sentinel_last_pct": "share of queries where the \"no relevant information\" sentinel ranked last or was omitted (omission counts as last: returned beats nothing)",
+    "episodes": "15 total: 3 real chunks from auto_alty/stimulus_log.jsonl, 2 real chunks from stimulus_log.jsonl, 10 synthetic (4 facts + noise each); golden set = 10 real + 40 synthetic queries"
+  }
+}

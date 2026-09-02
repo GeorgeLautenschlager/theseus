@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from openai import OpenAIError
+from openai import OpenAI, OpenAIError
 
 from .model_provider import ModelProvider
 
@@ -29,6 +29,9 @@ class OpenRouterProvider(ModelProvider):
                 "OPENROUTER_API_KEY environment variable."
             )
         super().__init__(base_url=base_url, model=model, api_key=api_key)
+        # ponytail: flash models answer in ~30s; fail fast on a hung backend instance
+        # and retry (the 600s default timeout once sank a whole eval run).
+        self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0, max_retries=5)
 
     def is_available(self) -> bool:
         try:

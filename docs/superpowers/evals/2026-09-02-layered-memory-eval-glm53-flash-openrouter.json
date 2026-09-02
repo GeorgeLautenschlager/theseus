@@ -1,0 +1,64 @@
+{
+  "queries": 50,
+  "episodes": 15,
+  "systems": {
+    "layered": {
+      "hit_rate_pct": 50.0,
+      "judge_answer_found_pct": 44.0,
+      "judge_best_rank_mean": 1,
+      "sentinel_last_pct": 96.0,
+      "recall_p50_ms": 62.2,
+      "recall_p95_ms": 110.1,
+      "consolidation_wall_s": 685.14,
+      "consolidation_tokens_in": 12944,
+      "consolidation_tokens_out": 6125,
+      "store": {
+        "bytes": 763011,
+        "records": {
+          "knowledge": 67,
+          "memory": 24,
+          "wisdom": 10
+        }
+      },
+      "quality": {
+        "dead_letters": 0,
+        "dead_letter_reasons": {},
+        "supersessions": 2
+      }
+    },
+    "agentic": {
+      "hit_rate_pct": 16.0,
+      "judge_answer_found_pct": 12.0,
+      "judge_best_rank_mean": 1.33,
+      "sentinel_last_pct": 94.0,
+      "recall_p50_ms": 51.3,
+      "recall_p95_ms": 106.4,
+      "consolidation_wall_s": 227.11,
+      "consolidation_tokens_in": 6309,
+      "consolidation_tokens_out": 914,
+      "store": {
+        "bytes": 68869,
+        "records": {
+          "notes": 3
+        }
+      }
+    },
+    "flat": {
+      "hit_rate_pct": 80.0,
+      "judge_answer_found_pct": 70.0,
+      "judge_best_rank_mean": 1.77,
+      "sentinel_last_pct": 94.0,
+      "recall_p50_ms": 47.9,
+      "recall_p95_ms": 59.7,
+      "consolidation_wall_s": 26.24,
+      "consolidation_tokens_in": 0,
+      "consolidation_tokens_out": 0,
+      "store": {
+        "bytes": 32198,
+        "records": {
+          "episode_records": 15
+        }
+      }
+    }
+  }
+}

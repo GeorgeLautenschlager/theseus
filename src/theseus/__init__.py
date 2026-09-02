@@ -2,6 +2,7 @@ from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.ooda_core import OODACore
 from theseus.memory import Memory
+from theseus.memory_module import Episode, MemoryModule
 from theseus.memory_note import MemoryNote
 from theseus.memory_store import MemoryStore
 from theseus.schedule import Schedule
@@ -22,7 +23,9 @@ __all__ = [
     "AgenticMemory",
     "Autocore",
     "OODACore",
+    "Episode",
     "Memory",
+    "MemoryModule",
     "MemoryNote",
     "MemoryStore",
     "Schedule",

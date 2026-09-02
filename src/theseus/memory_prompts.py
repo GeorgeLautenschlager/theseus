@@ -1,12 +1,14 @@
-"""Pure prompt builders and JSON schemas for the AgenticMemory pipeline.
+"""Pure prompt builders and JSON schemas for the memory pipelines.
 
 Mirrors cognitive_prompts.py: no I/O, no state — just strings and schemas, so
-the whole module is offline-testable. Two LLM steps:
+the whole module is offline-testable. Steps:
 
-1. Note construction — distill a batch of stimulus events into an enriched
-   note (context, keywords, tags).
-2. Link decision — given the new note and its nearest neighbors, choose which
-   (if any) existing notes it should link to.
+1. Note construction (AgenticMemory) — distill a batch of stimulus events into
+   an enriched note (context, keywords, tags).
+2. Link decision (AgenticMemory) — given the new note and its nearest
+   neighbors, choose which (if any) existing notes it should link to.
+3. Assertion extraction (layered MemoryModule) — distill one episode's evidence
+   into a summary plus candidate assertions for write routing.
 """
 
 from __future__ import annotations
@@ -66,6 +68,63 @@ def link_json_schema(candidate_ids: list[str]) -> dict:
         "required": ["links"],
         "additionalProperties": False,
     }
+
+
+def extraction_json_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "assertions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"enum": ["fact", "principle", "event"]},
+                        "subject": {"type": "string"},
+                        "predicate": {"type": "string"},
+                        "value": {"type": "string"},
+                        "statement": {"type": "string"},
+                    },
+                    "required": ["kind", "statement"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["summary", "assertions"],
+        "additionalProperties": False,
+    }
+
+
+def build_extraction_prompt(evidence_text: str, context_text: str = "") -> str:
+    context_block = (
+        f"\n<context_only>\n{context_text}\n</context_only>\n\n"
+        "The context_only block shows what the agent recalled while this episode was "
+        "happening. It is there so you can interpret the evidence; it is NOT evidence — "
+        "never source an assertion from it.\n\n" if context_text else ""
+    )
+    return (
+        "You are the memory-consolidation step of a cognitive agent. Below is one episode: "
+        "the stimulus events that just happened (one JSON event per line). Distill it.\n\n"
+        "<evidence>\n"
+        f"{evidence_text}\n"
+        "</evidence>\n"
+        + context_block
+        + "Produce:\n"
+        "- summary: 1-3 sentences, in the agent's first person, of what happened in this "
+        "episode. This is the whole episode record: carry the substance here.\n"
+        "- assertions: the durable claims worth keeping, each with:\n"
+        '  - kind: "fact" (a checkable claim about a subject), "principle" (a generalized '
+        'rule or preference that would guide future behavior), or "event" (something that '
+        "happened, not durable enough to be a fact).\n"
+        '  - for kind "fact": subject, predicate, value — e.g. subject "George", predicate '
+        '"prefers", value "dark mode". Only use kind "fact" when you can state all three.\n'
+        "  - statement: one plain sentence stating the claim, for every kind.\n"
+        "Skip conversational filler and anything that is only true of this exact moment.\n\n"
+        "Reply with a single JSON object and nothing else — no code fences, no commentary. "
+        'Use double quotes: {"summary": "...", "assertions": [{"kind": "fact", '
+        '"subject": "...", "predicate": "...", "value": "...", "statement": "..."}]}'
+    )
 
 
 def build_link_decision_prompt(new_note: MemoryNote, candidates: list[MemoryNote]) -> str:

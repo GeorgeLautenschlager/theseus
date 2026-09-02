@@ -229,3 +229,4 @@ stimulus_log.jsonl
 
 # Steward run artifacts (ephemeral: runlogs/ledgers folded into the PR, not tracked)
 .steward/
+.codebase-index/
