@@ -10,6 +10,7 @@ from theseus.replication_events import (
     DECLARED_REASONS,
     GAP,
     INFERRED_REASON,
+    MAX_REASON_CHARS,
     batch_rejected,
     declared_gap,
     inferred_gap,
@@ -41,7 +42,7 @@ def test_a_declared_gap_carries_the_range_the_surrogate_abandoned():
     }
 
 
-def test_an_inferred_gap_is_marked_undeclared_and_reasonless():
+def test_an_inferred_gap_is_marked_undeclared():
     """A seq jump with no marker: the surrogate died mid-buffer, or something is broken.
     Same hole as a declared gap, different diagnosis — so the host says which it is."""
     content = inferred_gap(
@@ -52,8 +53,15 @@ def test_an_inferred_gap_is_marked_undeclared_and_reasonless():
         span_end=SPAN_END,
     )
 
-    assert content["declared"] is False
-    assert content["reason"] == INFERRED_REASON
+    assert content == {
+        "origin": "android-01",
+        "from_seq": 5,
+        "to_seq": 9,
+        "reason": INFERRED_REASON,
+        "span_start": "2026-09-04T16:02:00+00:00",
+        "span_end": "2026-09-04T16:40:00+00:00",
+        "declared": False,
+    }
 
 
 @pytest.mark.parametrize("reason", DECLARED_REASONS)
@@ -71,7 +79,7 @@ def test_every_declared_reason_is_accepted(reason):
 
 
 def test_an_unknown_reason_raises_rather_than_serialising():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unknown declared reason"):
         declared_gap(
             origin="kitchen-surrogate",
             from_seq=1,
@@ -85,7 +93,7 @@ def test_an_unknown_reason_raises_rather_than_serialising():
 def test_the_inferred_reason_is_not_declarable():
     """`inferred` is what the host writes when nobody declared anything. A surrogate
     claiming it would erase the one distinction these events exist to carry."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unknown declared reason"):
         declared_gap(
             origin="kitchen-surrogate",
             from_seq=1,
@@ -97,7 +105,7 @@ def test_the_inferred_reason_is_not_declarable():
 
 
 def test_an_inverted_seq_range_raises():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="inverted seq range"):
         inferred_gap(
             origin="android-01",
             from_seq=9,
@@ -109,7 +117,7 @@ def test_an_inverted_seq_range_raises():
 
 def test_a_seq_below_one_raises():
     """Seqs start at 1, so 0 in a range is a bug, not a boundary."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="from_seq must be 1 or greater"):
         inferred_gap(
             origin="android-01",
             from_seq=0,
@@ -120,7 +128,7 @@ def test_a_seq_below_one_raises():
 
 
 def test_an_inverted_span_raises():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="inverted span"):
         inferred_gap(
             origin="android-01",
             from_seq=1,
@@ -250,6 +258,168 @@ def test_content_is_json_native():
         reason="storage_pressure",
         span_start=SPAN_START,
         span_end=SPAN_END,
+    )
+
+    assert json.loads(json.dumps(content)) == content
+
+
+def test_the_wire_vocabulary_is_fixed():
+    """These four constants are the module's entire compatibility surface with a future
+    non-Python surrogate. Every other test uses them as symbols, so a rename would stay
+    green everywhere except here — which is the point."""
+    assert GAP == "stimulus.gap"
+    assert BATCH_REJECTED == "replication.batch_rejected"
+    assert DECLARED_REASONS == ("link_down", "retry_exhausted", "storage_pressure")
+    assert INFERRED_REASON == "inferred"
+
+
+def test_a_naive_span_is_read_as_host_local():
+    """The locked-in decision: naive datetimes are host-local, exactly as
+    `StimulusEvent.to_json` already treats them. Pinned so a future "require tz-aware"
+    patch has to be a deliberate change to the contract rather than a silent one."""
+    naive_start = datetime(2026, 9, 4, 12, 0)
+    naive_end = datetime(2026, 9, 4, 12, 30)
+
+    content = inferred_gap(
+        origin="android-01",
+        from_seq=1,
+        to_seq=2,
+        span_start=naive_start,
+        span_end=naive_end,
+    )
+
+    assert content["span_start"] == naive_start.astimezone(timezone.utc).isoformat()
+    assert content["span_end"] == naive_end.astimezone(timezone.utc).isoformat()
+
+
+def test_a_span_mixing_naive_and_aware_is_normalised_before_it_is_compared():
+    """An ingress holding `datetime.now(timezone.utc)` beside a naive timestamp parsed from
+    a surrogate's payload is the realistic case. Comparing the two raw raises an opaque
+    TypeError naming neither field."""
+    naive_start = datetime(2026, 9, 4, 12, 0)
+    aware_end = naive_start.astimezone(timezone.utc) + timedelta(minutes=30)
+
+    content = inferred_gap(
+        origin="android-01",
+        from_seq=1,
+        to_seq=2,
+        span_start=naive_start,
+        span_end=aware_end,
+    )
+
+    assert content["span_end"] > content["span_start"]
+
+
+@pytest.mark.parametrize("status", [400, 404, 413, 499])
+def test_the_whole_4xx_range_is_accepted(status):
+    content = batch_rejected(
+        origin="kitchen-surrogate", from_seq=1, to_seq=2, status=status, reason="no"
+    )
+
+    assert content["status"] == status
+
+
+@pytest.mark.parametrize("status", [399, 500, 200, 302])
+def test_a_status_outside_4xx_raises(status):
+    with pytest.raises(ValueError, match="status must be 4xx"):
+        batch_rejected(
+            origin="kitchen-surrogate",
+            from_seq=1,
+            to_seq=2,
+            status=status,
+            reason="no",
+        )
+
+
+@pytest.mark.parametrize("reason", [None, 42, object(), "", "   "])
+def test_a_rejection_reason_that_is_not_real_text_raises(reason):
+    """Unvalidated, a non-string reason builds cleanly here and then explodes inside
+    `to_json` — a long way from the mistake. #33 copies a remote host's response body into
+    this field."""
+    with pytest.raises(ValueError, match="reason must be a non-empty string"):
+        batch_rejected(
+            origin="kitchen-surrogate",
+            from_seq=1,
+            to_seq=2,
+            status=400,
+            reason=reason,
+        )
+
+
+def test_an_over_long_rejection_reason_is_truncated_not_refused():
+    """A rejection that cannot be recorded because the host was verbose is a silence on the
+    tape, which is the failure this event type exists to prevent. So it is bounded, not
+    rejected."""
+    content = batch_rejected(
+        origin="kitchen-surrogate",
+        from_seq=1,
+        to_seq=2,
+        status=400,
+        reason="x" * (MAX_REASON_CHARS + 50),
+    )
+
+    assert content["reason"] == "x" * MAX_REASON_CHARS
+
+
+@pytest.mark.parametrize("seq", [True, False, 1.5, "3", None])
+def test_a_non_integer_seq_raises(seq):
+    """`bool` is an `int` in Python, so `from_seq=True` slips past a `< 1` guard and
+    serialises as `true` onto a wire field a non-Python surrogate parses as a number."""
+    with pytest.raises(ValueError, match="must be an integer"):
+        inferred_gap(
+            origin="android-01",
+            from_seq=seq,
+            to_seq=9,
+            span_start=SPAN_START,
+            span_end=SPAN_END,
+        )
+
+
+def test_a_non_integer_status_raises():
+    with pytest.raises(ValueError, match="status must be an integer"):
+        batch_rejected(
+            origin="kitchen-surrogate",
+            from_seq=1,
+            to_seq=2,
+            status=400.5,
+            reason="no",
+        )
+
+
+@pytest.mark.parametrize("origin", [None, 42, ["kitchen"], "", "   "])
+def test_an_origin_that_is_not_a_real_name_raises(origin):
+    with pytest.raises(ValueError, match="origin must be a non-empty name"):
+        inferred_gap(
+            origin=origin,
+            from_seq=1,
+            to_seq=2,
+            span_start=SPAN_START,
+            span_end=SPAN_END,
+        )
+
+
+def test_a_to_seq_below_one_names_to_seq():
+    """It is also an inverted range, but the fault is `to_seq`, and an error naming
+    `from_seq` sends the reader to the wrong argument."""
+    with pytest.raises(ValueError, match="to_seq must be 1 or greater"):
+        inferred_gap(
+            origin="android-01",
+            from_seq=1,
+            to_seq=0,
+            span_start=SPAN_START,
+            span_end=SPAN_END,
+        )
+
+
+def test_a_rejection_is_json_native():
+    """`declared_gap` has this covered; `batch_rejected` is the one carrying a remote
+    string, so it is the one that most needs it."""
+    content = batch_rejected(
+        origin="kitchen-surrogate",
+        from_seq=1,
+        to_seq=2,
+        status=400,
+        reason="malformed line 3",
     )
 
     assert json.loads(json.dumps(content)) == content
