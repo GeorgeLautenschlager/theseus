@@ -1,6 +1,15 @@
 # Replication Schemas, Read-Time Ordering and High-Water Marks
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use steward:steward-local-sdd to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+> **⚠️ The task sections below are the plan as written *before* implementation, and the source
+> they embed is superseded.** Five review rounds changed both new modules: `replication_events.py`
+> gained `_check_origin` / `_check_range` / `_utc_span` / `_clean_reason`, a `MAX_REASON_CHARS`
+> bound, a `DeclaredReason` literal and per-field type checks; `high_water.py` gained a
+> `threading.Lock` and a `_committed_seq` guard on recovery. **The shipped modules are the source
+> of truth** — read them, not this. The sections are kept unedited so the gap between intent and
+> outcome stays legible, and every change is recorded with its reasoning in
+> `.steward/runs/27-28-29/runlog.md`.
 
 **Goal:** Land the three issues that depend only on #26 — the gap/rejection event vocabulary (#27), the Assembler's read-time chronological ordering (#28), and the host's per-origin high-water marks (#29).
 
@@ -910,18 +919,72 @@ git commit -m "Add per-origin high-water marks derived from the log"
 ## Acceptance
 
 **#27**
-- [ ] Constructors for declared gap, inferred gap, and batch rejection — Task 1
-- [ ] Invalid reason or inverted seq range raises rather than serialising — Task 1
-- [ ] Round-trips through `StimulusEvent.to_json` / `from_json` — Task 1
+- [x] Constructors for declared gap, inferred gap, and batch rejection — Task 1
+- [x] Invalid reason or inverted seq range raises rather than serialising — Task 1
+- [x] Round-trips through `StimulusEvent.to_json` / `from_json` — Task 1
 
 **#28**
-- [ ] A batch arriving late with old `event_ts` interleaves correctly in the window, with the log file itself unchanged — Task 2
-- [ ] Events with identical `event_ts` come out in a stable, deterministic order — Task 2
-- [ ] Existing `tests/test_context_assembler.py` stays green — budget maths untouched — Task 2
-- [ ] Window with no `event_ts` skew is byte-identical to today's output — Task 2
+- [x] A batch arriving late with old `event_ts` interleaves correctly in the window, with the log file itself unchanged — Task 2
+- [x] Events with identical `event_ts` come out in a stable, deterministic order — Task 2
+- [x] Existing `tests/test_context_assembler.py` stays green — budget maths untouched — Task 2
+- [x] Window with no `event_ts` skew is byte-identical to today's output — Task 2
 
 **#29**
-- [ ] Correct marks recovered from a log containing several origins interleaved — Task 3
-- [ ] An origin never seen returns `None` (distinct from seq 0) — Task 3
-- [ ] Restart mid-stream recovers the same marks it had before — Task 3
-- [ ] Locally-produced host events don't pollute a surrogate's mark — Task 3
+- [x] Correct marks recovered from a log containing several origins interleaved — Task 3
+- [x] An origin never seen returns `None` (distinct from seq 0) — Task 3
+- [x] Restart mid-stream recovers the same marks it had before — Task 3
+- [x] Locally-produced host events don't pollute a surrogate's mark — Task 3
+
+---
+
+## Decisions escalated to the repo owner
+
+Two questions surfaced in review that are protocol calls rather than implementation ones. Both are
+**pinned by a test rather than fixed**, so changing the answer later shows up as a failing test
+rather than a silent shift.
+
+### 1. What the budget should drop when producers are skewed (#28)
+
+`_fit_to_budget` drops the earliest-*arrived* while emitting by `event_ts`. Once a surrogate is
+attached, a backfill can survive a cut that removes events which happened *after* it, leaving a
+hole in the middle of a window that reads as continuous — the same invisible-hole failure #27's
+gap markers exist to prevent, manufactured by the assembler.
+
+Dropping by chronology instead removes the class entirely, at the cost of discarding a
+just-delivered backlog first under budget pressure. That is a real trade, not an oversight, and
+#28's text explicitly scopes budget behaviour out ("keep the budget behaviour exactly as it is —
+only the output ordering changes").
+
+`tests/test_context_assembler.py::test_a_truncated_window_can_have_a_hole_in_its_chronology` is the
+reproduction case: four events, both policies' output named side by side in the comment. It fails
+if the drop order changes.
+
+### 2. What `link_down` describes (#27)
+
+The spec's own example — "I wasn't observing from 16:02 to 16:40, the link was down" — reads as an
+*observation* outage, in which no seqs were ever allocated and there is therefore no range to
+report. But `declared_gap` requires a range, and the spec assigns buffered-then-dropped to
+`retry_exhausted` and eviction to `storage_pressure`.
+
+Read as: **a range that was buffered and then given up on.** The link being down never stops a
+surrogate observing or allocating seqs, so a `link_down` gap always has a range. Chosen because
+making a required field optional later is backward-compatible while the reverse is not — the more
+reversible default under genuine ambiguity.
+
+**If `link_down` was meant to describe an observation outage with no seqs, that is a different
+schema and it should change before #32**, which is the first issue that emits one.
+
+## Follow-ups this branch created
+
+| Item | Where it belongs |
+|---|---|
+| Read-side validation of gap/rejection content arriving over the wire — must re-apply `replication_events`' rules rather than invent a second definition | #30 |
+| `floor(origin) -> int` on `HighWaterMarks`, so the three dedupe branches compare without an `is None` at each site | #30 |
+| A convention for what first contact above seq 1 means — gap needing an inferred marker, or a surrogate's first contact. Either answer writes a permanent event to the tape | #30 |
+| `span_start` for a host-minted inferred gap: it is the `ts` of the last event previously committed from that origin, which neither `HighWaterMarks` nor the log index provides today | #30 |
+| Origin canonicalisation at the door — case and whitespace currently fork a mark | #30 |
+| Whether `advance` should be bound to the log (via `subscribe`, or a `commit(log, events)`) rather than to caller discipline | #30's design |
+| Pacing a backfill drain, or capping any one origin's share of a context window | #30 |
+| Streaming `iter_events()` on `StimulusLog` to replace `read_all()`. Measured at a million events: 63s and 1.4 GB. Note `ContextAssembler` calls `read_all()` every cognitive turn, so it bites there first. A reverse scan is **unsound** — `test_marks_are_recovered_from_several_origins_interleaved` proves it | its own issue |
+| Naive-datetime handling codebase-wide. Contained at the parse boundary now; `StimulusEvent(ts=<naive>)` in memory is still naive | its own issue |
+| `pytest-timeout`, so a hang-shaped regression fails red instead of stalling CI | its own issue |
