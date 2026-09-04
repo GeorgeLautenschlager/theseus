@@ -406,10 +406,56 @@ def test_an_empty_origin_is_rejected(tmp_path):
 
 
 def test_a_replicated_seq_below_one_is_rejected(tmp_path):
-    """0 is reserved to mean 'nothing seen yet' for a reader's high-water mark."""
+    """Starting at 1 keeps 0 below every real seq, so a reader tracking what it has
+    accepted has a safe comparison floor. ("Nothing seen yet" is its own answer, distinct
+    from 0 — see `HighWaterMarks.high_water`.)"""
     log = make_log(tmp_path)
 
     with pytest.raises(ValueError):
         log.append(
             actor="user", type="chat_message", content={}, origin="android-01", seq=0
         )
+
+
+def test_a_locally_minted_ts_is_issued_in_lock_order(tmp_path):
+    """`ts` is minted under the append lock, so arrival order and chronology agree for a
+    single producer. Minted before the lock, a thread that blocked on another's fsync
+    would land after an event carrying a later clock — an inversion with no surrogate
+    anywhere in sight."""
+    log = make_log(tmp_path)
+    barrier = threading.Barrier(8)
+
+    def appender() -> None:
+        barrier.wait()
+        for _ in range(40):
+            log.append(actor="user", type="chat_message", content={})
+
+    threads = [threading.Thread(target=appender) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    events = sorted(log.read_all(), key=lambda e: e.seq)
+    assert [e.ts for e in events] == sorted(e.ts for e in events)
+
+
+def test_a_naive_timestamp_from_a_foreign_line_is_read_as_aware(tmp_path):
+    """A line this log wrote always carries an offset. One from somewhere else need not,
+    and a naive datetime mixed with an aware one raises inside any sort — which since #28
+    means every context assembly, and so the whole cognitive loop."""
+    path = tmp_path / "stimulus_log.jsonl"
+    path.write_text(
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00",'
+        '"actor":"peer","type":"observation","content":{},'
+        '"origin":"android-01","seq":1}\n',
+        encoding="utf-8",
+    )
+    log = StimulusLog(path=path)
+
+    (event,) = log.read_all()
+
+    assert event.ts.tzinfo is not None
+    assert event.appended_ts.tzinfo is not None
+    # And the pair a sort would compare is now comparable.
+    assert event.ts <= datetime.now(timezone.utc)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from datetime import datetime, timedelta, timezone
 
 from theseus.context_assembler import (
     DEFAULT_CHARS_PER_TOKEN,
@@ -364,3 +365,128 @@ class TestOversizedEventClamp:
 
         assert json.loads(line)["type"] == "decision"
         assert len(line) < 30_000
+
+
+class TestChronologicalOrdering:
+    """The spec's load-bearing decision: the host appends a replicated batch in *arrival*
+    order and never interleaves it into history. Chronology is a read-time concern, and
+    this is where it is paid for."""
+
+    def test_a_late_batch_interleaves_in_the_window_but_not_in_the_log(self, tmp_path):
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        base = datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc)
+        log.append(actor="george", type="exchange", content={"message": "first"},
+                   ts=base)
+        log.append(actor="george", type="exchange", content={"message": "third"},
+                   ts=base + timedelta(minutes=40))
+        # A surrogate comes back online and ships an hour-old observation.
+        log.append(
+            actor="kitchen", type="observation", content={"message": "second"},
+            ts=base + timedelta(minutes=20), origin="kitchen-surrogate", seq=1,
+        )
+
+        assembled = ContextAssembler(stimulus_log=log, window_size=50).assemble_context()
+
+        window = [json.loads(line)["content"]["message"]
+                  for line in assembled.recent_events.splitlines()]
+        assert window == ["first", "second", "third"]
+        # The log itself is untouched: append-only, arrival-ordered.
+        assert [e.content["message"] for e in log.read_all()] == [
+            "first", "third", "second"
+        ]
+
+    def test_identical_event_ts_comes_out_in_a_stable_deterministic_order(self, tmp_path):
+        """Two surrogates stamping the same millisecond must not swap places between two
+        assemblies of the same window."""
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        same = datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc)
+        for i in range(5):
+            log.append(actor="george", type="exchange", content={"message": f"msg {i}"},
+                       ts=same)
+
+        assembler = ContextAssembler(stimulus_log=log, window_size=50)
+        first = assembler.assemble_context().recent_events
+        second = assembler.assemble_context().recent_events
+
+        assert first == second
+        messages = [json.loads(line)["content"]["message"]
+                    for line in first.splitlines()]
+        assert messages == [f"msg {i}" for i in range(5)]
+
+    def test_a_window_with_no_skew_is_unchanged(self, tmp_path):
+        """The common case — one producer, arrival order already chronological — must
+        come out byte-identical to what it was before ordering existed."""
+        log = fill_log(tmp_path, 5)
+
+        assembled = ContextAssembler(stimulus_log=log, window_size=50).assemble_context()
+
+        assert assembled.recent_events == "\n".join(
+            e.to_json() for e in log.read_all()
+        )
+
+    def test_the_unbudgeted_path_is_ordered_too(self, tmp_path):
+        """`token_budget=None` with no declared context skips `_fit_to_budget` entirely —
+        it needs the same ordering, or the guarantee depends on which budget is in force."""
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        base = datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc)
+        log.append(actor="george", type="exchange", content={"message": "later"},
+                   ts=base + timedelta(minutes=40))
+        log.append(actor="george", type="exchange", content={"message": "earlier"},
+                   ts=base)
+
+        assembled = ContextAssembler(
+            stimulus_log=log, window_size=50, token_budget=None
+        ).assemble_context()
+
+        messages = [json.loads(line)["content"]["message"]
+                    for line in assembled.recent_events.splitlines()]
+        assert messages == ["earlier", "later"]
+
+    def test_selection_is_still_by_arrival_so_the_newest_events_are_kept(self, tmp_path):
+        """Ordering the output must not turn into ordering the *selection*: `window_size`
+        means the most recently arrived events, which is what keeps selection cheap on a
+        long log."""
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        base = datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc)
+        for i in range(5):
+            log.append(actor="george", type="exchange", content={"message": f"old {i}"},
+                       ts=base + timedelta(minutes=i))
+        # Arrives last, but is the oldest thing in the window by its own clock.
+        log.append(actor="kitchen", type="observation", content={"message": "backfill"},
+                   ts=base - timedelta(hours=1), origin="kitchen-surrogate", seq=1)
+
+        assembled = ContextAssembler(stimulus_log=log, window_size=2).assemble_context()
+
+        messages = [json.loads(line)["content"]["message"]
+                    for line in assembled.recent_events.splitlines()]
+        assert messages == ["backfill", "old 4"]
+
+    def test_a_truncated_window_can_have_a_hole_in_its_chronology(self, tmp_path):
+        """Pinning a known consequence rather than endorsing it: the budget drops the
+        earliest-*arrived* while emission is by `event_ts`, so a cut is not necessarily a
+        clean chronological suffix. Change the drop order and this test should be the
+        thing that tells you the behaviour moved."""
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        base = datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc)
+        for i in range(5):
+            log.append(actor="george", type="exchange",
+                       content={"message": f"local {i}"}, ts=base + timedelta(minutes=i))
+        log.append(actor="kitchen", type="observation",
+                   content={"message": "backfill"},
+                   ts=base - timedelta(hours=1),
+                   origin="kitchen-surrogate", seq=1)
+
+        per_event = event_tokens(log)
+        assembled = ContextAssembler(
+            stimulus_log=log, window_size=50, token_budget=per_event * 4
+        ).assemble_context()
+
+        messages = [json.loads(line)["content"]["message"]
+                    for line in assembled.recent_events.splitlines()]
+        # The backfill arrived last so the budget keeps it, and it happened an hour before
+        # everything else — so `local 0` and `local 1`, dropped for arriving earliest, sit
+        # chronologically *between* the backfill and `local 2`. The window reads as
+        # continuous and is not. Under a drop-by-chronology policy this would instead be
+        # ["local 1", "local 2", "local 3", "local 4"], which is why the whole list is
+        # asserted rather than its first element.
+        assert messages == ["backfill", "local 2", "local 3", "local 4"]

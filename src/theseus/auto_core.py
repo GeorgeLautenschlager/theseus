@@ -349,8 +349,11 @@ class Autocore:
             cause = f"it was triggered by {source}"
         return (
             f" That gap does not apply to this turn: {cause}. Something outside you"
-            f" wants attention now, so read the end of <stimulus_log> first and deal"
-            f" with it before returning to self-directed work."
+            f" wants attention now, so find it in <stimulus_log> and deal with it"
+            f" before returning to self-directed work. It is not necessarily the last"
+            f" line: what you are shown is ordered by when things happened, and something"
+            f" reached you late — a surrogate replicating a backlog, say — sits at its"
+            f" own place in that order rather than at the end."
         )
 
     def _current_goals_and_tasks(self) -> str:

@@ -58,6 +58,19 @@ def new_id(ms: int | None = None) -> str:
 DEFAULT_ORIGIN = "local"
 
 
+def _aware(value: datetime) -> datetime:
+    """A parsed timestamp, guaranteed comparable.
+
+    A line this log wrote always carries an offset — `to_json` normalises to UTC. A line
+    from somewhere else need not, and a naive one mixed with an aware one raises
+    `TypeError` inside any sort, which since #28 means every context assembly and so the
+    whole cognitive loop. Attaching the host's zone is the same reading `to_json` already
+    gives a naive datetime on the way out, applied here so nothing downstream can meet a
+    mixed pair.
+    """
+    return value.astimezone() if value.tzinfo is None else value
+
+
 # --- Event ----------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class StimulusEvent:
@@ -128,7 +141,7 @@ class StimulusEvent:
         them. It does mean `origin=""` is the one value that does not survive a round-trip.
         """
         d = json.loads(line)
-        ts = datetime.fromisoformat(d["ts"])
+        ts = _aware(datetime.fromisoformat(d["ts"]))
         appended_ts = d.get("appended_ts")
         return cls(
             id=d["id"],
@@ -138,7 +151,7 @@ class StimulusEvent:
             content=d["content"],
             origin=d.get("origin") or default_origin,
             seq=d.get("seq"),
-            appended_ts=datetime.fromisoformat(appended_ts) if appended_ts else ts,
+            appended_ts=_aware(datetime.fromisoformat(appended_ts)) if appended_ts else ts,
         )
 
 
@@ -218,8 +231,10 @@ class StimulusLog:
 
         The log is the only durable state, so the counter is derived from it rather than
         kept in a sidecar: a sidecar that disagreed with the file after a crash would
-        either skip real events or issue the same seq twice. Seqs start at 1, which
-        leaves 0 free to mean "nothing seen yet" for a reader's high-water mark.
+        either skip real events or issue the same seq twice. Seqs start at 1, so 0 is
+        always below every real seq and is a safe comparison floor for a reader tracking
+        what it has accepted. ("Nothing seen yet" is its own answer, distinct from 0 —
+        see `HighWaterMarks.high_water`.)
         """
         highest = 0
         for event in self.read_all():
@@ -254,7 +269,6 @@ class StimulusLog:
         `appended_ts`, so the same event has a different id on the producer and on this log.
         Identity across nodes is `(origin, seq)`, never `id`.
         """
-        ts = ts or datetime.now(timezone.utc)
         origin = self.origin if origin is None else origin
         if not origin:
             raise ValueError("origin must be a non-empty name")
@@ -273,8 +287,9 @@ class StimulusLog:
             )
         elif seq < 1:
             raise ValueError(
-                f"seq must be 1 or greater (got {seq!r}); 0 is reserved to mean "
-                f"'nothing seen yet' for a reader's high-water mark"
+                f"seq must be 1 or greater (got {seq!r}); starting at 1 keeps 0 below "
+                f"every real seq, as a safe comparison floor for a reader tracking what "
+                f"it has accepted"
             )
 
         with self._append_lock:
@@ -284,6 +299,11 @@ class StimulusLog:
                 seq = self._next_seq
                 self._next_seq = seq + 1
 
+            # Minted under the lock, not before it: a thread that stamped `ts` and then
+            # blocked on another thread's fsync would otherwise land after an event with a
+            # later clock, inverting arrival against chronology in a plain single-producer
+            # log. A caller-supplied `ts` is the producer's own and is left alone.
+            ts = ts or datetime.now(timezone.utc)
             appended_ts = datetime.now(timezone.utc)
             event = StimulusEvent(
                 id=new_id(int(appended_ts.timestamp() * 1000)),

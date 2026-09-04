@@ -116,12 +116,43 @@ eviction or abandonment happens with the range in hand. Whenever it skips forwar
 
 This preserves a distinction worth keeping:
 
-- **Declared gap** (marker present): normal operation. "I wasn't observing from 16:02 to 16:40,
-  the link was down." The agent can reason about it.
+- **Declared gap** (marker present): normal operation. "You weren't hearing from me between 16:02
+  and 16:40, the link was down." The agent can reason about it.
 - **Inferred gap** (host sees a `seq` jump with no marker): the surrogate died mid-buffer, or
   something is genuinely broken. Host logs it as such.
 
 Same hole, different diagnosis. Neither is rejected.
+
+A `link_down` gap still carries a range. The link being down never stops a surrogate observing or
+allocating `seq`, so the hole it declares is a range it buffered and then gave up on — not an
+interval in which nothing was seen.
+
+#### `stimulus.gap` content
+
+| Field | Type | Notes |
+|---|---|---|
+| `origin` | string | Whose stream has the hole. |
+| `from_seq` | integer ≥ 1 | First abandoned `seq`, **inclusive**. |
+| `to_seq` | integer ≥ 1 | Last abandoned `seq`, **inclusive**. A one-event hole has `from_seq == to_seq`. |
+| `reason` | string | `link_down` \| `retry_exhausted` \| `storage_pressure` when declared; `inferred` when host-minted. Authoritative. |
+| `span_start` | ISO-8601 UTC string | Start of the wall-clock span the hole covers. |
+| `span_end` | ISO-8601 UTC string | End of that span. Never before `span_start`. |
+| `declared` | boolean | `true` from the surrogate, `false` when the host minted it. Derived from `reason` and never disagrees with it; a reader that finds them disagreeing should believe `reason`. |
+
+#### `replication.batch_rejected` content
+
+| Field | Type | Notes |
+|---|---|---|
+| `origin` | string | Whose batch was rejected. |
+| `from_seq`, `to_seq` | integer ≥ 1 | The rejected range, **inclusive**. |
+| `status` | integer, `400`–`499` | The host's status. A `5xx` is retried, not rejected, so it is never valid here. |
+| `reason` | string | What the host said, bounded in length — it is a remote party's words going onto a permanent tape. |
+
+Both are ordinary `StimulusEvent`s: these fields are the event's `content`, and the table above
+is the wire contract a non-Python surrogate must satisfy. Timestamps are strings because
+`content` is JSON. The reference constructors and their validation live in
+`src/theseus/replication_events.py`; that validation is **write-side only**, so a host accepting
+these over the wire must re-apply the same rules at its ingress.
 
 ## Upstream: stimulus replication
 
