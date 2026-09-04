@@ -58,6 +58,19 @@ def new_id(ms: int | None = None) -> str:
 DEFAULT_ORIGIN = "local"
 
 
+def _aware(value: datetime) -> datetime:
+    """A parsed timestamp, guaranteed comparable.
+
+    A line this log wrote always carries an offset — `to_json` normalises to UTC. A line
+    from somewhere else need not, and a naive one mixed with an aware one raises
+    `TypeError` inside any sort, which since #28 means every context assembly and so the
+    whole cognitive loop. Attaching the host's zone is the same reading `to_json` already
+    gives a naive datetime on the way out, applied here so nothing downstream can meet a
+    mixed pair.
+    """
+    return value.astimezone() if value.tzinfo is None else value
+
+
 # --- Event ----------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class StimulusEvent:
@@ -128,7 +141,7 @@ class StimulusEvent:
         them. It does mean `origin=""` is the one value that does not survive a round-trip.
         """
         d = json.loads(line)
-        ts = datetime.fromisoformat(d["ts"])
+        ts = _aware(datetime.fromisoformat(d["ts"]))
         appended_ts = d.get("appended_ts")
         return cls(
             id=d["id"],
@@ -138,7 +151,7 @@ class StimulusEvent:
             content=d["content"],
             origin=d.get("origin") or default_origin,
             seq=d.get("seq"),
-            appended_ts=datetime.fromisoformat(appended_ts) if appended_ts else ts,
+            appended_ts=_aware(datetime.fromisoformat(appended_ts)) if appended_ts else ts,
         )
 
 
@@ -254,7 +267,6 @@ class StimulusLog:
         `appended_ts`, so the same event has a different id on the producer and on this log.
         Identity across nodes is `(origin, seq)`, never `id`.
         """
-        ts = ts or datetime.now(timezone.utc)
         origin = self.origin if origin is None else origin
         if not origin:
             raise ValueError("origin must be a non-empty name")
@@ -284,6 +296,11 @@ class StimulusLog:
                 seq = self._next_seq
                 self._next_seq = seq + 1
 
+            # Minted under the lock, not before it: a thread that stamped `ts` and then
+            # blocked on another thread's fsync would otherwise land after an event with a
+            # later clock, inverting arrival against chronology in a plain single-producer
+            # log. A caller-supplied `ts` is the producer's own and is left alone.
+            ts = ts or datetime.now(timezone.utc)
             appended_ts = datetime.now(timezone.utc)
             event = StimulusEvent(
                 id=new_id(int(appended_ts.timestamp() * 1000)),

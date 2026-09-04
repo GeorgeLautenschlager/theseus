@@ -87,6 +87,15 @@ class ContextAssembler:
     unit — fifty events is a couple of thousand tokens of chat, or a hundred thousand
     tokens if one of them is a `read` result carrying a whole file.
 
+    `window_size` caps *arrivals*, not wall-clock span, and since #28 the two can come
+    apart. A surrogate returning from an outage drains its backlog in back-to-back
+    batches, so a large enough drain can occupy the whole window for a turn or more —
+    handing the model an hour of stale observation, in clean chronological order, with no
+    recent local context beside it and nothing marking it as old. The events it displaces
+    do not come back, because the next assembly takes the tail and the tail has moved
+    past them. Pacing that drain, or capping any one origin's share of a window, belongs
+    at the ingress rather than here.
+
     ### Where the size comes from
 
     Sizing properly wants the model's context window, and that turns out not to be
@@ -222,6 +231,15 @@ class ContextAssembler:
         Selection is newest-first by *arrival* and emission is by `event_ts`; the two are
         deliberately different. Arrival is what "recent" means and what keeps selection
         cheap on a long log, but chronology is what the model has to read.
+
+        A consequence, once producers are skewed: what the budget drops is the
+        earliest-*arrived*, while what it emits is ordered by when things happened — so a
+        truncated window is not necessarily a clean chronological suffix. An event that
+        arrived early but happened late survives a cut that removes events which happened
+        before it, leaving a hole in the middle of a window that reads as continuous.
+        Dropping by chronology instead would remove the class entirely, at the cost of
+        discarding a just-delivered backlog first; that is a live question, deliberately
+        left to a follow-up because #28's scope is the emitted order alone.
         """
         max_event_chars = self._max_event_chars(budget)
         kept: list[tuple[StimulusEvent, str]] = []

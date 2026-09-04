@@ -460,3 +460,30 @@ class TestChronologicalOrdering:
         messages = [json.loads(line)["content"]["message"]
                     for line in assembled.recent_events.splitlines()]
         assert messages == ["backfill", "old 4"]
+
+    def test_a_truncated_window_can_have_a_hole_in_its_chronology(self, tmp_path):
+        """Pinning a known consequence rather than endorsing it: the budget drops the
+        earliest-*arrived* while emission is by `event_ts`, so a cut is not necessarily a
+        clean chronological suffix. Change the drop order and this test should be the
+        thing that tells you the behaviour moved."""
+        log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+        base = datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc)
+        for i in range(5):
+            log.append(actor="george", type="exchange",
+                       content={"message": f"local {i}"}, ts=base + timedelta(minutes=i))
+        log.append(actor="kitchen", type="observation",
+                   content={"message": "backfill"},
+                   ts=base + timedelta(minutes=1, seconds=30),
+                   origin="kitchen-surrogate", seq=1)
+
+        per_event = event_tokens(log)
+        assembled = ContextAssembler(
+            stimulus_log=log, window_size=50, token_budget=per_event * 4
+        ).assemble_context()
+
+        messages = [json.loads(line)["content"]["message"]
+                    for line in assembled.recent_events.splitlines()]
+        # The backfill arrived last so the budget keeps it, and it happened at 16:01:30 —
+        # so it is emitted before events that were dropped for arriving earlier.
+        assert messages[0] == "backfill"
+        assert "local 0" not in messages
