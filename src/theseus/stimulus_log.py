@@ -156,6 +156,12 @@ class StimulusLog:
     A log has an `origin` — the name of the place its own events enter the system. It
     allocates a monotonic `seq` per origin, recovered from the file on first append, and
     accepts replicated events that carry the origin and seq their producer assigned.
+
+    That allocator is per-instance and in-memory, so **exactly one writer per (file,
+    origin)** is a hard requirement. Two `StimulusLog` objects appending to one file under
+    the same origin — in one process or two — each recover the counter once and then drift
+    apart permanently, issuing the same seq twice. Concurrent *readers* are fine, and so is
+    a second writer under a genuinely different origin.
     """
 
     def __init__(
@@ -185,6 +191,12 @@ class StimulusLog:
         This is an in-process signal, not a file watch. A writer in another process
         appends to the same file without anyone here hearing about it; readers that
         must survive that keep polling `read_all`.
+
+        Notification order is not file order. Listeners are notified after the append lock
+        is released, so a listener that appends re-entrantly can have its own event
+        announced to later listeners before the one that triggered it. That is the price of
+        letting a listener append at all; a listener that needs true order should read the
+        file rather than trust the sequence of callbacks.
         """
         with self._listener_lock:
             self._listeners.append(listener)
@@ -226,16 +238,34 @@ class StimulusLog:
         here, and the id is minted from it, so id order stays arrival order however far a
         producer's clock has drifted.
 
-        A local append (`origin` omitted) gets the next seq for this log's own origin. A
-        replicated append carries the origin *and* the seq its producer already assigned;
-        this log cannot allocate one on a producer's behalf without colliding with it.
+        `origin` and `seq` are supplied together or not at all. Omit both for a local
+        append and this log allocates the next seq for its own origin. Supply both for a
+        replicated append, carrying the origin and seq the producer already assigned. A
+        log never allocates a seq on another producer's behalf, and never accepts one for
+        its own origin — either would put two numbering authorities on one origin name and
+        break the per-origin monotonicity that duplicate suppression depends on.
         """
         ts = ts or datetime.now(timezone.utc)
         origin = self.origin if origin is None else origin
-        if seq is None and origin != self.origin:
+        if not origin:
+            raise ValueError("origin must be a non-empty name")
+        if origin == self.origin:
+            if seq is not None:
+                raise ValueError(
+                    f"{origin!r} is this log's own origin and it allocates those seqs "
+                    f"itself. A replicated append must arrive under its producer's own "
+                    f"origin name — two producers sharing one name break the per-origin "
+                    f"monotonicity that duplicate suppression depends on."
+                )
+        elif seq is None:
             raise ValueError(
                 f"a replicated append (origin {origin!r}) must carry the seq its "
                 f"producer assigned"
+            )
+        elif seq < 1:
+            raise ValueError(
+                f"seq must be 1 or greater (got {seq!r}); 0 is reserved to mean "
+                f"'nothing seen yet' for a reader's high-water mark"
             )
 
         with self._append_lock:
@@ -244,10 +274,6 @@ class StimulusLog:
                     self._next_seq = self._recover_next_seq()
                 seq = self._next_seq
                 self._next_seq = seq + 1
-            elif origin == self.origin and self._next_seq is not None:
-                # Someone replayed one of our own events with an explicit seq; never
-                # hand that number out again.
-                self._next_seq = max(self._next_seq, seq + 1)
 
             appended_ts = datetime.now(timezone.utc)
             event = StimulusEvent(

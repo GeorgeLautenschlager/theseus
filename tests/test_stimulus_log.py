@@ -220,8 +220,10 @@ def test_the_log_stamps_its_own_origin_on_local_appends(tmp_path):
 
 def test_id_order_matches_append_order_when_event_ts_is_backdated(tmp_path):
     """A replicated event can carry a skewed or hours-old event_ts. The id is minted from
-    appended_ts so it never sorts into the middle of the log — read_range, the debug tail
-    cursor and most_recent_page all read id order as arrival order."""
+    appended_ts so it never sorts into the middle of the log. The consumer that actually
+    depends on this is `older_batch` in `theseus/web/debug_pagination.py`, which bisects a
+    list of ids and therefore requires it to be sorted ascending; `read_range` here and the
+    debug tail cursor read id order too."""
     log = make_log(tmp_path)
     backdated = datetime.now(timezone.utc) - timedelta(hours=1)
 
@@ -331,3 +333,53 @@ def test_concurrent_appends_never_reuse_a_seq(tmp_path):
         t.join()
 
     assert sorted(e.seq for e in events) == [1, 2, 3, 4, 5, 6, 7, 8]
+    # The returned objects alone would pass with a torn or short file; only reading it back
+    # proves the lock covered the write as well as the allocation.
+    assert sorted(e.seq for e in log.read_all()) == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_an_own_origin_append_may_not_carry_a_seq(tmp_path):
+    """Two numbering authorities on one origin name is exactly what breaks duplicate
+    suppression downstream — and since host and surrogate both default to the same origin
+    name, it is what an unconfigured deployment would otherwise produce silently."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append(
+            actor="user", type="chat_message", content={}, origin=DEFAULT_ORIGIN, seq=1
+        )
+
+
+def test_an_empty_origin_is_rejected(tmp_path):
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append(actor="user", type="chat_message", content={}, origin="", seq=1)
+
+
+def test_a_replicated_seq_below_one_is_rejected(tmp_path):
+    """0 is reserved to mean 'nothing seen yet' for a reader's high-water mark."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append(
+            actor="user", type="chat_message", content={}, origin="android-01", seq=0
+        )
+
+
+def test_a_listener_may_append_without_deadlocking(tmp_path):
+    """The append lock is released before listeners are notified, precisely so a listener
+    can append. This pins that boundary: move `_notify` inside the lock and this hangs."""
+    log = make_log(tmp_path)
+    echoed = []
+
+    def echo_once(event):
+        if event.type == "chat_message":
+            echoed.append(log.append(actor="tam", type="echo", content={}))
+
+    log.subscribe(echo_once)
+    log.append(actor="user", type="chat_message", content={})
+
+    assert [e.seq for e in log.read_all()] == [1, 2]
+    assert [e.type for e in log.read_all()] == ["chat_message", "echo"]
+    assert len(echoed) == 1
