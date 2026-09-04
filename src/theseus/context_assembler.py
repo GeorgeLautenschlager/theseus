@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any
 
 from theseus.stimulus_log import StimulusEvent, StimulusLog
@@ -56,6 +57,21 @@ class AssembledContext:
     recent_events: str   # tail of the stimulus log, one JSON event per line
     window_chars: int = 0
     budget_tokens: float | None = None  # what the window was fitted against, for debugging
+
+
+def _chronological(event: StimulusEvent) -> tuple[datetime, datetime, str]:
+    """Sort key for the emitted window: when the event *happened*, by its producer's clock.
+
+    The log is append-only and arrival-ordered — the host appends a replicated batch where
+    it lands and does not interleave it into history. Chronology is a read-time concern,
+    and this is the read. Without it, a surrogate that replicates an hour of backlog hands
+    the model stale observation *after* the things that happened since.
+
+    Ties break on arrival and then on id, so the order is total and deterministic: two
+    surrogates stamping the same millisecond must not swap places between two assemblies of
+    the same window.
+    """
+    return (event.ts, event.appended_ts, event.id)
 
 
 class ContextAssembler:
@@ -145,7 +161,7 @@ class ContextAssembler:
         budget = self._budget_tokens(overhead_chars)
 
         if budget is None:
-            lines = [event.to_json() for event in events]
+            lines = [event.to_json() for event in sorted(events, key=_chronological)]
         else:
             lines = self._fit_to_budget(events, budget)
 
@@ -194,16 +210,21 @@ class ContextAssembler:
         return usable - overhead
 
     def _fit_to_budget(self, events: list[StimulusEvent], budget: float) -> list[str]:
-        """Take events newest-first until the budget runs out, then restore log order.
+        """Take events newest-first until the budget runs out, then emit them in the order
+        they happened.
 
         Always returns at least one event. A window that overshoots the budget is
         recoverable — the backend truncates, or errors, and the next pass is calibrated —
         whereas an empty one asks the model to decide with no stimulus at all. The
         per-event clamp is what makes that guarantee affordable: without it the one event
         we promise to emit could itself be a whole file.
+
+        Selection is newest-first by *arrival* and emission is by `event_ts`; the two are
+        deliberately different. Arrival is what "recent" means and what keeps selection
+        cheap on a long log, but chronology is what the model has to read.
         """
         max_event_chars = self._max_event_chars(budget)
-        kept: list[str] = []
+        kept: list[tuple[StimulusEvent, str]] = []
         used = 0.0
 
         for event in reversed(events):
@@ -211,11 +232,11 @@ class ContextAssembler:
             cost = len(line) / self.chars_per_token
             if kept and used + cost > budget:
                 break
-            kept.append(line)
+            kept.append((event, line))
             used += cost
 
-        kept.reverse()
-        return kept
+        kept.sort(key=lambda pair: _chronological(pair[0]))
+        return [line for _, line in kept]
 
     def _max_event_chars(self, budget: float) -> int:
         tokens = max(budget * self.max_event_fraction, float(MIN_EVENT_TOKENS))
