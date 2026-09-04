@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
-from theseus.stimulus_log import DEFAULT_ORIGIN, StimulusEvent, StimulusLog
+import pytest
+
+from theseus.stimulus_log import DEFAULT_ORIGIN, StimulusEvent, StimulusLog, new_id
 
 
 def make_log(tmp_path) -> StimulusLog:
@@ -180,3 +183,151 @@ def test_envelope_fields_are_optional_so_existing_construction_sites_still_work(
 
     assert event.origin == DEFAULT_ORIGIN
     assert event.seq is None
+
+
+def test_local_appends_get_a_monotonic_seq_starting_at_one(tmp_path):
+    log = make_log(tmp_path)
+
+    events = [
+        log.append(actor="user", type="chat_message", content={"n": n}) for n in range(3)
+    ]
+
+    assert [e.seq for e in events] == [1, 2, 3]
+    assert {e.origin for e in events} == {DEFAULT_ORIGIN}
+
+
+def test_seq_is_monotonic_across_a_restart(tmp_path):
+    """The log file is the only durable state. A sidecar counter that disagreed with it
+    after a crash would either drop real events or issue the same seq twice."""
+    path = tmp_path / "stimulus_log.jsonl"
+    first = StimulusLog(path=path)
+    first.append(actor="user", type="chat_message", content={})
+    first.append(actor="user", type="chat_message", content={})
+
+    reopened = StimulusLog(path=path)
+    event = reopened.append(actor="user", type="chat_message", content={})
+
+    assert event.seq == 3
+
+
+def test_the_log_stamps_its_own_origin_on_local_appends(tmp_path):
+    log = StimulusLog(path=tmp_path / "stimulus_log.jsonl", origin="kitchen-surrogate")
+
+    event = log.append(actor="user", type="chat_message", content={})
+
+    assert event.origin == "kitchen-surrogate"
+
+
+def test_id_order_matches_append_order_when_event_ts_is_backdated(tmp_path):
+    """A replicated event can carry a skewed or hours-old event_ts. The id is minted from
+    appended_ts so it never sorts into the middle of the log — read_range, the debug tail
+    cursor and most_recent_page all read id order as arrival order."""
+    log = make_log(tmp_path)
+    backdated = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    old = log.append(actor="user", type="chat_message", content={"n": 1}, ts=backdated)
+    time.sleep(0.002)  # ULIDs are millisecond-resolution; keep the two ids distinguishable
+    new = log.append(actor="user", type="chat_message", content={"n": 2})
+
+    assert old.id < new.id
+    # Minted from arrival, not from the backdated event clock: an id minted an hour ago
+    # would sort below this one and land in the middle of the log.
+    assert old.id > new_id(int(backdated.timestamp() * 1000))
+    assert log.read_range(old.id, new.id) == [old, new]
+
+
+def test_appended_ts_is_minted_by_the_log_not_taken_from_the_caller(tmp_path):
+    log = make_log(tmp_path)
+    backdated = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    event = log.append(actor="user", type="chat_message", content={}, ts=backdated)
+
+    assert event.ts == backdated
+    assert event.appended_ts > event.ts
+
+
+def test_a_replicated_append_keeps_the_origin_and_seq_its_producer_assigned(tmp_path):
+    log = make_log(tmp_path)
+
+    event = log.append(
+        actor="user",
+        type="chat_message",
+        content={},
+        origin="kitchen-surrogate",
+        seq=41,
+    )
+
+    assert (event.origin, event.seq) == ("kitchen-surrogate", 41)
+    assert log.read_all() == [event]
+
+
+def test_a_replicated_append_must_carry_a_seq(tmp_path):
+    """This log can only allocate for its own origin — inventing a seq for someone else's
+    would collide with the one the producer already assigned."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append(
+            actor="user", type="chat_message", content={}, origin="kitchen-surrogate"
+        )
+
+
+def test_a_replicated_seq_does_not_disturb_the_local_counter(tmp_path):
+    log = make_log(tmp_path)
+    log.append(actor="user", type="chat_message", content={})
+    log.append(
+        actor="user", type="chat_message", content={}, origin="android-01", seq=900
+    )
+
+    event = log.append(actor="user", type="chat_message", content={})
+
+    assert event.seq == 2
+
+
+def test_seq_recovery_ignores_other_origins(tmp_path):
+    """Recovery counts only this log's own origin — a surrogate's seq 900 must not push
+    the host's own counter into the nine-hundreds."""
+    path = tmp_path / "stimulus_log.jsonl"
+    first = StimulusLog(path=path)
+    first.append(actor="user", type="chat_message", content={})
+    first.append(
+        actor="user", type="chat_message", content={}, origin="android-01", seq=900
+    )
+
+    event = StimulusLog(path=path).append(actor="user", type="chat_message", content={})
+
+    assert event.seq == 2
+
+
+def test_legacy_lines_read_back_with_the_logs_own_origin(tmp_path):
+    path = tmp_path / "stimulus_log.jsonl"
+    path.write_text(
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00+00:00",'
+        '"actor":"user","type":"chat_message","content":{}}\n',
+        encoding="utf-8",
+    )
+    log = StimulusLog(path=path, origin="kitchen-surrogate")
+
+    (event,) = log.read_all()
+
+    assert event.origin == "kitchen-surrogate"
+    assert event.seq is None
+    assert event.appended_ts == event.ts
+
+
+def test_concurrent_appends_never_reuse_a_seq(tmp_path):
+    log = make_log(tmp_path)
+    events: list[StimulusEvent] = []
+    barrier = threading.Barrier(8)
+
+    def appender() -> None:
+        barrier.wait()
+        events.append(log.append(actor="user", type="chat_message", content={}))
+
+    threads = [threading.Thread(target=appender) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(e.seq for e in events) == [1, 2, 3, 4, 5, 6, 7, 8]

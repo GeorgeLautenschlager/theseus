@@ -152,14 +152,23 @@ class StimulusLog:
 
     Listeners registered with `subscribe` are called with each appended event, on
     the appending thread, once the write is durable.
+
+    A log has an `origin` — the name of the place its own events enter the system. It
+    allocates a monotonic `seq` per origin, recovered from the file on first append, and
+    accepts replicated events that carry the origin and seq their producer assigned.
     """
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self, path: str | os.PathLike[str], origin: str = DEFAULT_ORIGIN
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
+        self.origin = origin
         self._listeners: list[Callable[[StimulusEvent], None]] = []
         self._listener_lock = threading.Lock()
+        self._append_lock = threading.Lock()
+        self._next_seq: int | None = None  # recovered from the log on first local append
 
     def subscribe(
         self, listener: Callable[[StimulusEvent], None]
@@ -187,20 +196,77 @@ class StimulusLog:
 
         return unsubscribe
 
+    def _recover_next_seq(self) -> int:
+        """The seq this log should issue next for its own origin, read back off the file.
+
+        The log is the only durable state, so the counter is derived from it rather than
+        kept in a sidecar: a sidecar that disagreed with the file after a crash would
+        either skip real events or issue the same seq twice. Seqs start at 1, which
+        leaves 0 free to mean "nothing seen yet" for a reader's high-water mark.
+        """
+        highest = 0
+        for event in self.read_all():
+            if event.origin == self.origin and event.seq is not None:
+                highest = max(highest, event.seq)
+        return highest + 1
+
     def append(
         self,
         actor: str,
         type: str,
         content: dict[str, Any],
         ts: datetime | None = None,
+        *,
+        origin: str | None = None,
+        seq: int | None = None,
     ) -> StimulusEvent:
+        """Append one event and notify listeners.
+
+        `ts` is the event's own clock — when it happened. `appended_ts` is always minted
+        here, and the id is minted from it, so id order stays arrival order however far a
+        producer's clock has drifted.
+
+        A local append (`origin` omitted) gets the next seq for this log's own origin. A
+        replicated append carries the origin *and* the seq its producer already assigned;
+        this log cannot allocate one on a producer's behalf without colliding with it.
+        """
         ts = ts or datetime.now(timezone.utc)
-        event = StimulusEvent(id=new_id(int(ts.timestamp() * 1000)),
-                              ts=ts, actor=actor, type=type, content=content)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(event.to_json() + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        origin = self.origin if origin is None else origin
+        if seq is None and origin != self.origin:
+            raise ValueError(
+                f"a replicated append (origin {origin!r}) must carry the seq its "
+                f"producer assigned"
+            )
+
+        with self._append_lock:
+            if seq is None:
+                if self._next_seq is None:
+                    self._next_seq = self._recover_next_seq()
+                seq = self._next_seq
+                self._next_seq = seq + 1
+            elif origin == self.origin and self._next_seq is not None:
+                # Someone replayed one of our own events with an explicit seq; never
+                # hand that number out again.
+                self._next_seq = max(self._next_seq, seq + 1)
+
+            appended_ts = datetime.now(timezone.utc)
+            event = StimulusEvent(
+                id=new_id(int(appended_ts.timestamp() * 1000)),
+                ts=ts,
+                actor=actor,
+                type=type,
+                content=content,
+                origin=origin,
+                seq=seq,
+                appended_ts=appended_ts,
+            )
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(event.to_json() + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+        # Outside the lock: a listener is free to append, and holding the lock across a
+        # callback would deadlock it.
         self._notify(event)
         return event
 
@@ -226,7 +292,9 @@ class StimulusLog:
             if not stripped:
                 continue
             try:
-                events.append(StimulusEvent.from_json(stripped))
+                events.append(
+                    StimulusEvent.from_json(stripped, default_origin=self.origin)
+                )
             except (json.JSONDecodeError, KeyError) as exc:
                 is_last = i == len(lines) - 1
                 if is_last and not line.endswith("\n"):
