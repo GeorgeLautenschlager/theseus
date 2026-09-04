@@ -71,6 +71,10 @@ class StimulusEvent:
     `appended_ts` is authoritative for *log order*, `ts` for *meaning*. The gap between
     them is observable clock skew — a surrogate drifting 900ms shows up in the trace
     instead of silently scrambling the agent's sense of before-and-after.
+
+    `appended_ts` is `None` only as a constructor sentinel meaning "derive it from `ts`". On a
+    constructed instance it is always a `datetime`, so downstream ordering code needs no
+    defensive `or event.ts`.
     """
 
     id: str
@@ -85,6 +89,10 @@ class StimulusEvent:
     def __post_init__(self) -> None:
         # An event that no log has appended yet still needs an arrival timestamp, so
         # ordering code never has to special-case None.
+        #
+        # Deriving it only when it is None also means `dataclasses.replace(event, ts=...)`
+        # leaves `appended_ts` where it was — correcting an event's own clock must not move
+        # the moment it arrived.
         if self.appended_ts is None:
             object.__setattr__(self, "appended_ts", self.ts)
 
@@ -111,7 +119,13 @@ class StimulusEvent:
         """Parse one log line. Lines written before the envelope existed are still valid:
         `origin` falls back to `default_origin` (the reading log's own origin), `seq` to
         None, and `appended_ts` to `ts`. Old lines stay readable in place — there is no
-        migration."""
+        migration.
+
+        An `origin` that is present but empty is treated as absent and coerced to
+        `default_origin` too: an empty origin name is a misconfiguration, and filing those
+        events under the reading log's own origin is the least surprising thing to do with
+        them. It does mean `origin=""` is the one value that does not survive a round-trip.
+        """
         d = json.loads(line)
         ts = datetime.fromisoformat(d["ts"])
         appended_ts = d.get("appended_ts")

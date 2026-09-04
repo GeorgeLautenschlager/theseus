@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from datetime import datetime, timezone
 
@@ -111,6 +112,33 @@ def test_to_json_round_trips_every_envelope_field():
     assert StimulusEvent.from_json(event.to_json()) == event
 
 
+def test_to_json_writes_the_wire_format_key_names():
+    """The round-trip test above is symmetric — renaming a key in both directions keeps it
+    green. These bytes are a cross-process contract, so the names themselves are pinned here."""
+    event = _event(
+        origin="kitchen-surrogate",
+        seq=7,
+        appended_ts=datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc),
+    )
+
+    wire = json.loads(event.to_json())
+
+    assert set(wire) == {
+        "id",
+        "ts",
+        "actor",
+        "type",
+        "content",
+        "origin",
+        "seq",
+        "appended_ts",
+    }
+    assert wire["origin"] == "kitchen-surrogate"
+    assert wire["seq"] == 7
+    assert wire["ts"] == "2026-01-01T12:00:00+00:00"
+    assert wire["appended_ts"] == "2026-01-01T13:30:00+00:00"
+
+
 def test_a_pre_change_log_line_parses_with_the_documented_defaults():
     """Every line written before this change lacks the envelope. They stay readable in
     place — no migration script — so the defaults are part of the contract."""
@@ -144,6 +172,10 @@ def test_appended_ts_defaults_to_event_ts_when_not_supplied():
 
 
 def test_envelope_fields_are_optional_so_existing_construction_sites_still_work():
+    """The subject here is the construction call itself: `_event()` passes only the five
+    original keyword arguments, which is exactly how `tests/test_debug_pagination.py` and
+    `tests/test_debug_row_rendering.py` build events. If the envelope fields ever lose their
+    defaults, this stops constructing before it reaches an assertion."""
     event = _event()
 
     assert event.origin == DEFAULT_ORIGIN
