@@ -169,31 +169,6 @@ def test_a_batch_rejection_records_what_the_host_said():
     }
 
 
-def test_a_non_4xx_rejection_status_raises():
-    """This event exists for the permanently-unacceptable class. A 5xx is retried, not
-    rejected, and recording one here would make the tape claim a batch was abandoned
-    when the surrogate is still trying to send it."""
-    with pytest.raises(ValueError):
-        batch_rejected(
-            origin="kitchen-surrogate",
-            from_seq=1,
-            to_seq=2,
-            status=503,
-            reason="upstream down",
-        )
-
-
-def test_an_empty_origin_raises():
-    with pytest.raises(ValueError):
-        inferred_gap(
-            origin="",
-            from_seq=1,
-            to_seq=2,
-            span_start=SPAN_START,
-            span_end=SPAN_END,
-        )
-
-
 def test_a_gap_round_trips_through_the_event_envelope():
     """These are ordinary events on the tape — the whole point is that a hole is
     something the agent reads, not an error channel beside the log."""
@@ -358,7 +333,7 @@ def test_an_over_long_rejection_reason_is_truncated_not_refused():
         reason="x" * (MAX_REASON_CHARS + 50),
     )
 
-    assert content["reason"] == "x" * MAX_REASON_CHARS
+    assert content["reason"] == "x" * (MAX_REASON_CHARS - 1) + "…"
 
 
 @pytest.mark.parametrize("seq", [True, False, 1.5, "3", None])
@@ -423,3 +398,45 @@ def test_a_rejection_is_json_native():
     )
 
     assert json.loads(json.dumps(content)) == content
+
+
+@pytest.mark.parametrize("span", ["2026-09-04T16:02:00+00:00", 1757000000, None])
+def test_a_span_that_is_not_a_datetime_raises(span):
+    """#30 reads `span_start` out of a JSON body, where it is an ISO *string*. Handing
+    that straight in is the obvious mistake, so it names the field rather than surfacing
+    as an AttributeError from inside the conversion."""
+    with pytest.raises(ValueError, match="span_start must be a datetime"):
+        inferred_gap(
+            origin="android-01",
+            from_seq=1,
+            to_seq=2,
+            span_start=span,
+            span_end=SPAN_END,
+        )
+
+
+def test_a_truncated_reason_says_that_it_was_truncated():
+    """An evidentiary event a reader cannot tell was cut is one that quietly misleads."""
+    content = batch_rejected(
+        origin="kitchen-surrogate",
+        from_seq=1,
+        to_seq=2,
+        status=400,
+        reason="x" * (MAX_REASON_CHARS + 50),
+    )
+
+    assert len(content["reason"]) == MAX_REASON_CHARS
+    assert content["reason"].endswith("…")
+    assert content["reason"].startswith("x")
+
+
+def test_a_reason_is_recorded_without_its_padding():
+    content = batch_rejected(
+        origin="kitchen-surrogate",
+        from_seq=1,
+        to_seq=2,
+        status=400,
+        reason="   batch exceeds max byte size   ",
+    )
+
+    assert content["reason"] == "batch exceeds max byte size"

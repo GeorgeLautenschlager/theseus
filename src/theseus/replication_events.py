@@ -18,7 +18,9 @@ This module is the shared vocabulary only — constructors and validation. Nothi
 emits, appends or transports anything; the ingress and the replicator own that. What it
 does own is refusing to build a malformed marker: an invalid reason, an inverted range or
 a value that would not survive the wire raises here, at the mistake, rather than
-serialising into the log where it is permanent.
+serialising into the log where it is permanent. Every rejection is a `ValueError`,
+including the ones that are arguably type errors: an ingress catching malformed input at
+one boundary should not need two except clauses to do it.
 
 **Validation here is write-side only.** These constructors are the schema for events this
 node *builds*. An event arriving over the wire has been through none of them — a remote
@@ -172,6 +174,14 @@ def _check_int(name: str, value: int) -> None:
         raise ValueError(f"{name} must be an integer (got {value!r})")
 
 
+def _check_datetime(name: str, value: datetime) -> None:
+    """A span arrives from a JSON body as an ISO *string*, and handing that straight in is
+    the obvious mistake. Caught here so it names the field, rather than surfacing as an
+    `AttributeError` about `astimezone` from somewhere in the middle of the call."""
+    if not isinstance(value, datetime):
+        raise ValueError(f"{name} must be a datetime (got {value!r})")
+
+
 def _check_range(from_seq: int, to_seq: int) -> None:
     """The abandoned range, inclusive. A single-event hole is `from_seq == to_seq`."""
     _check_int("from_seq", from_seq)
@@ -199,6 +209,8 @@ def _utc_span(span_start: datetime, span_end: datetime) -> tuple[str, str]:
     `StimulusEvent.to_json` cannot encode a datetime, and failing there would be a long way
     from the mistake.
     """
+    _check_datetime("span_start", span_start)
+    _check_datetime("span_end", span_end)
     start = span_start.astimezone(timezone.utc)
     end = span_end.astimezone(timezone.utc)
     if end < start:
@@ -207,7 +219,15 @@ def _utc_span(span_start: datetime, span_end: datetime) -> tuple[str, str]:
 
 
 def _clean_reason(reason: str) -> str:
-    """The host's stated reason, bounded. See `MAX_REASON_CHARS`."""
+    """The host's stated reason: stripped, and bounded per `MAX_REASON_CHARS`.
+
+    An over-long reason is marked where it was cut. This is an evidentiary event — a
+    reader that cannot tell "the host said exactly this" from "the host said this and
+    more" is being quietly misled about what it has.
+    """
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError(f"reason must be a non-empty string (got {reason!r})")
-    return reason[:MAX_REASON_CHARS]
+    reason = reason.strip()
+    if len(reason) <= MAX_REASON_CHARS:
+        return reason
+    return reason[: MAX_REASON_CHARS - 1] + "…"
