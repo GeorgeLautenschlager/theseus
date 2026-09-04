@@ -19,7 +19,34 @@ from __future__ import annotations
 
 import threading
 
-from theseus.stimulus_log import StimulusLog
+from theseus.stimulus_log import StimulusEvent, StimulusLog
+
+
+def _committed_seq(event: StimulusEvent) -> int | None:
+    """The seq to fold into a mark, or None for a line that carries none.
+
+    Recovery reads whatever is on disk, and disk is not the same trust boundary as
+    `StimulusLog.append`: a foreign writer — another implementation, a hand-edited file —
+    can put a string or a negative number where a seq belongs. Folding one of those into a
+    mark yields a mark that compares wrongly or not at all, and an under-counted mark is
+    the direction that re-appends a batch the host already has. So recovery fails loudly
+    here rather than booting with a mark that lies, which is what `read_all` already does
+    for a corrupt interior line.
+    """
+    if event.seq is None:
+        # Written before the envelope existed. History, not a delivery: no mark.
+        return None
+    if isinstance(event.seq, bool) or not isinstance(event.seq, int):
+        raise ValueError(
+            f"event {event.id} carries a non-integer seq {event.seq!r}; "
+            f"a mark derived from it would compare wrongly"
+        )
+    if event.seq < 1:
+        raise ValueError(
+            f"event {event.id} carries seq {event.seq!r}; seqs start at 1, and a mark "
+            f"below that would sit under every real seq"
+        )
+    return event.seq
 
 
 class HighWaterMarks:
@@ -50,10 +77,9 @@ class HighWaterMarks:
         # permanent memory. `StimulusLog` locks its own counter for the same reason.
         self._lock = threading.Lock()
         for event in log.read_all():
-            # Lines written before the envelope existed carry no seq. They are history,
-            # not deliveries, and must not invent a mark.
-            if event.seq is not None:
-                self.advance(event.origin, event.seq)
+            seq = _committed_seq(event)
+            if seq is not None:
+                self.advance(event.origin, seq)
 
     def high_water(self, origin: str) -> int | None:
         """Highest seq committed for `origin`, or `None` if nothing has ever arrived from it.
@@ -74,9 +100,11 @@ class HighWaterMarks:
         straddling the mark commits only the events above it and a duplicate commits
         nothing, so the mark is a maximum rather than a last-write.
 
-        `seq` is not validated here: a mark advances *on commit*, so the only path that can
-        produce one has already been through `StimulusLog.append`, which rejects a seq below
-        1. Validating untrusted input is the ingress's job, at the door.
+        `seq` is not validated here, because both paths that reach it have already checked
+        it: a live commit came through `StimulusLog.append`, which rejects a seq below 1,
+        and recovery came through `_committed_seq`, which rejects anything a foreign writer
+        may have left on disk. Validating an untrusted *batch* — shape, size, origin — is
+        still the ingress's job, at the door.
         """
         with self._lock:
             current = self._marks.get(origin)

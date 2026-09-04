@@ -183,22 +183,32 @@ def test_marks_are_a_snapshot_and_do_not_see_later_appends(tmp_path):
 
 
 def test_a_seq_that_is_not_a_number_fails_the_boot_loudly(tmp_path):
-    """Only a foreign writer can produce this — `append` refuses a non-integer seq. The
-    contract is that recovery raises rather than silently under-counting, because an
-    under-counted mark is the double-append direction."""
+    """Only a foreign writer can produce this — `append` refuses a non-integer seq. Recovery
+    rejects it on its own rather than waiting for a later comparison to force the clash, so
+    a log whose *only* replicated line is malformed still fails rather than booting with a
+    mark that lies. An under-counted mark is the double-append direction."""
     path = tmp_path / "stimulus_log.jsonl"
-    # The second line is what makes boot compare: first contact with an origin takes no
-    # comparison, so a lone string seq would sail through and only the int that follows it
-    # forces the str/int clash.
     path.write_text(
         '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00+00:00",'
         '"actor":"peer","type":"observation","content":{},'
-        '"origin":"android-01","seq":"7"}\n'
-        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ02","ts":"2026-01-01T12:00:01+00:00",'
-        '"actor":"peer","type":"observation","content":{},'
-        '"origin":"android-01","seq":8}\n',
+        '"origin":"android-01","seq":"7"}\n',
         encoding="utf-8",
     )
 
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="non-integer seq"):
+        HighWaterMarks(StimulusLog(path=path))
+
+
+def test_a_seq_below_one_on_disk_fails_the_boot(tmp_path):
+    """The other direction a foreign writer can get wrong. A mark below 1 sits under every
+    real seq, so every subsequent batch would look like a duplicate."""
+    path = tmp_path / "stimulus_log.jsonl"
+    path.write_text(
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00+00:00",'
+        '"actor":"peer","type":"observation","content":{},'
+        '"origin":"android-01","seq":-5}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="seqs start at 1"):
         HighWaterMarks(StimulusLog(path=path))

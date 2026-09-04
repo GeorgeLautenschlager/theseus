@@ -183,7 +183,10 @@ def _check_datetime(name: str, value: datetime) -> None:
 
 
 def _check_range(from_seq: int, to_seq: int) -> None:
-    """The abandoned range, inclusive. A single-event hole is `from_seq == to_seq`."""
+    """Reject a range that could not describe a real span of events.
+
+    Inclusive at both ends, so a single-event range has `from_seq == to_seq`.
+    """
     _check_int("from_seq", from_seq)
     _check_int("to_seq", to_seq)
     if from_seq < 1:

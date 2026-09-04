@@ -351,7 +351,7 @@ class Autocore:
             f" That gap does not apply to this turn: {cause}. Something outside you"
             f" wants attention now, so find it in <stimulus_log> and deal with it"
             f" before returning to self-directed work. It is not necessarily the last"
-            f" line: the log is ordered by when things happened, and something that"
+            f" line: what you are shown is ordered by when things happened, and something"
             f" reached you late — a surrogate replicating a backlog, say — sits at its"
             f" own place in that order rather than at the end."
         )

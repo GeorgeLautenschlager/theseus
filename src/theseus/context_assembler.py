@@ -87,7 +87,7 @@ class ContextAssembler:
     unit — fifty events is a couple of thousand tokens of chat, or a hundred thousand
     tokens if one of them is a `read` result carrying a whole file.
 
-    `window_size` caps *arrivals*, not wall-clock span, and since #28 the two can come
+    `window_size` caps *arrivals*, not wall-clock span, and since #26 the two can come
     apart. A surrogate returning from an outage drains its backlog in back-to-back
     batches, so a large enough drain can occupy the whole window for a turn or more —
     handing the model an hour of stale observation, in clean chronological order, with no
@@ -233,15 +233,16 @@ class ContextAssembler:
         cheap on a long log, but chronology is what the model has to read.
 
         A consequence, once producers are skewed: what the budget drops is the
-        earliest-*arrived*, while what it emits is ordered by when things happened — so a
-        truncated window is not necessarily a clean chronological suffix. An event that
-        arrived late but happened early — a surrogate's backfill — survives
-        a cut that removes events which happened *after* it, so those dropped events sit
+        earliest-*arrived*, while what it emits is ordered by when things happened. An
+        event that arrived late but happened early — a surrogate's backfill — survives a
+        cut that removes events which happened *after* it, so those dropped events sit
         chronologically between the backfill and the rest of the window. The result reads
         as continuous and is not.
+
         Dropping by chronology instead would remove the class entirely, at the cost of
-        discarding a just-delivered backlog first; that is a live question, deliberately
-        left to a follow-up because #28's scope is the emitted order alone.
+        discarding a just-delivered backlog first. That is a live question, deliberately
+        left to a follow-up: the emitted order is what this change is scoped to, and which
+        events survive a cut is a separate decision.
         """
         max_event_chars = self._max_event_chars(budget)
         kept: list[tuple[StimulusEvent, str]] = []
