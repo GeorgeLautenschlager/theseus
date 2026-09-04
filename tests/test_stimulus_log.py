@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import json
 import threading
+import time
+from datetime import datetime, timedelta, timezone
 
-from theseus.stimulus_log import StimulusLog
+import pytest
+
+from theseus.stimulus_log import DEFAULT_ORIGIN, StimulusEvent, StimulusLog, new_id
 
 
 def make_log(tmp_path) -> StimulusLog:
     return StimulusLog(path=tmp_path / "stimulus_log.jsonl")
 
 
+# --- Listeners ------------------------------------------------------------------
 def test_subscribe_hands_each_appended_event_to_the_listener(tmp_path):
     log = make_log(tmp_path)
     seen = []
@@ -86,3 +92,324 @@ def test_listener_fires_on_the_appending_thread(tmp_path):
     appender.join()
 
     assert threads == [appender]
+
+
+def test_a_listener_may_append_without_deadlocking(tmp_path):
+    """The append lock is released before listeners are notified, precisely so a listener
+    can append. This pins that boundary: move `_notify` inside the lock and this hangs."""
+    log = make_log(tmp_path)
+    echoed = []
+
+    def echo_once(event):
+        if event.type == "chat_message":
+            echoed.append(log.append(actor="tam", type="echo", content={}))
+
+    log.subscribe(echo_once)
+    log.append(actor="user", type="chat_message", content={})
+
+    assert [e.seq for e in log.read_all()] == [1, 2]
+    assert [e.type for e in log.read_all()] == ["chat_message", "echo"]
+    assert len(echoed) == 1
+
+
+# --- Event envelope -------------------------------------------------------------
+def _event(**overrides) -> StimulusEvent:
+    fields = dict(
+        id="01ABCDEFGHJKMNPQRSTVWXYZ0",
+        ts=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        actor="user",
+        type="chat_message",
+        content={"message": "hi"},
+    )
+    fields.update(overrides)
+    return StimulusEvent(**fields)
+
+
+def test_to_json_round_trips_every_envelope_field():
+    event = _event(
+        origin="kitchen-surrogate",
+        seq=7,
+        appended_ts=datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc),
+    )
+
+    assert StimulusEvent.from_json(event.to_json()) == event
+
+
+def test_to_json_writes_the_wire_format_key_names():
+    """The round-trip test above is symmetric — renaming a key in both directions keeps it
+    green. These bytes are a cross-process contract, so the names themselves are pinned here."""
+    event = _event(
+        origin="kitchen-surrogate",
+        seq=7,
+        appended_ts=datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc),
+    )
+
+    wire = json.loads(event.to_json())
+
+    assert set(wire) == {
+        "id",
+        "ts",
+        "actor",
+        "type",
+        "content",
+        "origin",
+        "seq",
+        "appended_ts",
+    }
+    assert wire["origin"] == "kitchen-surrogate"
+    assert wire["seq"] == 7
+    assert wire["ts"] == "2026-01-01T12:00:00+00:00"
+    assert wire["appended_ts"] == "2026-01-01T13:30:00+00:00"
+
+
+def test_a_pre_change_log_line_parses_with_the_documented_defaults():
+    """Every line written before this change lacks the envelope. They stay readable in
+    place — no migration script — so the defaults are part of the contract."""
+    legacy = (
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00+00:00",'
+        '"actor":"user","type":"chat_message","content":{"message":"hi"}}'
+    )
+
+    event = StimulusEvent.from_json(legacy, default_origin="kitchen-surrogate")
+
+    assert event.origin == "kitchen-surrogate"
+    assert event.seq is None
+    assert event.appended_ts == event.ts
+
+
+def test_from_json_falls_back_to_the_module_default_origin():
+    legacy = (
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00+00:00",'
+        '"actor":"user","type":"chat_message","content":{}}'
+    )
+
+    assert StimulusEvent.from_json(legacy).origin == DEFAULT_ORIGIN
+
+
+def test_appended_ts_defaults_to_event_ts_when_not_supplied():
+    """An event that was never appended by a log still has a usable arrival timestamp,
+    so downstream ordering never has to special-case None."""
+    event = _event()
+
+    assert event.appended_ts == event.ts
+
+
+def test_envelope_fields_are_optional_so_existing_construction_sites_still_work():
+    """The subject here is the construction call itself: `_event()` passes only the five
+    original keyword arguments, which is exactly how `tests/test_debug_pagination.py` and
+    `tests/test_debug_row_rendering.py` build events. If the envelope fields ever lose their
+    defaults, this stops constructing before it reaches an assertion."""
+    event = _event()
+
+    assert event.origin == DEFAULT_ORIGIN
+    assert event.seq is None
+
+
+# --- Origin and seq allocation --------------------------------------------------
+def test_local_appends_get_a_monotonic_seq_starting_at_one(tmp_path):
+    log = make_log(tmp_path)
+
+    events = [
+        log.append(actor="user", type="chat_message", content={"n": n}) for n in range(3)
+    ]
+
+    assert [e.seq for e in events] == [1, 2, 3]
+    assert {e.origin for e in events} == {DEFAULT_ORIGIN}
+
+
+def test_seq_is_monotonic_across_a_restart(tmp_path):
+    """The log file is the only durable state. A sidecar counter that disagreed with it
+    after a crash would either drop real events or issue the same seq twice."""
+    path = tmp_path / "stimulus_log.jsonl"
+    first = StimulusLog(path=path)
+    first.append(actor="user", type="chat_message", content={})
+    first.append(actor="user", type="chat_message", content={})
+
+    reopened = StimulusLog(path=path)
+    event = reopened.append(actor="user", type="chat_message", content={})
+
+    assert event.seq == 3
+
+
+def test_the_log_stamps_its_own_origin_on_local_appends(tmp_path):
+    log = StimulusLog(path=tmp_path / "stimulus_log.jsonl", origin="kitchen-surrogate")
+
+    event = log.append(actor="user", type="chat_message", content={})
+
+    assert event.origin == "kitchen-surrogate"
+
+
+def test_id_order_matches_append_order_when_event_ts_is_backdated(tmp_path):
+    """A replicated event can carry a skewed or hours-old event_ts. The id is minted from
+    appended_ts so it never sorts into the middle of the log. The consumer that actually
+    depends on this is `older_batch` in `theseus/web/debug_pagination.py`, which bisects a
+    list of ids and therefore requires it to be sorted ascending; `read_range` here and the
+    debug tail cursor read id order too."""
+    log = make_log(tmp_path)
+    backdated = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    old = log.append(actor="user", type="chat_message", content={"n": 1}, ts=backdated)
+    time.sleep(0.002)  # ULIDs are millisecond-resolution; keep the two ids distinguishable
+    new = log.append(actor="user", type="chat_message", content={"n": 2})
+
+    assert old.id < new.id
+    # Minted from arrival, not from the backdated event clock: an id minted an hour ago
+    # would sort below this one and land in the middle of the log.
+    assert old.id > new_id(int(backdated.timestamp() * 1000))
+    assert log.read_range(old.id, new.id) == [old, new]
+
+
+def test_appended_ts_is_minted_by_the_log_not_taken_from_the_caller(tmp_path):
+    log = make_log(tmp_path)
+    backdated = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    event = log.append(actor="user", type="chat_message", content={}, ts=backdated)
+
+    assert event.ts == backdated
+    assert event.appended_ts > event.ts
+
+
+def test_a_replicated_append_keeps_the_origin_and_seq_its_producer_assigned(tmp_path):
+    log = make_log(tmp_path)
+
+    event = log.append(
+        actor="user",
+        type="chat_message",
+        content={},
+        origin="kitchen-surrogate",
+        seq=41,
+    )
+
+    assert (event.origin, event.seq) == ("kitchen-surrogate", 41)
+    assert log.read_all() == [event]
+
+
+def test_a_replicated_append_must_carry_a_seq(tmp_path):
+    """This log can only allocate for its own origin — inventing a seq for someone else's
+    would collide with the one the producer already assigned."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append(
+            actor="user", type="chat_message", content={}, origin="kitchen-surrogate"
+        )
+
+
+def test_a_replicated_seq_does_not_disturb_the_local_counter(tmp_path):
+    log = make_log(tmp_path)
+    log.append(actor="user", type="chat_message", content={})
+    log.append(
+        actor="user", type="chat_message", content={}, origin="android-01", seq=900
+    )
+
+    event = log.append(actor="user", type="chat_message", content={})
+
+    assert event.seq == 2
+
+
+def test_seq_recovery_ignores_other_origins(tmp_path):
+    """Recovery counts only this log's own origin — a surrogate's seq 900 must not push
+    the host's own counter into the nine-hundreds."""
+    path = tmp_path / "stimulus_log.jsonl"
+    first = StimulusLog(path=path)
+    first.append(actor="user", type="chat_message", content={})
+    first.append(
+        actor="user", type="chat_message", content={}, origin="android-01", seq=900
+    )
+
+    event = StimulusLog(path=path).append(actor="user", type="chat_message", content={})
+
+    assert event.seq == 2
+
+
+def test_legacy_lines_read_back_with_the_logs_own_origin(tmp_path):
+    path = tmp_path / "stimulus_log.jsonl"
+    path.write_text(
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00+00:00",'
+        '"actor":"user","type":"chat_message","content":{}}\n',
+        encoding="utf-8",
+    )
+    log = StimulusLog(path=path, origin="kitchen-surrogate")
+
+    (event,) = log.read_all()
+
+    assert event.origin == "kitchen-surrogate"
+    assert event.seq is None
+    assert event.appended_ts == event.ts
+
+
+def test_appending_to_a_log_of_pre_envelope_lines_starts_seq_at_one(tmp_path):
+    """The upgrade path every deployed agent takes: a log full of lines written before the
+    envelope existed, then a restart on this code. Those lines carry no seq, recovery skips
+    them, and numbering starts at 1 behind them — a gap, which the protocol permits."""
+    path = tmp_path / "stimulus_log.jsonl"
+    path.write_text(
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00+00:00",'
+        '"actor":"user","type":"chat_message","content":{}}\n'
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ1","ts":"2026-01-01T12:01:00+00:00",'
+        '"actor":"tam","type":"chat_message","content":{}}\n',
+        encoding="utf-8",
+    )
+    log = StimulusLog(path=path)
+
+    event = log.append(actor="user", type="chat_message", content={})
+
+    assert event.seq == 1
+    assert [e.seq for e in log.read_all()] == [None, None, 1]
+
+
+def test_concurrent_appends_never_reuse_a_seq(tmp_path):
+    log = make_log(tmp_path)
+    events: list[StimulusEvent] = []
+    barrier = threading.Barrier(8)
+
+    def appender() -> None:
+        barrier.wait()
+        events.append(log.append(actor="user", type="chat_message", content={}))
+
+    threads = [threading.Thread(target=appender) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(e.seq for e in events) == [1, 2, 3, 4, 5, 6, 7, 8]
+    # The returned objects alone would pass with a torn or short file; only reading it back
+    # proves the lock covered the write as well as the allocation.
+    assert sorted(e.seq for e in log.read_all()) == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_an_own_origin_append_may_not_carry_a_seq(tmp_path):
+    """Two numbering authorities on one origin name is exactly what breaks duplicate
+    suppression downstream — and since host and surrogate both default to the same origin
+    name, it is what an unconfigured deployment would otherwise produce silently."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append(
+            actor="user", type="chat_message", content={}, origin=DEFAULT_ORIGIN, seq=1
+        )
+
+
+def test_a_log_cannot_be_configured_with_an_empty_origin(tmp_path):
+    """An origin is configuration, so the error belongs at construction rather than on the
+    first append."""
+    with pytest.raises(ValueError):
+        StimulusLog(path=tmp_path / "stimulus_log.jsonl", origin="")
+
+
+def test_an_empty_origin_is_rejected(tmp_path):
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append(actor="user", type="chat_message", content={}, origin="", seq=1)
+
+
+def test_a_replicated_seq_below_one_is_rejected(tmp_path):
+    """0 is reserved to mean 'nothing seen yet' for a reader's high-water mark."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append(
+            actor="user", type="chat_message", content={}, origin="android-01", seq=0
+        )
