@@ -559,8 +559,82 @@ git commit -m "Give StimulusLog an origin and a per-origin seq allocator"
 
 ## Acceptance (from issue #26)
 
-- [ ] `to_json` / `from_json` round-trips all fields — Task 1
-- [ ] A pre-change log line parses with the documented defaults — Task 1
-- [ ] `seq` is monotonic per origin across a process restart — Task 2
-- [ ] ULID ordering still matches append order when `event_ts` is backdated by an hour — Task 2
-- [ ] Existing `tests/test_stimulus_log.py` stays green — both tasks, Step 5
+- [x] `to_json` / `from_json` round-trips all fields — Task 1
+- [x] A pre-change log line parses with the documented defaults — Task 1
+- [x] `seq` is monotonic per origin across a process restart — Task 2
+- [x] ULID ordering still matches append order when `event_ts` is backdated by an hour — Task 2
+- [x] Existing `tests/test_stimulus_log.py` stays green — both tasks, Step 5
+
+---
+
+## Amendments made during execution
+
+The task sections above are the plan **as written before implementation**, kept as-is so the
+diff between intent and outcome stays legible. Review changed three things; where this section
+and a task section disagree, **this section is what shipped**.
+
+### 1. `append` rejects an own-origin `seq` instead of reconciling it
+
+Task 2's prescribed `append` (above) reconciles an own-origin append that arrives with an
+explicit seq by bumping the counter past it:
+
+```python
+            elif origin == self.origin and self._next_seq is not None:
+                self._next_seq = max(self._next_seq, seq + 1)
+```
+
+**That branch was deleted.** Code review demonstrated it silently accepts the *default*
+misconfiguration: because `DEFAULT_ORIGIN` is `"local"` on both host and surrogate, an
+unconfigured surrogate shipping a batch upstream lands as `origin="local", seq=1…` on a host
+whose own origin is also `"local"`. The result is two numbering authorities on one origin —
+file seqs `[1, 2, 1, 2, 3]` — which is precisely what #29's per-origin high-water dedupe reads
+as data loss. The branch had no test coverage, and nothing in the repo or the protocol replays
+an own-origin event with an explicit seq.
+
+The shipped contract is one sentence: **`origin` and `seq` are supplied together or not at all.**
+`append` now rejects an empty origin, a `seq` supplied for the log's own origin, a foreign origin
+without a seq, and a foreign `seq < 1`. All four raise `ValueError` ahead of the lock, so a
+rejected append leaves nothing on disk. The lock body keeps only the local-allocation branch —
+after validation, `seq is None` holds if and only if the append is local.
+
+### 2. Documented constraints the prescribed code left implicit
+
+- **Exactly one writer per `(file, origin)`** is a hard requirement, now in the `StimulusLog`
+  class docstring. The allocator is per-instance and in-memory, so two logs appending to one file
+  under one origin each recover the counter once and then drift apart permanently. Concurrent
+  readers are fine; so is a second writer under a genuinely different origin. Enforcing this with
+  an `flock` is a later issue — it needs answers about contention and NFS that #26 does not.
+- **Notification order is not file order**, now in `subscribe`'s docstring. Listeners fire after
+  the append lock is released, so a listener that appends re-entrantly can have its own event
+  announced to later listeners before the one that triggered it. That is the price of letting a
+  listener append at all.
+- **A replicated event is re-identified host-side** — `append` always mints the id from its own
+  `appended_ts`, so the same event has different ids on producer and host. Identity across nodes
+  is `(origin, seq)`, never `id`. #30 and #31 must not correlate by id.
+
+### 3. Six tests beyond the twenty-two prescribed
+
+The wire-format test (pinning the eight literal JSON key names, because
+`from_json(to_json()) == event` is symmetric and survives a rename that would break the
+protocol); four validation tests for the newly-rejected combinations; a test that a listener may
+append without deadlocking, which pins the lock boundary; and one covering the upgrade path every
+deployed agent takes — a log of pre-envelope, seq-`None` lines, then an append, which starts at 1
+behind them.
+
+---
+
+## Release boundaries — read before tagging
+
+The Task 1 → Task 2 hazard described under **File Structure** has a larger twin at the
+**#26 → #27** boundary, and that one is *not* confined to a single PR.
+
+Once #26 ships, a deployed agent runs on the default `origin="local"` and writes lines carrying
+an **explicit** `"origin":"local"`. `from_json` backfills `default_origin` only when the key is
+*absent*, so when #27 plumbs a real origin name through `Autocore`, those in-between events stay
+filed under `local` while everything before them (no key at all) and after them (the new name)
+reads as the new origin. Per-origin monotonicity still holds, so nothing breaks — but the agent's
+history is split across two origin labels, `_recover_next_seq` restarts at 1 for the new name, and
+#29's high-water store sees one node as two origins.
+
+Two cheap mitigations, either is sufficient: don't cut a release between merging #26 and #27, or
+have #27 keep the host's own origin as `"local"` and give real names only to surrogates.
