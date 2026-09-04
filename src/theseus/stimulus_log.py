@@ -50,14 +50,43 @@ def new_id(ms: int | None = None) -> str:
     return _b32(ms, 10) + _b32(rand, 16)  # 26 chars
 
 
+# The origin a log stamps on its own events when none is configured. `origin` answers
+# *where* an event entered the system (`kitchen-surrogate`, `android-01`, `webchat`);
+# `actor` answers *who* produced it. They stay separate: the same mind reaches the agent
+# through several channels, and collapsing them makes the agent either believe in two
+# users or unable to decide which mouth to answer from.
+DEFAULT_ORIGIN = "local"
+
+
 # --- Event ----------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class StimulusEvent:
+    """One thing that happened, plus the envelope that lets it be replicated.
+
+    `content` is the surrogate protocol's `payload` under its original name — the alias
+    is documented rather than renamed, because renaming it churns every module for no gain.
+    Likewise `ts` is the protocol's `event_ts`.
+
+    The two timestamps are both retained, and they answer different questions:
+    `appended_ts` is authoritative for *log order*, `ts` for *meaning*. The gap between
+    them is observable clock skew — a surrogate drifting 900ms shows up in the trace
+    instead of silently scrambling the agent's sense of before-and-after.
+    """
+
     id: str
-    ts: datetime
+    ts: datetime         # event_ts: when it happened, by the producer's clock
     actor: str           # who/what produced it ("george", "tam", "env", "sensor")
     type: str            # "exchange" | "capture" | "observation" | ...
     content: dict[str, Any]  # type-specific payload; e.g. {"prompt":..,"response":..}
+    origin: str = DEFAULT_ORIGIN  # where it entered the system; assigned by the producer
+    seq: int | None = None        # monotonic per origin. Not contiguous — gaps are legal.
+    appended_ts: datetime | None = None  # when it landed on this log
+
+    def __post_init__(self) -> None:
+        # An event that no log has appended yet still needs an arrival timestamp, so
+        # ordering code never has to special-case None.
+        if self.appended_ts is None:
+            object.__setattr__(self, "appended_ts", self.ts)
 
     def to_json(self) -> str:
         return json.dumps(
@@ -67,20 +96,34 @@ class StimulusEvent:
                 "actor": self.actor,
                 "type": self.type,
                 "content": self.content,
+                "origin": self.origin,
+                "seq": self.seq,
+                "appended_ts": self.appended_ts.astimezone(timezone.utc).isoformat(),
             },
             ensure_ascii=False,
             separators=(",", ":"),
         )
 
     @classmethod
-    def from_json(cls, line: str) -> "StimulusEvent":
+    def from_json(
+        cls, line: str, *, default_origin: str = DEFAULT_ORIGIN
+    ) -> "StimulusEvent":
+        """Parse one log line. Lines written before the envelope existed are still valid:
+        `origin` falls back to `default_origin` (the reading log's own origin), `seq` to
+        None, and `appended_ts` to `ts`. Old lines stay readable in place — there is no
+        migration."""
         d = json.loads(line)
+        ts = datetime.fromisoformat(d["ts"])
+        appended_ts = d.get("appended_ts")
         return cls(
             id=d["id"],
-            ts=datetime.fromisoformat(d["ts"]),
+            ts=ts,
             actor=d["actor"],
             type=d["type"],
             content=d["content"],
+            origin=d.get("origin") or default_origin,
+            seq=d.get("seq"),
+            appended_ts=datetime.fromisoformat(appended_ts) if appended_ts else ts,
         )
 
 
