@@ -430,15 +430,17 @@ from theseus.replication_batch import (
 )
 
 
-def line(seq: int, origin: str = "kitchen-surrogate", **overrides) -> str:
+def line(n: int, origin: str = "kitchen-surrogate", **overrides) -> str:
+    """The first parameter is `n`, not `seq`, so a test can override `seq` by keyword
+    without colliding with the positional argument."""
     fields = {
-        "id": f"01PRODUCERID{seq:014d}",
+        "id": f"01PRODUCERID{n:014d}",
         "ts": "2026-09-04T16:00:00+00:00",
         "actor": "sensor",
         "type": "observation",
-        "content": {"n": seq},
+        "content": {"n": n},
         "origin": origin,
-        "seq": seq,
+        "seq": n,
     }
     fields.update(overrides)
     import json
