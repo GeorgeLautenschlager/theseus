@@ -170,6 +170,10 @@ class StimulusLog:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
+        if not origin:
+            # Configuration, so it fails here rather than on the first append: an origin is
+            # the key everything downstream dedupes and routes on.
+            raise ValueError("origin must be a non-empty name")
         self.origin = origin
         self._listeners: list[Callable[[StimulusEvent], None]] = []
         self._listener_lock = threading.Lock()

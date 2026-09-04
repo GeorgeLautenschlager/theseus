@@ -383,3 +383,10 @@ def test_a_listener_may_append_without_deadlocking(tmp_path):
     assert [e.seq for e in log.read_all()] == [1, 2]
     assert [e.type for e in log.read_all()] == ["chat_message", "echo"]
     assert len(echoed) == 1
+
+
+def test_a_log_cannot_be_configured_with_an_empty_origin(tmp_path):
+    """An origin is configuration, so the error belongs at construction rather than on the
+    first append."""
+    with pytest.raises(ValueError):
+        StimulusLog(path=tmp_path / "stimulus_log.jsonl", origin="")
