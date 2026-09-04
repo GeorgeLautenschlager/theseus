@@ -23,6 +23,16 @@
 Nothing else changes. `ContextAssembler` ordering by `event_ts`, the host ingress endpoint, gap
 markers, and the high-water-mark store are **later issues (#27–#34) and explicitly out of scope**.
 
+**Do not cut a release between Task 1 and Task 2.** After Task 1, `StimulusLog.append` still
+constructs events without an origin, so every line it writes carries an explicit
+`"origin":"local"` on the wire. Task 2's `from_json(..., default_origin=self.origin)` backfills
+only when the key is *absent* — an explicit `"local"` wins — so a log later configured as
+`origin="kitchen-surrogate"` would read its Task-1-era history back as `local`, and
+`_recover_next_seq` (which filters on `event.origin == self.origin`) would skip all of it. The
+window exists only for the intermediate commit; both tasks ship in one PR, and `make release`
+runs from `main` after merge, so this cannot reach a deployed agent. It is recorded here because
+the hazard is invisible from either task read alone.
+
 ## Naming decisions locked in for this plan
 
 These are settled — implement them as written, do not re-derive:
