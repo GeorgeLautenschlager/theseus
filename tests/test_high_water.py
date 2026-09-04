@@ -99,31 +99,48 @@ def test_pre_envelope_lines_leave_no_mark(tmp_path):
     assert marks.high_water(log.origin) is None
 
 
-def test_concurrent_advances_never_move_a_mark_backwards(tmp_path):
-    """`advance` is a read-modify-write, and the ingress that calls it is an HTTP endpoint:
-    a surrogate whose client times out and retries produces two concurrent requests for one
-    origin. Unlocked, the interleaving moves the mark *down*, which re-appends a batch the
-    host already committed."""
+def test_a_concurrent_advance_cannot_clobber_a_higher_mark(tmp_path):
+    """The defect this guards is a lost update: one caller reads a mark, is descheduled
+    while a higher mark is committed, then writes its own lower value over the top —
+    re-appending a batch the host already had.
+
+    A test that merely runs threads and hopes for that interleaving is blind: the critical
+    section is about a microsecond and the interpreter switches every five milliseconds, so
+    it never lands. This forces the interleaving instead. The read inside `advance` is
+    interposed, a competing higher `advance` runs at exactly that moment, and the lock is
+    the only thing that can make it wait. The timeout is what makes holding the lock a pass
+    rather than a hang.
+    """
     marks = HighWaterMarks(make_log(tmp_path))
-    barrier = threading.Barrier(8)
-    seen: list[int] = []
+    competitor: list[threading.Thread] = []
+    interposed = threading.Event()
 
-    def advancer(start: int) -> None:
-        barrier.wait()
-        for seq in range(start, start + 200):
-            marks.advance("kitchen-surrogate", seq)
-            mark = marks.high_water("kitchen-surrogate")
-            assert mark is not None
-            seen.append(mark)
+    class InterposedMarks(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            if not interposed.is_set():
+                interposed.set()
+                done = threading.Event()
 
-    threads = [threading.Thread(target=advancer, args=(i * 1000,)) for i in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+                def compete() -> None:
+                    marks.advance("kitchen-surrogate", 900)
+                    done.set()
 
-    assert seen == sorted(seen), "a mark moved backwards"
-    assert marks.high_water("kitchen-surrogate") == 7199
+                thread = threading.Thread(target=compete)
+                competitor.append(thread)
+                thread.start()
+                # Blocked by the lock, this times out and the outer write wins the race
+                # it was always going to win. Unlocked, it completes here and the outer
+                # write silently reverts it.
+                done.wait(timeout=0.5)
+            return value
+
+    marks._marks = InterposedMarks(marks._marks)
+
+    marks.advance("kitchen-surrogate", 100)
+    competitor[0].join(timeout=5)
+
+    assert marks.high_water("kitchen-surrogate") == 900
 
 
 def test_recovery_and_advance_compose(tmp_path):
