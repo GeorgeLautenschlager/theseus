@@ -231,8 +231,10 @@ class StimulusLog:
 
         The log is the only durable state, so the counter is derived from it rather than
         kept in a sidecar: a sidecar that disagreed with the file after a crash would
-        either skip real events or issue the same seq twice. Seqs start at 1, which
-        leaves 0 free to mean "nothing seen yet" for a reader's high-water mark.
+        either skip real events or issue the same seq twice. Seqs start at 1, so 0 is
+        always below every real seq and is a safe comparison floor for a reader tracking
+        what it has accepted. ("Nothing seen yet" is its own answer, distinct from 0 —
+        see `HighWaterMarks.high_water`.)
         """
         highest = 0
         for event in self.read_all():
@@ -285,8 +287,9 @@ class StimulusLog:
             )
         elif seq < 1:
             raise ValueError(
-                f"seq must be 1 or greater (got {seq!r}); 0 is reserved to mean "
-                f"'nothing seen yet' for a reader's high-water mark"
+                f"seq must be 1 or greater (got {seq!r}); starting at 1 keeps 0 below "
+                f"every real seq, as a safe comparison floor for a reader tracking what "
+                f"it has accepted"
             )
 
         with self._append_lock:
