@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -459,3 +460,135 @@ def test_a_naive_timestamp_from_a_foreign_line_is_read_as_aware(tmp_path):
     assert event.appended_ts.tzinfo is not None
     # And the pair a sort would compare is now comparable.
     assert event.ts <= datetime.now(timezone.utc)
+
+
+def _replicated(seq: int, message: str = "hi", origin: str = "kitchen-surrogate"):
+    """One event shaped as it arrives off the wire: the producer's id and appended_ts are
+    placeholders, because this log re-mints both."""
+    return StimulusEvent(
+        id="01PRODUCERSIDWILLBEDROPPED",
+        # Midnight, not a wall-clock "now": the re-mint test asserts appended_ts (minted from
+        # now) sorts after this producer ts, so the fixture must sit in the past.
+        ts=datetime(2026, 9, 4, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=seq),
+        actor="sensor",
+        type="observation",
+        content={"message": message},
+        origin=origin,
+        seq=seq,
+    )
+
+
+def test_append_many_writes_the_whole_batch(tmp_path):
+    log = make_log(tmp_path)
+
+    appended = log.append_many([_replicated(1), _replicated(2), _replicated(3)])
+
+    assert [e.seq for e in appended] == [1, 2, 3]
+    assert [e.seq for e in log.read_all()] == [1, 2, 3]
+    assert {e.origin for e in log.read_all()} == {"kitchen-surrogate"}
+
+
+def test_append_many_re_mints_id_and_appended_ts(tmp_path):
+    """Identity across nodes is (origin, seq), never id. The producer's id is its own."""
+    log = make_log(tmp_path)
+
+    (appended,) = log.append_many([_replicated(1)])
+
+    assert appended.id != "01PRODUCERSIDWILLBEDROPPED"
+    assert appended.appended_ts > appended.ts
+    assert appended.ts == datetime(2026, 9, 4, 0, 0, 1, tzinfo=timezone.utc)
+
+
+def test_append_many_ids_are_strictly_increasing(tmp_path):
+    """A whole batch lands inside one millisecond, and `older_batch` bisects a list of ids
+    expecting it sorted. Independent random suffixes would collide with that; a batch
+    mints a monotonic run instead."""
+    log = make_log(tmp_path)
+
+    appended = log.append_many([_replicated(n) for n in range(1, 51)])
+
+    ids = [e.id for e in appended]
+    assert ids == sorted(ids)
+    assert len(set(ids)) == 50
+
+
+def test_append_many_ids_sort_above_everything_already_on_the_log(tmp_path):
+    log = make_log(tmp_path)
+    earlier = log.append(actor="george", type="exchange", content={})
+
+    appended = log.append_many([_replicated(1), _replicated(2)])
+
+    assert earlier.id < appended[0].id
+
+
+def test_append_many_is_one_fsync_for_the_whole_batch(tmp_path, monkeypatch):
+    """All-or-nothing application: the spec forbids a partial state the surrogate would
+    have to reason about. One open, one write, one fsync."""
+    log = make_log(tmp_path)
+    fsyncs = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(
+        os, "fsync", lambda fd: (fsyncs.append(fd), real_fsync(fd))[1]
+    )
+
+    log.append_many([_replicated(n) for n in range(1, 11)])
+
+    assert len(fsyncs) == 1
+
+
+def test_append_many_notifies_listeners_for_every_event(tmp_path):
+    log = make_log(tmp_path)
+    seen = []
+    log.subscribe(seen.append)
+
+    appended = log.append_many([_replicated(1), _replicated(2)])
+
+    assert seen == appended
+
+
+def test_append_many_notifies_after_the_whole_batch_is_durable(tmp_path):
+    """A listener must never see event 1 while event 2 of the same batch could still be
+    lost — the batch is the unit that is all-or-nothing."""
+    log = make_log(tmp_path)
+    on_disk = []
+    log.subscribe(lambda event: on_disk.append(len(log.read_all())))
+
+    log.append_many([_replicated(1), _replicated(2)])
+
+    assert on_disk == [2, 2]
+
+
+def test_append_many_rejects_a_batch_before_writing_any_of_it(tmp_path):
+    """Validation ahead of the lock, exactly as `append` does it: a rejected batch leaves
+    nothing on disk, so the surrogate has no partial state to reason about."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError):
+        log.append_many([_replicated(1), _replicated(2, origin=log.origin)])
+
+    assert log.read_all() == []
+
+
+def test_append_many_rejects_a_batch_spanning_two_origins(tmp_path):
+    """The spec's batch is a contiguous seq range from exactly one origin. Two origins in
+    one batch would make the all-or-nothing guarantee span two dedupe streams."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError, match="exactly one origin"):
+        log.append_many([_replicated(1), _replicated(1, origin="android-01")])
+
+
+def test_append_many_of_nothing_is_a_no_op(tmp_path):
+    log = make_log(tmp_path)
+
+    assert log.append_many([]) == []
+    assert log.read_all() == []
+
+
+def test_append_many_does_not_disturb_the_local_counter(tmp_path):
+    log = make_log(tmp_path)
+    log.append(actor="george", type="exchange", content={})
+
+    log.append_many([_replicated(90), _replicated(91)])
+
+    assert log.append(actor="george", type="exchange", content={}).seq == 2

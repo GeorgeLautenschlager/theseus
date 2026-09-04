@@ -50,6 +50,23 @@ def new_id(ms: int | None = None) -> str:
     return _b32(ms, 10) + _b32(rand, 16)  # 26 chars
 
 
+def _id_run(ms: int, count: int) -> list[str]:
+    """`count` ids for one instant, strictly increasing.
+
+    `new_id` gives each id an independent random suffix, which is fine at human rates
+    where the millisecond prefix does the ordering. A replicated batch is not that: fifty
+    events land in one write, share a millisecond, and are then distinguished only by
+    chance — while `older_batch` in the debug pagination bisects a list of ids and needs it
+    sorted ascending.
+
+    So a batch draws one random base and walks it. The base is drawn below `2**80 - count`
+    so the walk cannot wrap, which would put the run out of order at exactly the moment it
+    matters.
+    """
+    base = int.from_bytes(os.urandom(10), "big") % ((1 << 80) - count)
+    return [_b32(ms, 10) + _b32(base + i, 16) for i in range(count)]
+
+
 # The origin a log stamps on its own events when none is configured. `origin` answers
 # *where* an event entered the system (`kitchen-surrogate`, `android-01`, `webchat`);
 # `actor` answers *who* produced it. They stay separate: the same mind reaches the agent
@@ -242,6 +259,37 @@ class StimulusLog:
                 highest = max(highest, event.seq)
         return highest + 1
 
+    def _check_replicated(self, origin: str | None, seq: int | None) -> None:
+        """The contract for an event this log did not produce: `origin` and `seq` are
+        supplied together, the origin is somebody else's, and the seq is a real one.
+
+        Shared by `append` and `append_many` so the two cannot drift — an ingress that
+        could get a batch past a check a single append would have caught is exactly the
+        hole this protocol's dedupe depends on not existing.
+        """
+        if not origin:
+            raise ValueError("origin must be a non-empty name")
+        if origin == self.origin:
+            raise ValueError(
+                f"{origin!r} is this log's own origin and it allocates those seqs "
+                f"itself. A replicated append must arrive under its producer's own "
+                f"origin name — two producers sharing one name break the per-origin "
+                f"monotonicity that duplicate suppression depends on."
+            )
+        if seq is None:
+            raise ValueError(
+                f"a replicated append (origin {origin!r}) must carry the seq its "
+                f"producer assigned"
+            )
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise ValueError(f"seq must be an integer (got {seq!r})")
+        if seq < 1:
+            raise ValueError(
+                f"seq must be 1 or greater (got {seq!r}); starting at 1 keeps 0 below "
+                f"every real seq, as a safe comparison floor for a reader tracking what "
+                f"it has accepted"
+            )
+
     def append(
         self,
         actor: str,
@@ -270,27 +318,11 @@ class StimulusLog:
         Identity across nodes is `(origin, seq)`, never `id`.
         """
         origin = self.origin if origin is None else origin
-        if not origin:
-            raise ValueError("origin must be a non-empty name")
-        if origin == self.origin:
-            if seq is not None:
-                raise ValueError(
-                    f"{origin!r} is this log's own origin and it allocates those seqs "
-                    f"itself. A replicated append must arrive under its producer's own "
-                    f"origin name — two producers sharing one name break the per-origin "
-                    f"monotonicity that duplicate suppression depends on."
-                )
-        elif seq is None:
-            raise ValueError(
-                f"a replicated append (origin {origin!r}) must carry the seq its "
-                f"producer assigned"
-            )
-        elif seq < 1:
-            raise ValueError(
-                f"seq must be 1 or greater (got {seq!r}); starting at 1 keeps 0 below "
-                f"every real seq, as a safe comparison floor for a reader tracking what "
-                f"it has accepted"
-            )
+        # A local append is the one shape that carries no seq, because the allocator below
+        # supplies it. Everything else is somebody else's event and goes through the
+        # replicated contract.
+        if not (origin == self.origin and seq is None):
+            self._check_replicated(origin, seq)
 
         with self._append_lock:
             if seq is None:
@@ -324,6 +356,64 @@ class StimulusLog:
         # callback would deadlock it.
         self._notify(event)
         return event
+
+    def append_many(self, events: Iterable[StimulusEvent]) -> list[StimulusEvent]:
+        """Append a replicated batch, all of it or none of it.
+
+        The spec forbids a partial state the surrogate would have to reason about, so the
+        whole batch goes down under one `open`/`write`/`fsync`. That also makes a crash
+        mid-batch harmless in a way a per-event loop is not: the only line that can tear is
+        the last one, which `read_all` already recovers from, while an interior tear — the
+        one case it raises on — becomes unreachable.
+
+        Takes events as parsed off the wire and returns the ones actually written. `id` and
+        `appended_ts` are re-minted here, exactly as in `append`: identity across nodes is
+        `(origin, seq)`, never `id`. `ts` is the producer's own and is left alone.
+
+        Replication-shaped: every event must carry a foreign origin and a seq, and the whole
+        batch must come from one origin — the spec's batch is a contiguous seq range from
+        exactly one producer, and a batch spanning two would make one all-or-nothing write
+        span two dedupe streams. Validation happens before the lock, so a rejected batch
+        leaves nothing behind.
+        """
+        events = list(events)
+        if not events:
+            return []
+
+        origins = {event.origin for event in events}
+        if len(origins) != 1:
+            raise ValueError(
+                f"a batch must come from exactly one origin, got {sorted(origins)}"
+            )
+        for event in events:
+            self._check_replicated(event.origin, event.seq)
+
+        with self._append_lock:
+            appended_ts = datetime.now(timezone.utc)
+            ids = _id_run(int(appended_ts.timestamp() * 1000), len(events))
+            minted = [
+                StimulusEvent(
+                    id=id,
+                    ts=event.ts,
+                    actor=event.actor,
+                    type=event.type,
+                    content=event.content,
+                    origin=event.origin,
+                    seq=event.seq,
+                    appended_ts=appended_ts,
+                )
+                for id, event in zip(ids, events)
+            ]
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write("".join(event.to_json() + "\n" for event in minted))
+                f.flush()
+                os.fsync(f.fileno())
+
+        # Outside the lock, and only once the whole batch is durable: a listener must never
+        # see the first event of a batch while the last could still be lost.
+        for event in minted:
+            self._notify(event)
+        return minted
 
     def _notify(self, event: StimulusEvent) -> None:
         """Fan the event out to listeners, snapshotting the list so a listener may
