@@ -406,7 +406,9 @@ def test_an_empty_origin_is_rejected(tmp_path):
 
 
 def test_a_replicated_seq_below_one_is_rejected(tmp_path):
-    """0 is reserved to mean 'nothing seen yet' for a reader's high-water mark."""
+    """Starting at 1 keeps 0 below every real seq, so a reader tracking what it has
+    accepted has a safe comparison floor. ("Nothing seen yet" is its own answer, distinct
+    from 0 — see `HighWaterMarks.high_water`.)"""
     log = make_log(tmp_path)
 
     with pytest.raises(ValueError):
