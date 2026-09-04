@@ -473,7 +473,7 @@ class TestChronologicalOrdering:
                        content={"message": f"local {i}"}, ts=base + timedelta(minutes=i))
         log.append(actor="kitchen", type="observation",
                    content={"message": "backfill"},
-                   ts=base + timedelta(minutes=1, seconds=30),
+                   ts=base - timedelta(hours=1),
                    origin="kitchen-surrogate", seq=1)
 
         per_event = event_tokens(log)
@@ -483,7 +483,10 @@ class TestChronologicalOrdering:
 
         messages = [json.loads(line)["content"]["message"]
                     for line in assembled.recent_events.splitlines()]
-        # The backfill arrived last so the budget keeps it, and it happened at 16:01:30 —
-        # so it is emitted before events that were dropped for arriving earlier.
-        assert messages[0] == "backfill"
-        assert "local 0" not in messages
+        # The backfill arrived last so the budget keeps it, and it happened an hour before
+        # everything else — so `local 0` and `local 1`, dropped for arriving earliest, sit
+        # chronologically *between* the backfill and `local 2`. The window reads as
+        # continuous and is not. Under a drop-by-chronology policy this would instead be
+        # ["local 1", "local 2", "local 3", "local 4"], which is why the whole list is
+        # asserted rather than its first element.
+        assert messages == ["backfill", "local 2", "local 3", "local 4"]

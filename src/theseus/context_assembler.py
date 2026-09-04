@@ -235,8 +235,10 @@ class ContextAssembler:
         A consequence, once producers are skewed: what the budget drops is the
         earliest-*arrived*, while what it emits is ordered by when things happened — so a
         truncated window is not necessarily a clean chronological suffix. An event that
-        arrived early but happened late survives a cut that removes events which happened
-        before it, leaving a hole in the middle of a window that reads as continuous.
+        arrived late but happened early — a surrogate's backfill — survives
+        a cut that removes events which happened *after* it, so those dropped events sit
+        chronologically between the backfill and the rest of the window. The result reads
+        as continuous and is not.
         Dropping by chronology instead would remove the class entirely, at the cost of
         discarding a just-delivered backlog first; that is a live question, deliberately
         left to a follow-up because #28's scope is the emitted order alone.
