@@ -14,6 +14,7 @@ def make_log(tmp_path) -> StimulusLog:
     return StimulusLog(path=tmp_path / "stimulus_log.jsonl")
 
 
+# --- Listeners ------------------------------------------------------------------
 def test_subscribe_hands_each_appended_event_to_the_listener(tmp_path):
     log = make_log(tmp_path)
     seen = []
@@ -93,6 +94,25 @@ def test_listener_fires_on_the_appending_thread(tmp_path):
     assert threads == [appender]
 
 
+def test_a_listener_may_append_without_deadlocking(tmp_path):
+    """The append lock is released before listeners are notified, precisely so a listener
+    can append. This pins that boundary: move `_notify` inside the lock and this hangs."""
+    log = make_log(tmp_path)
+    echoed = []
+
+    def echo_once(event):
+        if event.type == "chat_message":
+            echoed.append(log.append(actor="tam", type="echo", content={}))
+
+    log.subscribe(echo_once)
+    log.append(actor="user", type="chat_message", content={})
+
+    assert [e.seq for e in log.read_all()] == [1, 2]
+    assert [e.type for e in log.read_all()] == ["chat_message", "echo"]
+    assert len(echoed) == 1
+
+
+# --- Event envelope -------------------------------------------------------------
 def _event(**overrides) -> StimulusEvent:
     fields = dict(
         id="01ABCDEFGHJKMNPQRSTVWXYZ0",
@@ -185,6 +205,7 @@ def test_envelope_fields_are_optional_so_existing_construction_sites_still_work(
     assert event.seq is None
 
 
+# --- Origin and seq allocation --------------------------------------------------
 def test_local_appends_get_a_monotonic_seq_starting_at_one(tmp_path):
     log = make_log(tmp_path)
 
@@ -317,6 +338,26 @@ def test_legacy_lines_read_back_with_the_logs_own_origin(tmp_path):
     assert event.appended_ts == event.ts
 
 
+def test_appending_to_a_log_of_pre_envelope_lines_starts_seq_at_one(tmp_path):
+    """The upgrade path every deployed agent takes: a log full of lines written before the
+    envelope existed, then a restart on this code. Those lines carry no seq, recovery skips
+    them, and numbering starts at 1 behind them — a gap, which the protocol permits."""
+    path = tmp_path / "stimulus_log.jsonl"
+    path.write_text(
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ0","ts":"2026-01-01T12:00:00+00:00",'
+        '"actor":"user","type":"chat_message","content":{}}\n'
+        '{"id":"01ABCDEFGHJKMNPQRSTVWXYZ1","ts":"2026-01-01T12:01:00+00:00",'
+        '"actor":"tam","type":"chat_message","content":{}}\n',
+        encoding="utf-8",
+    )
+    log = StimulusLog(path=path)
+
+    event = log.append(actor="user", type="chat_message", content={})
+
+    assert event.seq == 1
+    assert [e.seq for e in log.read_all()] == [None, None, 1]
+
+
 def test_concurrent_appends_never_reuse_a_seq(tmp_path):
     log = make_log(tmp_path)
     events: list[StimulusEvent] = []
@@ -350,6 +391,13 @@ def test_an_own_origin_append_may_not_carry_a_seq(tmp_path):
         )
 
 
+def test_a_log_cannot_be_configured_with_an_empty_origin(tmp_path):
+    """An origin is configuration, so the error belongs at construction rather than on the
+    first append."""
+    with pytest.raises(ValueError):
+        StimulusLog(path=tmp_path / "stimulus_log.jsonl", origin="")
+
+
 def test_an_empty_origin_is_rejected(tmp_path):
     log = make_log(tmp_path)
 
@@ -365,28 +413,3 @@ def test_a_replicated_seq_below_one_is_rejected(tmp_path):
         log.append(
             actor="user", type="chat_message", content={}, origin="android-01", seq=0
         )
-
-
-def test_a_listener_may_append_without_deadlocking(tmp_path):
-    """The append lock is released before listeners are notified, precisely so a listener
-    can append. This pins that boundary: move `_notify` inside the lock and this hangs."""
-    log = make_log(tmp_path)
-    echoed = []
-
-    def echo_once(event):
-        if event.type == "chat_message":
-            echoed.append(log.append(actor="tam", type="echo", content={}))
-
-    log.subscribe(echo_once)
-    log.append(actor="user", type="chat_message", content={})
-
-    assert [e.seq for e in log.read_all()] == [1, 2]
-    assert [e.type for e in log.read_all()] == ["chat_message", "echo"]
-    assert len(echoed) == 1
-
-
-def test_a_log_cannot_be_configured_with_an_empty_origin(tmp_path):
-    """An origin is configuration, so the error belongs at construction rather than on the
-    first append."""
-    with pytest.raises(ValueError):
-        StimulusLog(path=tmp_path / "stimulus_log.jsonl", origin="")

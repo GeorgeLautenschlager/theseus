@@ -83,7 +83,8 @@ class StimulusEvent:
     type: str            # "exchange" | "capture" | "observation" | ...
     content: dict[str, Any]  # type-specific payload; e.g. {"prompt":..,"response":..}
     origin: str = DEFAULT_ORIGIN  # where it entered the system; assigned by the producer
-    seq: int | None = None        # monotonic per origin. Not contiguous — gaps are legal.
+    seq: int | None = None        # monotonic per origin, not contiguous — gaps are legal.
+                                  # None only on a line written before the envelope existed.
     appended_ts: datetime | None = None  # when it landed on this log
 
     def __post_init__(self) -> None:
@@ -167,13 +168,13 @@ class StimulusLog:
     def __init__(
         self, path: str | os.PathLike[str], origin: str = DEFAULT_ORIGIN
     ) -> None:
+        if not origin:
+            # Configuration, so it fails before anything is created: an origin is the key
+            # everything downstream dedupes and routes on.
+            raise ValueError("origin must be a non-empty name")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
-        if not origin:
-            # Configuration, so it fails here rather than on the first append: an origin is
-            # the key everything downstream dedupes and routes on.
-            raise ValueError("origin must be a non-empty name")
         self.origin = origin
         self._listeners: list[Callable[[StimulusEvent], None]] = []
         self._listener_lock = threading.Lock()
@@ -248,6 +249,10 @@ class StimulusLog:
         log never allocates a seq on another producer's behalf, and never accepts one for
         its own origin — either would put two numbering authorities on one origin name and
         break the per-origin monotonicity that duplicate suppression depends on.
+
+        A replicated event is re-identified here: the id is minted from this log's
+        `appended_ts`, so the same event has a different id on the producer and on this log.
+        Identity across nodes is `(origin, seq)`, never `id`.
         """
         ts = ts or datetime.now(timezone.utc)
         origin = self.origin if origin is None else origin
