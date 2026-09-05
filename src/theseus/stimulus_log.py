@@ -415,12 +415,17 @@ class StimulusLog:
         the events it described are already committed. Local events are numbered here from
         this log's own counter; replicated ones keep the seq their producer assigned.
 
-        The one shape the log does police: at most one origin other than this log's own
-        may appear in a write. That is exactly what the wire allows — one surrogate's
-        range plus, sometimes, this host's own gap marker explaining a hole in it — so
-        the rule here is the wire rule as it looks after the marker is added; two foreign
-        origins mean a caller that never went through `replication_batch.parse_batch`'s
-        door.
+        Beyond the per-event contract `_check_replicated` applies, the one *batch-shaped*
+        rule the log polices is origins: at most one other than this log's own may appear
+        in a write. That is exactly what the wire allows — one surrogate's range plus,
+        sometimes, this host's own gap marker explaining a hole in it — so the rule here is
+        the wire rule as it looks after the marker is added; two foreign origins mean a
+        caller that never went through `replication_batch.parse_batch`'s door.
+
+        Whether the seqs ascend, repeat or leave holes is **not** checked here. That is the
+        wire protocol's business and `parse_batch` enforces it; restating it in the storage
+        layer would be a second, divergent copy of a rule in the layer least able to explain
+        a rejection.
         """
         events = list(events)
         if not events:
@@ -444,6 +449,13 @@ class StimulusLog:
         # door — the #31 surrogate side, a replay tool, a test — putting one all-or-nothing
         # fsync across two dedupe streams, which is a bug in that caller, not a wire
         # condition. It costs a set comprehension over a list already in hand.
+        #
+        # The argument is knowingly half-applied. "One fsync should not commit an ambiguous
+        # stream" bites just as hard on a repeated or descending seq *within* one origin,
+        # and those still go straight onto the tape from here. They are caught at the door
+        # instead, because ordering is the wire's rule to state and this layer could not
+        # explain a rejection of it; the origin case is kept because it is the one a caller
+        # bypassing the door gets wrong silently rather than loudly.
         #
         # This runs after the loop above, so every origin here is a non-empty string and the
         # sort cannot raise TypeError on a mixed None.
