@@ -8,6 +8,7 @@ import pytest
 from theseus.replication_batch import (
     DEFAULT_MAX_BATCH_BYTES,
     DEFAULT_MAX_BATCH_EVENTS,
+    NO_REASON_GIVEN,
     BatchRejected,
     parse_batch,
 )
@@ -34,8 +35,22 @@ def body(*lines: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+HOST = "local"
+
+
+def parse(text, **kwargs):
+    """`parse_batch` on behalf of a host whose own origin is `local`.
+
+    `host_origin` is required by the parser and is the same value in almost every test, so it
+    is defaulted here rather than repeated thirty times. A test that cares — the one about a
+    batch claiming the host's own name — passes it explicitly, and it still wins.
+    """
+    kwargs.setdefault("host_origin", HOST)
+    return parse_batch(text, **kwargs)
+
+
 def test_a_normal_batch_parses_into_events():
-    events = parse_batch(body(line(1), line(2), line(3)))
+    events = parse(body(line(1), line(2), line(3)))
 
     assert [e.seq for e in events] == [1, 2, 3]
     assert {e.origin for e in events} == {"kitchen-surrogate"}
@@ -43,26 +58,26 @@ def test_a_normal_batch_parses_into_events():
 
 
 def test_a_trailing_newline_is_optional():
-    assert len(parse_batch(line(1) + "\n" + line(2))) == 2
+    assert len(parse(line(1) + "\n" + line(2))) == 2
 
 
 def test_blank_lines_are_ignored():
     """A JSONL producer that ends with a blank line has not malformed anything."""
-    assert len(parse_batch(line(1) + "\n\n" + line(2) + "\n\n")) == 2
+    assert len(parse(line(1) + "\n\n" + line(2) + "\n\n")) == 2
 
 
 def test_an_empty_body_is_rejected():
     """Nothing to commit is not the same as a batch, and answering 2xx would advance the
     surrogate's cursor past events it never sent."""
     with pytest.raises(BatchRejected) as caught:
-        parse_batch("   \n\n")
+        parse("   \n\n")
 
     assert caught.value.status == 400
 
 
 def test_a_line_that_is_not_json_is_rejected():
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1), "{not json", line(3)))
+        parse(body(line(1), "{not json", line(3)))
 
     assert caught.value.status == 400
     assert "line 2" in caught.value.reason
@@ -70,7 +85,7 @@ def test_a_line_that_is_not_json_is_rejected():
 
 def test_a_line_missing_a_required_field_is_rejected():
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1).replace('"actor": "sensor", ', "")))
+        parse(body(line(1).replace('"actor": "sensor", ', "")))
 
     assert caught.value.status == 400
 
@@ -79,7 +94,7 @@ def test_a_line_without_a_seq_is_rejected():
     """Read-side validation: `replication_events` validates only what this node builds, so
     the ingress re-applies the rules to anything off the wire."""
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1, seq=None)))
+        parse(body(line(1, seq=None)))
 
     assert caught.value.status == 400
     assert "seq" in caught.value.reason
@@ -88,7 +103,7 @@ def test_a_line_without_a_seq_is_rejected():
 @pytest.mark.parametrize("seq", ["7", 0, -3, True, 1.5])
 def test_a_seq_that_is_not_a_positive_integer_is_rejected(seq):
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1, seq=seq)))
+        parse(body(line(1, seq=seq)))
 
     assert caught.value.status == 400
 
@@ -96,7 +111,7 @@ def test_a_seq_that_is_not_a_positive_integer_is_rejected(seq):
 @pytest.mark.parametrize("origin", [None, "", "   ", 42])
 def test_a_line_without_a_real_origin_is_rejected(origin):
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1, origin=origin)))
+        parse(body(line(1, origin=origin)))
 
     assert caught.value.status == 400
 
@@ -105,7 +120,7 @@ def test_a_batch_spanning_two_origins_is_rejected():
     """The brief's batch comes from exactly one producer. Two would make one
     all-or-nothing write span two dedupe streams."""
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1), line(2, origin="android-01")))
+        parse(body(line(1), line(2, origin="android-01")))
 
     assert caught.value.status == 400
     assert "one origin" in caught.value.reason
@@ -113,7 +128,7 @@ def test_a_batch_spanning_two_origins_is_rejected():
 
 def test_seqs_must_ascend():
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(2), line(1)))
+        parse(body(line(2), line(1)))
 
     assert caught.value.status == 400
     assert "ascending" in caught.value.reason
@@ -123,7 +138,7 @@ def test_a_repeated_seq_in_one_batch_is_rejected():
     """Two events claiming one seq makes the high-water mark ambiguous about which was
     committed."""
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1), line(1)))
+        parse(body(line(1), line(1)))
 
     assert caught.value.status == 400
 
@@ -132,14 +147,14 @@ def test_a_gap_inside_a_batch_is_accepted():
     """Deliberately *not* contiguous. A surrogate that evicted seqs under storage pressure
     holds a buffer with real holes; rejecting it would tell the surrogate to abandon data it
     still has, which is the opposite of what the abandon rule is for."""
-    events = parse_batch(body(line(1), line(2), line(90)))
+    events = parse(body(line(1), line(2), line(90)))
 
     assert [e.seq for e in events] == [1, 2, 90]
 
 
 def test_too_many_events_is_rejected():
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(*[line(n) for n in range(1, 5)]), max_events=3)
+        parse(body(*[line(n) for n in range(1, 5)]), max_events=3)
 
     assert caught.value.status == 413
     assert "3" in caught.value.reason
@@ -147,7 +162,7 @@ def test_too_many_events_is_rejected():
 
 def test_too_many_bytes_is_rejected():
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1), line(2)), max_bytes=50)
+        parse(body(line(1), line(2)), max_bytes=50)
 
     assert caught.value.status == 413
 
@@ -155,7 +170,7 @@ def test_too_many_bytes_is_rejected():
 def test_the_byte_limit_is_measured_on_the_encoded_body():
     """A limit that counted characters would let a multi-byte payload through at several
     times the size the host meant to accept."""
-    fat = parse_batch  # alias for readability
+    fat = parse  # alias for readability
     with pytest.raises(BatchRejected):
         fat(body(line(1, content={"m": "é" * 200})), max_bytes=300)
 
@@ -163,7 +178,7 @@ def test_the_byte_limit_is_measured_on_the_encoded_body():
 def test_limits_default_to_the_module_constants():
     assert DEFAULT_MAX_BATCH_EVENTS > 0
     assert DEFAULT_MAX_BATCH_BYTES > 0
-    assert len(parse_batch(body(line(1)))) == 1
+    assert len(parse(body(line(1)))) == 1
 
 
 def test_a_rejection_carries_a_reason_short_enough_to_record():
@@ -171,7 +186,7 @@ def test_a_rejection_carries_a_reason_short_enough_to_record():
     at `MAX_REASON_CHARS` and lands on a permanent tape."""
 
     with pytest.raises(BatchRejected) as caught:
-        parse_batch(body(line(1), "{not json"))
+        parse(body(line(1), "{not json"))
 
     assert 0 < len(caught.value.reason) <= MAX_REASON_CHARS
 
@@ -179,8 +194,8 @@ def test_a_rejection_carries_a_reason_short_enough_to_record():
 def test_bytes_and_str_bodies_behave_the_same():
     text = body(line(1), line(2))
 
-    assert [e.seq for e in parse_batch(text)] == [
-        e.seq for e in parse_batch(text.encode("utf-8"))
+    assert [e.seq for e in parse(text)] == [
+        e.seq for e in parse(text.encode("utf-8"))
     ]
 
 
@@ -194,7 +209,7 @@ def test_a_line_deep_enough_to_exhaust_the_stack_is_a_4xx_not_a_crash():
     assert len(body) < DEFAULT_MAX_BATCH_BYTES
 
     with pytest.raises(BatchRejected) as excinfo:
-        parse_batch(body)
+        parse(body)
 
     assert excinfo.value.status == 400
     assert "nests too deeply" in excinfo.value.reason
@@ -226,7 +241,7 @@ def test_a_line_separator_inside_a_value_does_not_split_the_line(separator):
     assert separator in wire  # the precondition: raw on the wire, not escaped
     assert len(wire.splitlines()) == 2  # and `splitlines` would indeed tear it
 
-    events = parse_batch(wire + "\n")
+    events = parse(wire + "\n")
 
     assert len(events) == 1
     assert events[0].content == {"message": message}
@@ -239,7 +254,7 @@ def test_a_body_that_is_not_utf8_is_rejected_rather_than_repaired():
     body = line(1).encode("utf-8").replace(b"sensor", b"sen\xffor")
 
     with pytest.raises(BatchRejected) as excinfo:
-        parse_batch(body)
+        parse(body)
 
     assert excinfo.value.status == 400
     assert "UTF-8" in excinfo.value.reason
@@ -249,7 +264,7 @@ def test_a_seq_above_the_ceiling_is_rejected():
     """A mark of 10**100 is not a counter; accepting it discards that origin's entire
     future, because nothing it ever sends again clears the high-water mark."""
     with pytest.raises(BatchRejected, match="ceiling"):
-        parse_batch(line(1, seq=10**100))
+        parse(line(1, seq=10**100))
 
 
 @pytest.mark.parametrize(
@@ -269,7 +284,7 @@ def test_the_rest_of_the_envelope_is_checked_too(overrides, expected):
     """`from_json` indexes these straight out of the parsed dict, so without a check they
     reach the tape as a `None` type or a dict id."""
     with pytest.raises(BatchRejected, match=expected):
-        parse_batch(line(1, **overrides))
+        parse(line(1, **overrides))
 
 
 def test_a_naive_ts_is_rejected_rather_than_read_in_the_hosts_zone():
@@ -277,30 +292,17 @@ def test_a_naive_ts_is_rejected_rather_than_read_in_the_hosts_zone():
     line, wrong for a surrogate elsewhere, and it moves the event hours from where it
     belongs in the Assembler's sort."""
     with pytest.raises(BatchRejected, match="no UTC offset"):
-        parse_batch(line(1, ts="2026-09-04T16:00:00"))
+        parse(line(1, ts="2026-09-04T16:00:00"))
 
 
 def test_a_batch_claiming_the_hosts_own_origin_is_a_4xx():
     """Without this it surfaces as a ValueError out of `append_many`, which the endpoint
     answers as a 5xx and the surrogate retries forever — a misconfiguration no retry fixes."""
     with pytest.raises(BatchRejected) as excinfo:
-        parse_batch(line(1, origin="local"), host_origin="local")
+        parse(line(1, origin="local"), host_origin="local")
 
     assert excinfo.value.status == 400
     assert "own origin" in excinfo.value.reason
-
-
-def test_host_origin_is_not_checked_unless_it_is_given():
-    assert len(parse_batch(line(1, origin="local"))) == 1
-
-
-def test_batch_rejected_refuses_a_status_outside_the_4xx_class():
-    """This exception *is* the do-not-retry signal. Raising it with a 5xx would tell the
-    surrogate to abandon a batch it should have retried, and nothing downstream could
-    catch it."""
-    for status in (200, 500, 503):
-        with pytest.raises(ValueError, match="4xx"):
-            BatchRejected(status, "whatever")
 
 
 def test_batch_rejected_marks_a_truncated_reason():
@@ -312,6 +314,147 @@ def test_batch_rejected_marks_a_truncated_reason():
     assert rejected.reason.endswith("…")
 
 
-def test_batch_rejected_refuses_an_empty_reason():
-    with pytest.raises(ValueError):
-        BatchRejected(400, "   ")
+MAX_CONTENT_DEPTH_BOUNDARY = 99  # the deepest `nested()` the parser must still accept
+
+
+def nested(depth: int) -> str:
+    """One line whose `content` holds a list nested `depth` deep.
+
+    `content` itself is level 1, so the innermost value sits at level `depth + 1` — which is
+    why the accepted/rejected boundary below lands on 99/100 rather than 100/101.
+    """
+    return line(1).replace(
+        '"content": {"n": 1}', '"content": {"m": ' + "[" * depth + "]" * depth + "}"
+    )
+
+
+def commit(body, tmp_path):
+    """Parse a body and append it, the way the ingress will.
+
+    Returns the rejection status, or None if the batch committed. Anything that is neither —
+    an exception escaping either call — fails the test, because that is the `5xx` the whole
+    module exists to prevent.
+    """
+    from theseus.stimulus_log import StimulusLog
+
+    log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+    try:
+        events = parse(body, host_origin=log.origin)
+    except BatchRejected as rejected:
+        return rejected.status
+    log.append_many(events)
+    return None
+
+
+# --- The contract: anything the parser accepts, the log can commit ---------------
+def test_a_lone_surrogate_in_content_is_a_4xx_not_a_crash(tmp_path):
+    """`\\ud800` is six ASCII characters on the wire, legal JSON grammar, and valid UTF-8 —
+    so it passes every field check. It has no UTF-8 encoding, so the log's own `to_json`
+    raises `UnicodeEncodeError` at write time. Escaping means the endpoint answers 500, the
+    surrogate reads that as transient, and it resends a 145-byte body forever."""
+    body = line(1).replace('"content": {"n": 1}', '"content": {"m": "\\ud800"}')
+
+    assert commit(body, tmp_path) == 400
+
+
+@pytest.mark.parametrize("depth", [9993, 9994, 9995])
+def test_the_band_where_dumps_gives_out_before_loads_is_a_4xx(tmp_path, depth):
+    """`json.loads` and `json.dumps` share one C-stack budget and do not spend it
+    identically, so there is a band — measured at 9993-9995, a 20 KB body under half a
+    percent of the byte limit — where the batch parses and the write raises. The older
+    deep-nesting test uses depth 20,000, past the band, which is how this survived."""
+    assert commit(nested(depth), tmp_path) == 400
+
+
+def test_content_at_the_depth_limit_is_accepted(tmp_path):
+    """The bound has to be a bound, not a wall a legitimate payload hits."""
+    assert commit(nested(MAX_CONTENT_DEPTH_BOUNDARY), tmp_path) is None
+
+
+def test_content_past_the_depth_limit_is_rejected_at_a_fixed_bound():
+    """Refused at a fixed depth rather than wherever CPython's stack happens to give out.
+    The stack limit moves with how much stack is left when the call happens, and a bound
+    that moves is not a bound a surrogate can be held to."""
+    with pytest.raises(BatchRejected, match="deeper than"):
+        parse(nested(MAX_CONTENT_DEPTH_BOUNDARY + 1))
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_a_non_finite_float_in_content_is_rejected(token, tmp_path):
+    """`json.loads` accepts these bare tokens and `json.dumps` re-emits them, so the line
+    lands on the tape as something no JSON reader outside Python will parse — forever, on an
+    append-only file. Python's own `read_all` round-trips it, which is what makes it
+    dangerous: nothing here would notice."""
+    body = line(1).replace('"content": {"n": 1}', '"content": {"m": ' + token + "}")
+
+    assert commit(body, tmp_path) == 400
+
+
+def test_everything_the_parser_accepts_can_actually_be_committed(tmp_path):
+    """The module's contract in one test. Each body below satisfies every field rule; the
+    ones that are unwritable must be rejected, and the ones that are writable must commit —
+    but nothing may escape either call."""
+    bodies = [
+        line(1),
+        nested(5),
+        nested(MAX_CONTENT_DEPTH_BOUNDARY),
+        nested(MAX_CONTENT_DEPTH_BOUNDARY + 1),
+        nested(9994),
+        nested(20_000),
+        line(1).replace('"content": {"n": 1}', '"content": {"m": "\\ud800"}'),
+        line(1).replace('"content": {"n": 1}', '"content": {"m": NaN}'),
+    ]
+
+    outcomes = [commit(body, tmp_path / str(n)) for n, body in enumerate(bodies)]
+
+    assert outcomes == [None, None, None, 400, 400, 400, 400, 400]
+
+
+# --- host_origin is not optional ------------------------------------------------
+def test_host_origin_is_required():
+    """There is no caller for whom "do not check" is the right answer. Optional, it was one
+    forgotten keyword argument away from the 5xx-retry-forever it exists to prevent."""
+    with pytest.raises(TypeError):
+        parse_batch(body(line(1)))
+
+
+# --- The origin has to be the name it looks like --------------------------------
+@pytest.mark.parametrize("origin", [" local ", "local ", " local", "\tlocal"])
+def test_an_origin_padded_with_whitespace_is_rejected(origin):
+    """Rejected rather than trimmed: trimming silently rewrites the name a producer chose,
+    and accepting it as-is files those events under a second origin that reads identically
+    to the first everywhere a human looks — on a permanent tape. It also walks straight past
+    the host-origin guard, since `" local "` is not `"local"`."""
+    with pytest.raises(BatchRejected, match="whitespace"):
+        parse(line(1, origin=origin), host_origin="local")
+
+
+# --- The body itself ------------------------------------------------------------
+def test_a_body_that_is_neither_text_nor_bytes_is_a_4xx():
+    """`bytearray` has no `.encode`. A caller-shape mistake, but one that would otherwise
+    escape as an `AttributeError` before any try block."""
+    with pytest.raises(BatchRejected, match="not usable text or bytes"):
+        parse(bytearray(line(1), "utf-8"))
+
+
+def test_a_str_body_carrying_a_lone_surrogate_is_a_4xx():
+    with pytest.raises(BatchRejected, match="not usable text or bytes"):
+        parse(line(1).replace("sensor", "sen\ud800or"))
+
+
+# --- Constructing the do-not-retry signal must not fail -------------------------
+def test_batch_rejected_replaces_an_unusable_reason_rather_than_raising():
+    """A reason comes from data, and this exception is the signal that stops a poison batch.
+    Raising while constructing it would escape as the 500 that creates one. Losing a little
+    information in a case that should not arise beats losing the channel in one that might."""
+    assert BatchRejected(400, "   ").reason == NO_REASON_GIVEN
+    assert BatchRejected(400, None).reason == NO_REASON_GIVEN
+    assert BatchRejected(400, 7).reason == NO_REASON_GIVEN
+
+
+def test_batch_rejected_still_refuses_a_status_outside_the_4xx_class():
+    """The status is the opposite case: it is a literal at every call site, so a wrong one
+    is a programmer error that must be loud rather than data that must be tolerated."""
+    for status in (200, 500, 503):
+        with pytest.raises(ValueError, match="4xx"):
+            BatchRejected(status, "whatever")
