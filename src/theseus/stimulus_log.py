@@ -415,10 +415,12 @@ class StimulusLog:
         the events it described are already committed. Local events are numbered here from
         this log's own counter; replicated ones keep the seq their producer assigned.
 
-        The log does not police batch shape beyond that. Whether the seqs ascend, repeat,
-        or come from one producer is the wire protocol's business and is enforced at the
-        door by `replication_batch.parse_batch` — restating it here would be a second,
-        divergent copy of a rule in the layer least able to explain a rejection.
+        The one shape the log does police: at most one origin other than this log's own
+        may appear in a write. That is exactly what the wire allows — one surrogate's
+        range plus, sometimes, this host's own gap marker explaining a hole in it — so
+        the rule here is the wire rule as it looks after the marker is added; two foreign
+        origins mean a caller that never went through `replication_batch.parse_batch`'s
+        door.
         """
         events = list(events)
         if not events:
@@ -433,6 +435,24 @@ class StimulusLog:
             # crash between them loses the explanation.
             if not (event.origin == self.origin and event.seq is None):
                 self._check_replicated(event.origin, event.seq)
+
+        # At most one origin other than this log's own. The spec's wire batch is one
+        # origin's range, and `parse_batch` enforces that at the door; what reaches here is
+        # that batch plus, sometimes, this host's own gap marker explaining a hole in it. So
+        # the rule the *storage* layer holds is the wire rule as it looks after the marker
+        # is added. Two foreign origins in one write is a caller that never went through the
+        # door — the #31 surrogate side, a replay tool, a test — putting one all-or-nothing
+        # fsync across two dedupe streams, which is a bug in that caller, not a wire
+        # condition. It costs a set comprehension over a list already in hand.
+        #
+        # This runs after the loop above, so every origin here is a non-empty string and the
+        # sort cannot raise TypeError on a mixed None.
+        foreign = {event.origin for event in events if event.origin != self.origin}
+        if len(foreign) > 1:
+            raise ValueError(
+                f"a batch may carry at most one origin beside this log's own "
+                f"({self.origin!r}), got {sorted(foreign)}"
+            )
 
         with self._append_lock:
             appended_ts = datetime.now(timezone.utc)

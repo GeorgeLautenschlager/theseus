@@ -156,7 +156,7 @@ def batch_rejected(
         "from_seq": from_seq,
         "to_seq": to_seq,
         "status": status,
-        "reason": _clean_reason(reason),
+        "reason": clean_reason(reason),
     }
 
 
@@ -221,7 +221,7 @@ def _utc_span(span_start: datetime, span_end: datetime) -> tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
-def _clean_reason(reason: str) -> str:
+def clean_reason(reason: str) -> str:
     """The host's stated reason: stripped, and bounded per `MAX_REASON_CHARS`.
 
     An over-long reason is marked where it was cut. This is an evidentiary event — a

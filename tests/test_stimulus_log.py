@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import threading
@@ -648,3 +649,52 @@ def test_append_many_does_not_disturb_the_local_counter(tmp_path):
     log.append_many([_replicated(90), _replicated(91)])
 
     assert log.append(actor="george", type="exchange", content={}).seq == 2
+
+
+def test_append_many_rejects_two_foreign_origins(tmp_path):
+    """One all-or-nothing fsync must not span two dedupe streams. `parse_batch` enforces
+    the wire's one-origin rule at the door, but a caller that never goes through the door —
+    the surrogate side, a replay tool, a test — would put both streams in one write."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError, match="at most one origin"):
+        log.append_many([_replicated(1), _replicated(1, origin="android-01")])
+
+    assert log.read_all() == []
+
+
+def test_append_many_rolls_back_a_write_that_dies_part_way(tmp_path, monkeypatch):
+    """The failure this guards is not a crash — a crash can only tear the final line, which
+    `read_all` drops. It is an exception mid-write, ENOSPC being the realistic one: the
+    prefix is committed, the file ends mid-line, and the *next* successful append
+    concatenates onto that stump and turns it into an interior corrupt record. `read_all`
+    raises on those by design and forever, and `HighWaterMarks` derives itself by reading
+    the whole log — so the agent never boots again."""
+    log = make_log(tmp_path)
+    log.append(actor="george", type="exchange", content={"message": "first"})
+    committed = log.path.stat().st_size
+
+    real_open = open
+
+    class TornWriter(io.TextIOWrapper):
+        """Commits a prefix, then dies the way ENOSPC does."""
+
+        def write(self, s):
+            super().write(s[: len(s) // 3])
+            super().flush()
+            raise OSError(28, "No space left on device")
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        if "a" in mode:
+            return TornWriter(real_open(path, "ab"), encoding="utf-8")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    with pytest.raises(OSError):
+        log.append_many([_replicated(1), _replicated(2), _replicated(3)])
+    monkeypatch.undo()
+
+    assert log.path.stat().st_size == committed
+    assert len(log.read_all()) == 1
+    log.append(actor="george", type="exchange", content={"message": "later"})
+    assert len(log.read_all()) == 2  # not a permanently unreadable log
