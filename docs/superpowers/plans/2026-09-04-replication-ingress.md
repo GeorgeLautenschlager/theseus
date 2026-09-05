@@ -1179,12 +1179,6 @@ the module's imports. Add `from theseus.replication_events import MAX_REASON_CHA
 `from theseus.stimulus_log import StimulusEvent`. Keep every existing test. Add:
 
 ```python
-# The three characters `str.splitlines()` breaks on that `\n` does not: LINE SEPARATOR,
-# PARAGRAPH SEPARATOR, NEXT LINE. Written as escapes so this file cannot itself be torn by
-# a tool that splits on them.
-LINE_SEPARATORS = ["\u2028", "\u2029", "\u0085"]
-
-
 def test_a_line_deep_enough_to_exhaust_the_stack_is_a_4xx_not_a_crash():
     """20,000 levels is 40 KB — one percent of the byte limit — and `json.loads` recurses
     once per level. `RecursionError` is not a `ValueError`, so it is not a `JSONDecodeError`
@@ -1201,24 +1195,19 @@ def test_a_line_deep_enough_to_exhaust_the_stack_is_a_4xx_not_a_crash():
     assert "nests too deeply" in excinfo.value.reason
 
 
-@pytest.mark.parametrize("separator", LINE_SEPARATORS)
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\u0085"])
 def test_a_line_separator_inside_a_value_does_not_split_the_line(separator):
-    """`StimulusEvent.to_json` serialises with `ensure_ascii=False`, so a Theseus surrogate
-    puts these on the wire raw. `splitlines()` breaks on all three; `split("\\n")` does not.
-    Rejecting one would be a 400 — do not retry — so a transcript containing a line
-    separator would be discarded permanently and only for that content."""
+    """Not hypothetical: the line is built by the same `to_json` a Theseus surrogate runs.
+    It serialises with `ensure_ascii=False`, so these three reach the wire raw, and
+    `str.splitlines()` breaks on all three where `split("\\n")` does not. Tearing one line
+    into two invalid halves answers 400 — do not retry — so a transcript containing a line
+    separator would be discarded permanently, silently, and only for that content.
+
+    The body must come from `to_json`, **not** from this module's `line()` helper:
+    `json.dumps` defaults to `ensure_ascii=True` and would escape the separator, leaving
+    nothing for `splitlines` to split — and the test would then pass against its own
+    reverted fix, which is worse than not having it."""
     message = f"before{separator}after"
-    body = line(1, content={"message": message})
-
-    events = parse_batch(body)
-
-    assert len(events) == 1
-    assert events[0].content == {"message": message}
-
-
-def test_the_separator_case_is_reachable_from_theseuss_own_serialiser():
-    """Not hypothetical: this is a round trip through the code a surrogate actually runs."""
-    message = "one\u2028two"
     event = StimulusEvent(
         id="01PRODUCERID00000000000001",
         ts=datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc),
@@ -1229,9 +1218,13 @@ def test_the_separator_case_is_reachable_from_theseuss_own_serialiser():
         seq=1,
     )
     wire = event.to_json()
-    assert "\u2028" in wire  # raw on the wire, not escaped
+    assert separator in wire  # the precondition: raw on the wire, not escaped
+    assert len(wire.splitlines()) == 2  # and `splitlines` would indeed tear it
 
-    assert parse_batch(wire + "\n")[0].content == {"message": message}
+    events = parse_batch(wire + "\n")
+
+    assert len(events) == 1
+    assert events[0].content == {"message": message}
 
 
 def test_a_body_that_is_not_utf8_is_rejected_rather_than_repaired():
@@ -1380,7 +1373,7 @@ for the restored run, and put both in the report:
 | Revert | Tests that must fail |
 |---|---|
 | `_loads` back to a plain `json.loads` in a `try/except json.JSONDecodeError` | the deep-nesting test |
-| `split("\n")` back to `splitlines()` | the three separator cases + the serialiser round-trip |
+| `split("\n")` back to `splitlines()` | the three separator cases |
 | `decode("utf-8")` back to `decode("utf-8", errors="replace")` | the not-UTF-8 test |
 | drop the `MAX_SEQ` branch | the ceiling test |
 | drop the `_check_envelope` call | the eight envelope cases + the naive-ts test |
