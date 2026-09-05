@@ -21,6 +21,7 @@ Pure: no I/O, no log, no marks, no FastAPI. The endpoint is the only thing that 
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from typing import Any
 
@@ -40,9 +41,20 @@ DEFAULT_MAX_BATCH_BYTES = 4 * 1024 * 1024
 # and it is beyond any producer that increments once per event.
 MAX_SEQ = 2**63 - 1
 
+# How deep a `content` payload may nest. This is a protocol limit deliberately far below the
+# depth anything here actually breaks at, because the depth it breaks at is not a contract:
+# `json`'s own limit is a C-stack guard, so it moves with how much stack is left when the
+# call happens, and a bound that moves is a bound a surrogate cannot be held to. A chat
+# message, a tool result and a sensor capture are all a handful of levels deep; 100 is
+# generous for every one of them and small enough to be checked without recursing.
+MAX_CONTENT_DEPTH = 100
+
 # The envelope fields that must be present, non-empty strings on the wire. `origin` and
 # `seq` are checked separately, with reasons of their own.
 _REQUIRED_STRINGS = ("id", "actor", "type")
+
+# What a rejection says when its reason is unusable. See `_safe_reason`.
+NO_REASON_GIVEN = "rejected (no reason given)"
 
 
 class BatchRejected(Exception):
@@ -52,9 +64,13 @@ class BatchRejected(Exception):
     copy onto its own tape — so the reason is written for that reader, and bounded by the
     same rule `replication_events` bounds a declared reason with, marked where it was cut.
 
-    The status is checked because this exception *is* the protocol's "do not retry" signal:
-    raising it with a `5xx` would tell the surrogate to abandon a batch it should have
-    retried, and there is no later layer that could catch the mistake.
+    Two rules pull in opposite directions here and are resolved deliberately. The status is
+    *checked*, and constructing this with a `5xx` raises: that is a programmer error at a
+    call site, every call site passes a literal, and a `5xx` smuggled into the do-not-retry
+    signal would tell a surrogate to abandon a batch it should have retried. The reason is
+    *not* checked, and an unusable one is replaced rather than rejected: a reason comes from
+    data, and an exception raised while building the signal that prevents a poison batch
+    would itself be the 500 that makes one.
     """
 
     def __init__(self, status: int, reason: str) -> None:
@@ -67,16 +83,16 @@ class BatchRejected(Exception):
                 f"BatchRejected is the 4xx class; {status!r} is not a 4xx status"
             )
         self.status = status
-        self.reason = clean_reason(reason)
+        self.reason = _safe_reason(reason)
         super().__init__(f"{status}: {self.reason}")
 
 
 def parse_batch(
     body: str | bytes,
     *,
+    host_origin: str,
     max_events: int = DEFAULT_MAX_BATCH_EVENTS,
     max_bytes: int = DEFAULT_MAX_BATCH_BYTES,
-    host_origin: str | None = None,
 ) -> list[StimulusEvent]:
     """Parse a JSONL replication body into events, or raise `BatchRejected`.
 
@@ -89,14 +105,24 @@ def parse_batch(
     with a `4xx` would tell it to abandon data it still has — the opposite of what the
     abandon rule is for. Ascending is what ordering and the dedupe straddle actually need.
 
-    `host_origin`, when given, is this log's own origin name, and a batch claiming it is
-    rejected here. A surrogate misconfigured with the host's name puts two numbering
-    authorities on one seq stream, which is unfixable by retrying and so belongs in the
-    `4xx` class — without this it would surface further down as an unhandled `ValueError`
-    out of `append_many`, which the endpoint would answer as a `5xx` and the surrogate would
-    retry forever.
+    `host_origin` is this log's own origin name, and a batch claiming it is rejected here. It
+    is required rather than optional because there is no caller for whom "do not check" is
+    the right answer: a surrogate misconfigured with the host's name puts two numbering
+    authorities on one seq stream, and without this check it surfaces further down as an
+    unhandled `ValueError` out of `append_many`, which the endpoint answers as a `5xx` and
+    the surrogate retries forever. An optional guard against that would be one forgotten
+    keyword argument away from the failure it prevents.
+
+    **The contract this module owes the ingress: anything it accepts, the log can commit.**
+    Validating the envelope is not enough on its own — a body can satisfy every field rule
+    and still be unwritable, and the failure then lands past this module as a `5xx`. So the
+    last thing each line goes through is the serialisation the log will actually perform.
     """
-    raw = body if isinstance(body, bytes) else body.encode("utf-8")
+    try:
+        raw = body if isinstance(body, bytes) else body.encode("utf-8")
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise BatchRejected(400, f"batch body is not usable text or bytes: {exc}") from exc
+
     if len(raw) > max_bytes:
         raise BatchRejected(
             413, f"batch is {len(raw)} bytes, over the {max_bytes} byte limit"
@@ -140,9 +166,10 @@ def parse_batch(
 
 
 def _parse_line(number: int, text: str) -> StimulusEvent:
-    """Validate the wire values *before* building an event from them.
+    """Validate the wire values *before* building an event from them, and the event before
+    returning it.
 
-    This ordering is the point of the module, not an accident. `StimulusEvent.from_json`
+    The first ordering is the point of the module, not an accident. `StimulusEvent.from_json`
     is generous by design — it coerces an absent or empty `origin` to the reading log's own
     origin, because that is the right reading for a line this node wrote before the envelope
     existed. Applied to an untrusted body it would turn a surrogate's missing origin into
@@ -158,9 +185,27 @@ def _parse_line(number: int, text: str) -> StimulusEvent:
     _check_envelope(number, raw)
 
     try:
-        return StimulusEvent.from_json(text)
+        event = StimulusEvent.from_json(text)
+        # The writability round-trip, and the reason this function's contract is "the log can
+        # commit this" rather than "the fields look right". Two things reach here having
+        # satisfied every field rule and still cannot be written:
+        #
+        #   - a lone surrogate escape (`"\ud800"`), which is six ASCII bytes on the wire and
+        #     legal JSON grammar, but has no UTF-8 encoding — `UnicodeEncodeError`;
+        #   - a `content` deep enough that `json.dumps` gives out where `json.loads` did not,
+        #     a band that exists because the two share one C-stack budget and do not spend it
+        #     identically — `RecursionError`.
+        #
+        # Both were reproduced escaping this module as unhandled exceptions, at 145 bytes and
+        # 20 KB respectively. Unhandled means the endpoint answers `5xx`, which a surrogate
+        # reads as transient, so it resends the one batch that can never succeed while
+        # everything behind it waits. Doing the log's own serialisation here converts both
+        # into the `4xx` they always were. It costs one extra serialisation per line, which
+        # is the cheapest possible price for the module's central promise.
+        event.to_json().encode("utf-8")
     except (KeyError, ValueError, TypeError, RecursionError) as exc:
         raise BatchRejected(400, f"line {number} is not a usable event: {exc}") from exc
+    return event
 
 
 def _loads(number: int, text: str) -> Any:
@@ -190,6 +235,16 @@ def _check_origin(number: int, origin: Any) -> None:
         raise BatchRejected(
             400, f"line {number} has no usable origin (got {origin!r})"
         )
+    if origin != origin.strip():
+        # Rejected rather than trimmed. Trimming would silently rewrite the name a producer
+        # chose; accepting it as-is files those events under a second origin that reads
+        # identically to the first everywhere a human looks, on a permanent tape — and it
+        # walks straight past the host-origin guard below, since `" local "` is not `"local"`.
+        raise BatchRejected(
+            400,
+            f"line {number} has an origin padded with whitespace ({origin!r}); it would "
+            f"stand beside its own trimmed name as a second, indistinguishable stream",
+        )
 
 
 def _check_seq(number: int, seq: Any) -> None:
@@ -216,6 +271,11 @@ def _check_envelope(number: int, raw: dict[str, Any]) -> None:
     `"id": {}` becomes an event with a `None` type or a dict id, appended to the tape and
     read back by everything downstream. None of that is fixable by resending, so it is a
     `4xx` and not something to discover later in the Assembler.
+
+    `id` is validated and then discarded — `append_many` re-mints it, because identity across
+    nodes is `(origin, seq)` and never `id`. That is deliberate: this module states the wire
+    contract a non-Python surrogate must satisfy, and a field the host happens not to keep is
+    still a field a producer must send correctly if the two are to agree on the format.
     """
     for field in _REQUIRED_STRINGS:
         value = raw.get(field)
@@ -228,7 +288,48 @@ def _check_envelope(number: int, raw: dict[str, Any]) -> None:
         raise BatchRejected(
             400, f"line {number} has a non-object content (got {content!r})"
         )
+    _check_content(number, content)
     _check_ts(number, raw.get("ts"))
+
+
+def _check_content(number: int, content: dict[str, Any]) -> None:
+    """One walk over `content`, for two things `json.loads` accepts and the tape should not
+    keep.
+
+    **Depth.** Nesting past `MAX_CONTENT_DEPTH` is refused here, at a fixed bound, rather
+    than being left to whichever of `json.loads` and `json.dumps` gives out first. Those two
+    share one C-stack budget and do not spend it identically, so there is a band — measured
+    at depths 9993 to 9995, a 20 KB body — where the load succeeds and the write raises. The
+    writability round-trip in `_parse_line` catches that band, but only by accident of stack
+    depth, and an accident is not something a surrogate can be held to. This bound is.
+
+    **Non-finite floats.** `json.loads` accepts the bare `NaN` and `Infinity` tokens, and
+    `json.dumps` re-emits them, so the line lands on the tape as something no JSON reader
+    outside Python will parse — forever, on an append-only file. Python's own `read_all`
+    round-trips it, which is what makes it dangerous: nothing here would notice, and the
+    export tool or the non-Python surrogate that eventually chokes has no way back.
+
+    Iterative on purpose: a recursive check on deeply nested input would be one more thing
+    that raises `RecursionError` in the middle of deciding whether something is too deep.
+    """
+    stack: list[tuple[Any, int]] = [(content, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if depth > MAX_CONTENT_DEPTH:
+            raise BatchRejected(
+                400,
+                f"line {number} nests content deeper than {MAX_CONTENT_DEPTH} levels",
+            )
+        if isinstance(value, dict):
+            stack.extend((item, depth + 1) for item in value.values())
+        elif isinstance(value, list):
+            stack.extend((item, depth + 1) for item in value)
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise BatchRejected(
+                400,
+                f"line {number} carries {value} in content; it is not JSON any reader "
+                f"outside Python can parse, and the tape is append-only",
+            )
 
 
 def _check_ts(number: int, ts: Any) -> None:
@@ -254,13 +355,13 @@ def _check_ts(number: int, ts: Any) -> None:
         )
 
 
-def _check_one_origin(events: list[StimulusEvent], host_origin: str | None) -> None:
+def _check_one_origin(events: list[StimulusEvent], host_origin: str) -> None:
     origins = sorted({event.origin for event in events})
     if len(origins) != 1:
         raise BatchRejected(
             400, f"a batch must come from one origin, got {origins}"
         )
-    if host_origin is not None and origins[0] == host_origin:
+    if origins[0] == host_origin:
         raise BatchRejected(
             400,
             f"batch claims this host's own origin ({host_origin!r}); a surrogate must send "
@@ -275,3 +376,19 @@ def _check_ascending(events: list[StimulusEvent]) -> None:
                 400,
                 f"seqs must be ascending; {later.seq} follows {earlier.seq}",
             )
+
+
+def _safe_reason(reason: Any) -> str:
+    """`clean_reason`, made incapable of failing.
+
+    `clean_reason` raises on an empty or non-string reason, which is right where it is used —
+    a marker this node builds with no reason in it is a bug worth stopping for. It is wrong
+    here. A reason reaching `BatchRejected` came from data, and this exception is the signal
+    that stops a poison batch: an exception raised while constructing it would escape as the
+    `500` that creates one. Substituting a placeholder loses a little information in a case
+    that should not arise; raising loses the channel in a case that might.
+    """
+    try:
+        return clean_reason(reason)
+    except (ValueError, TypeError):
+        return NO_REASON_GIVEN
