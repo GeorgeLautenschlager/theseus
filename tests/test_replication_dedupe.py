@@ -26,22 +26,30 @@ def event(seq: int, *, origin: str = SURROGATE, ts: datetime | None = None) -> S
     )
 
 
-def gap_event(seq: int, from_seq: int, to_seq: int, *, origin: str = SURROGATE):
-    """A gap the surrogate declared about its own stream, as it arrives in a batch."""
+def gap_event(seq: int, from_seq: int, to_seq: int, *, about: str = SURROGATE):
+    """A gap the surrogate declared, as it arrives in a batch.
+
+    `about` is the origin named in the marker's *content* — whose stream it claims to
+    describe. That is a separate thing from the envelope origin, which is always the
+    surrogate that sent the marker, and the two must not be conflated: a batch's events all
+    carry one envelope origin by the time they reach the planner, while a marker inside it
+    can claim to be about anybody. Telling those apart is exactly what `_declared_in`'s
+    origin comparison is for.
+    """
     return StimulusEvent(
         id=f"01PRODUCERID{seq:014d}",
         ts=BASE + timedelta(seconds=seq),
         actor="sensor",
         type=GAP,
         content=declared_gap(
-            origin=origin,
+            origin=about,
             from_seq=from_seq,
             to_seq=to_seq,
             reason="storage_pressure",
             span_start=BASE,
             span_end=BASE + timedelta(minutes=1),
         ),
-        origin=origin,
+        origin=SURROGATE,
         seq=seq,
     )
 
@@ -161,7 +169,7 @@ def test_a_declared_gap_covering_only_part_of_the_hole_does_not_silence_the_host
 
 
 def test_a_declared_gap_about_another_origin_does_not_silence_the_host():
-    result = plan([gap_event(10, 6, 9, origin="android-01"), event(11)], high_water=5)
+    result = plan([gap_event(10, 6, 9, about="android-01"), event(11)], high_water=5)
 
     assert result.inferred_hole == (6, 9)
 
