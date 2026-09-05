@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -23,7 +24,6 @@ def line(n: int, origin: str = "kitchen-surrogate", **overrides) -> str:
         "seq": n,
     }
     fields.update(overrides)
-    import json
 
     return json.dumps(fields)
 
