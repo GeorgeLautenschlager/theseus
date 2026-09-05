@@ -791,3 +791,612 @@ Written as each predecessor lands. The dedupe planner and the endpoint depend on
 Tasks 1 and 2 settle, and this plan deliberately does not embed source for modules that review
 rounds will change — the previous branch's plan had to be marked superseded for exactly that
 reason.
+
+---
+
+### Task 2 fix round (#30): close the two poison-batch holes, and settle where the one-origin rule lives
+
+Two reviewers reached opposite conclusions about `append_many`'s one-origin check. This task
+resolves that, and closes the review findings against `replication_batch.py`.
+
+#### The origin rule: where it lives, and in what form
+
+Task 1's reviewer said remove it from `append_many` (it blocks the legitimate mixed write, and
+`parse_batch` already guards the wire). Task 2's reviewer said keep it (one all-or-nothing fsync
+must not span two dedupe streams, and a future non-wire caller — the #31 surrogate side, a replay
+tool, a test — routes around `parse_batch` entirely). The fix round removed it outright, which
+takes the first reviewer's side without answering the second's objection.
+
+The spec settles it. Line 161: *"Batch: a contiguous `seq` range from exactly one `origin`."* That
+is a **wire** rule, and `parse_batch` owns it — including "contiguous", which the parser has
+deliberately relaxed to "ascending" for a reason it documents. But `append_many` is not handed the
+wire batch; it is handed the wire batch **plus the host's own gap marker**. So the storage layer's
+invariant is that same rule as it looks after the host adds its marker:
+
+> **At most one origin other than this log's own, per batch.**
+
+That permits exactly the case both reviewers agreed must work, keeps a two-line tripwire for
+callers that never touch the wire, and restates none of the ordering rules that genuinely belong at
+the door. Two foreign origins in one `append_many` is a caller bug, not a wire condition, and the
+storage layer naming both origins is a perfectly good explanation of a caller bug.
+
+#### The two Criticals, measured
+
+Both were reproduced against `a6e6332` before this task was written.
+
+**1. `RecursionError` escapes `parse_batch`.** Only `json.JSONDecodeError` is caught, and
+`json.loads` recurses:
+
+```
+depth   1000 (   2185 bytes, 0.05% of limit): accepted
+depth   5000 (  10185 bytes, 0.24% of limit): accepted
+depth  20000 (  40185 bytes, 0.96% of limit): !!! UNHANDLED RecursionError
+depth 100000 ( 200185 bytes, 4.77% of limit): !!! UNHANDLED RecursionError
+```
+
+40 KB — one percent of the byte limit — escapes as an unhandled exception. Task 4 would answer
+`500`, the surrogate reads `5xx` as transient, and it retries that batch forever while everything
+behind it waits. That is precisely the poison batch the `4xx` class exists to prevent.
+
+**2. `splitlines()` splits well-formed lines.** `StimulusEvent.to_json` uses
+`ensure_ascii=False`, so a Theseus surrogate emits U+2028 / U+2029 / U+0085 raw inside string
+values, and `str.splitlines()` breaks on all three. Verified end to end, building the line with
+Theseus's own serialiser:
+
+```
+to_json emits U+2028 raw: True
+U+2028 in content: BatchRejected 400: line 1 is not JSON: Unterminated string starting at ...
+U+0085 in content: BatchRejected 400: line 1 is not JSON: Unterminated string starting at ...
+```
+
+A `400` means *do not retry*. So any transcript containing a line separator — pasted text, a
+Windows-authored file, an LLM's own output — makes the host permanently discard a well-formed
+batch. Silent, permanent, content-triggered data loss. `split("\n")` is the only correct split for
+JSONL, because `\n` is the only separator the format defines.
+
+#### The Importants, also measured
+
+```
+seq = 10**100:  ACCEPTED     -> poisons that origin's high-water mark forever
+content = null: ACCEPTED     -> content is typed dict[str, Any]
+type = null:    ACCEPTED
+id = {}:        ACCEPTED
+naive ts:       ACCEPTED     -> coerced to the *host's local zone* (EDT), not UTC
+invalid utf-8:  ACCEPTED     -> the replacement character written to the tape
+```
+
+The naive-`ts` case is worse than "silently coerced": `_aware` attaches the **host's** zone, which
+is the right reading for an old local line and the wrong one for a surrogate in another zone — it
+shifts the event by hours in the Assembler's chronological sort. The wire format is fully
+specified, so a `ts` without an offset is a producer bug and is unfixable by retrying.
+
+`errors="replace"` is the same shape of mistake: a body that is not UTF-8 will never become UTF-8
+by being sent again, and substituting the replacement character writes corruption onto an
+append-only tape that nothing later can distinguish from content.
+
+#### Changes
+
+**a. `src/theseus/replication_events.py` — promote `_clean_reason` to `clean_reason`.**
+
+Rename the function and its call sites within that module. Nothing else changes. It is promoted
+because a second module now needs the identical rule: `BatchRejected.reason` is copied verbatim
+onto the surrogate's tape by a `replication.batch_rejected` marker, so it is the same value class,
+and it must be bounded the same way — marked where it was cut, so a reader can tell "the host said
+exactly this" from "the host said this and more".
+
+**b. `src/theseus/stimulus_log.py` — restore the narrowed invariant in `append_many`.**
+
+Keep everything `9a7fb11` did (the mixed batch, `_next_local_seq`, `_write_durably`). Add the
+foreign-origin check **after** the per-event validation loop and before the lock:
+
+```python
+        # At most one origin other than this log's own. The spec's wire batch is one
+        # origin's range, and `parse_batch` enforces that at the door; what reaches here is
+        # that batch plus, sometimes, this host's own gap marker explaining a hole in it. So
+        # the rule the *storage* layer holds is the wire rule as it looks after the marker
+        # is added. Two foreign origins in one write is a caller that never went through the
+        # door — the #31 surrogate side, a replay tool, a test — putting one all-or-nothing
+        # fsync across two dedupe streams, which is a bug in that caller, not a wire
+        # condition. It costs a set comprehension over a list already in hand.
+        #
+        # This runs after the loop above, so every origin here is a non-empty string and the
+        # sort cannot raise TypeError on a mixed None.
+        foreign = {event.origin for event in events if event.origin != self.origin}
+        if len(foreign) > 1:
+            raise ValueError(
+                f"a batch may carry at most one origin beside this log's own "
+                f"({self.origin!r}), got {sorted(foreign)}"
+            )
+```
+
+**c. `src/theseus/replication_batch.py` — the parser.** Replace the file's body from the imports
+down with the source below. The module docstring stays as it is.
+
+```python
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from typing import Any
+
+from theseus.replication_events import clean_reason
+from theseus.stimulus_log import StimulusEvent
+
+# A batch is bounded twice, because the two limits fail differently: a count keeps one
+# commit from stalling the cognitive loop, and a byte size keeps a single event with a
+# hundred-megabyte payload from doing the same with one line. Both are configurable; these
+# are the defaults a LAN surrogate can rely on.
+DEFAULT_MAX_BATCH_EVENTS = 500
+DEFAULT_MAX_BATCH_BYTES = 4 * 1024 * 1024
+
+# A seq is a counter, and a counter that arrives as 10**100 is not a counter — it is a mark
+# that no real event can ever exceed, so accepting it discards that origin's whole future.
+# int64 is the ceiling every store, wire format and database this could pass through shares,
+# and it is beyond any producer that increments once per event.
+MAX_SEQ = 2**63 - 1
+
+# The envelope fields that must be present, non-empty strings on the wire. `origin` and
+# `seq` are checked separately, with reasons of their own.
+_REQUIRED_STRINGS = ("id", "actor", "type")
+
+
+class BatchRejected(Exception):
+    """A batch that will never be acceptable, however many times it is sent.
+
+    Carries the status the endpoint should answer with and the reason the surrogate will
+    copy onto its own tape — so the reason is written for that reader, and bounded by the
+    same rule `replication_events` bounds a declared reason with, marked where it was cut.
+
+    The status is checked because this exception *is* the protocol's "do not retry" signal:
+    raising it with a `5xx` would tell the surrogate to abandon a batch it should have
+    retried, and there is no later layer that could catch the mistake.
+    """
+
+    def __init__(self, status: int, reason: str) -> None:
+        if (
+            not isinstance(status, int)
+            or isinstance(status, bool)
+            or not 400 <= status < 500
+        ):
+            raise ValueError(
+                f"BatchRejected is the 4xx class; {status!r} is not a 4xx status"
+            )
+        self.status = status
+        self.reason = clean_reason(reason)
+        super().__init__(f"{status}: {self.reason}")
+
+
+def parse_batch(
+    body: str | bytes,
+    *,
+    max_events: int = DEFAULT_MAX_BATCH_EVENTS,
+    max_bytes: int = DEFAULT_MAX_BATCH_BYTES,
+    host_origin: str | None = None,
+) -> list[StimulusEvent]:
+    """Parse a JSONL replication body into events, or raise `BatchRejected`.
+
+    Accepts one event per line, ascending by `seq`, all from one origin. Blank lines are
+    ignored — a producer that ends with a newline has malformed nothing.
+
+    Seqs must **ascend**, but need not be contiguous. The brief describes a batch as a
+    contiguous range, and a well-behaved surrogate sends one; but a surrogate that evicted
+    events under storage pressure holds a buffer with real holes in it, and answering that
+    with a `4xx` would tell it to abandon data it still has — the opposite of what the
+    abandon rule is for. Ascending is what ordering and the dedupe straddle actually need.
+
+    `host_origin`, when given, is this log's own origin name, and a batch claiming it is
+    rejected here. A surrogate misconfigured with the host's name puts two numbering
+    authorities on one seq stream, which is unfixable by retrying and so belongs in the
+    `4xx` class — without this it would surface further down as an unhandled `ValueError`
+    out of `append_many`, which the endpoint would answer as a `5xx` and the surrogate would
+    retry forever.
+    """
+    raw = body if isinstance(body, bytes) else body.encode("utf-8")
+    if len(raw) > max_bytes:
+        raise BatchRejected(
+            413, f"batch is {len(raw)} bytes, over the {max_bytes} byte limit"
+        )
+
+    # Strict, not `errors="replace"`. A body that is not UTF-8 will not become UTF-8 by
+    # being sent again, and substituting the replacement character writes corruption onto an
+    # append-only tape that nothing downstream can tell apart from content the producer
+    # meant.
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BatchRejected(
+            400, f"batch is not valid UTF-8 (byte {exc.start}: {exc.reason})"
+        ) from exc
+
+    # `split("\n")`, never `splitlines()`. JSONL defines exactly one separator, and
+    # `splitlines` invents six more: `StimulusEvent.to_json` serialises with
+    # `ensure_ascii=False`, so a Theseus surrogate puts U+2028, U+2029 and U+0085 on the
+    # wire raw inside string values, and splitting on those tears a well-formed line into
+    # two invalid halves. The answer would be a `400` — do not retry — so any transcript
+    # containing a line separator would be discarded permanently, silently, and only for
+    # certain content.
+    lines = [
+        (number, stripped)
+        for number, line in enumerate(text.split("\n"), 1)
+        if (stripped := line.strip())
+    ]
+    if not lines:
+        raise BatchRejected(400, "batch is empty")
+    if len(lines) > max_events:
+        raise BatchRejected(
+            413,
+            f"batch carries {len(lines)} events, over the {max_events} event limit",
+        )
+
+    events = [_parse_line(number, text) for number, text in lines]
+    _check_one_origin(events, host_origin)
+    _check_ascending(events)
+    return events
+
+
+def _parse_line(number: int, text: str) -> StimulusEvent:
+    """Validate the wire values *before* building an event from them.
+
+    This ordering is the point of the module, not an accident. `StimulusEvent.from_json`
+    is generous by design — it coerces an absent or empty `origin` to the reading log's own
+    origin, because that is the right reading for a line this node wrote before the envelope
+    existed. Applied to an untrusted body it would turn a surrogate's missing origin into
+    the *host's* own name, which is precisely the collision that puts two numbering
+    authorities on one origin. So the raw values are checked first, and only then parsed.
+    """
+    raw = _loads(number, text)
+    if not isinstance(raw, dict):
+        raise BatchRejected(400, f"line {number} is not a JSON object")
+
+    _check_origin(number, raw.get("origin"))
+    _check_seq(number, raw.get("seq"))
+    _check_envelope(number, raw)
+
+    try:
+        return StimulusEvent.from_json(text)
+    except (KeyError, ValueError, TypeError, RecursionError) as exc:
+        raise BatchRejected(400, f"line {number} is not a usable event: {exc}") from exc
+
+
+def _loads(number: int, text: str) -> Any:
+    """`json.loads` with its recursion made part of the `4xx` class.
+
+    `json.loads` recurses once per level of nesting, so a deeply nested body raises
+    `RecursionError` — which is not a `ValueError` and so is not a `JSONDecodeError`.
+    Measured against the unguarded parser: 20,000 levels is 40 KB, one percent of the byte
+    limit, and escaped as an unhandled exception. The endpoint would answer `500`, the
+    surrogate would read that as transient, and it would resend that batch forever while
+    every event behind it waited. A batch too deep to parse is as permanently unacceptable
+    as one that is not JSON at all, and belongs in the same class.
+
+    The stack has already unwound to this frame by the time the handler runs, so building
+    the rejection here is safe.
+    """
+    try:
+        return json.loads(text)
+    except RecursionError as exc:
+        raise BatchRejected(400, f"line {number} nests too deeply to parse") from exc
+    except ValueError as exc:  # JSONDecodeError is a ValueError
+        raise BatchRejected(400, f"line {number} is not JSON: {exc}") from exc
+
+
+def _check_origin(number: int, origin: Any) -> None:
+    if not isinstance(origin, str) or not origin.strip():
+        raise BatchRejected(
+            400, f"line {number} has no usable origin (got {origin!r})"
+        )
+
+
+def _check_seq(number: int, seq: Any) -> None:
+    """`bool` is an `int` in Python, and `true` on the wire would sail past a `< 1` guard
+    and then compare as 1 against a high-water mark."""
+    if seq is None:
+        raise BatchRejected(400, f"line {number} carries no seq")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise BatchRejected(400, f"line {number} has a non-integer seq ({seq!r})")
+    if seq < 1:
+        raise BatchRejected(400, f"line {number} has seq {seq}; seqs start at 1")
+    if seq > MAX_SEQ:
+        raise BatchRejected(
+            400,
+            f"line {number} has seq {seq}, above the {MAX_SEQ} ceiling; a mark that high "
+            f"would discard everything that origin ever sends afterwards",
+        )
+
+
+def _check_envelope(number: int, raw: dict[str, Any]) -> None:
+    """The rest of the envelope, which `from_json` would take on trust.
+
+    `from_json` indexes these straight out of the parsed dict, so `"type": null` or
+    `"id": {}` becomes an event with a `None` type or a dict id, appended to the tape and
+    read back by everything downstream. None of that is fixable by resending, so it is a
+    `4xx` and not something to discover later in the Assembler.
+    """
+    for field in _REQUIRED_STRINGS:
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise BatchRejected(
+                400, f"line {number} has no usable {field} (got {value!r})"
+            )
+    content = raw.get("content")
+    if not isinstance(content, dict):
+        raise BatchRejected(
+            400, f"line {number} has a non-object content (got {content!r})"
+        )
+    _check_ts(number, raw.get("ts"))
+
+
+def _check_ts(number: int, ts: Any) -> None:
+    """A producer timestamp, with the offset the wire format requires.
+
+    A naive `ts` is not merely imprecise here. `stimulus_log._aware` attaches the *host's*
+    zone to it, which is the right reading for an old local line and the wrong one for a
+    surrogate in another zone — the event lands hours from where it belongs in the
+    Assembler's chronological sort, silently. The wire format is fully specified, so a `ts`
+    without an offset is a producer bug and no amount of resending fixes it.
+    """
+    if not isinstance(ts, str):
+        raise BatchRejected(400, f"line {number} has no usable ts (got {ts!r})")
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError as exc:
+        raise BatchRejected(400, f"line {number} has an unparseable ts ({ts!r})") from exc
+    if parsed.tzinfo is None:
+        raise BatchRejected(
+            400,
+            f"line {number} has a ts with no UTC offset ({ts!r}); a naive timestamp would "
+            f"be read in the host's zone, not the producer's",
+        )
+
+
+def _check_one_origin(events: list[StimulusEvent], host_origin: str | None) -> None:
+    origins = sorted({event.origin for event in events})
+    if len(origins) != 1:
+        raise BatchRejected(
+            400, f"a batch must come from one origin, got {origins}"
+        )
+    if host_origin is not None and origins[0] == host_origin:
+        raise BatchRejected(
+            400,
+            f"batch claims this host's own origin ({host_origin!r}); a surrogate must send "
+            f"under its own name, or two producers number one seq stream",
+        )
+
+
+def _check_ascending(events: list[StimulusEvent]) -> None:
+    for earlier, later in zip(events, events[1:]):
+        if later.seq <= earlier.seq:
+            raise BatchRejected(
+                400,
+                f"seqs must be ascending; {later.seq} follows {earlier.seq}",
+            )
+```
+
+#### Tests
+
+**In `tests/test_replication_batch.py`:** hoist the `import json` out of the `line` helper up to
+the module's imports. Add `from theseus.replication_events import MAX_REASON_CHARS` and
+`from theseus.stimulus_log import StimulusEvent`. Keep every existing test. Add:
+
+```python
+# The three characters `str.splitlines()` breaks on that `\n` does not: LINE SEPARATOR,
+# PARAGRAPH SEPARATOR, NEXT LINE. Written as escapes so this file cannot itself be torn by
+# a tool that splits on them.
+LINE_SEPARATORS = ["\u2028", "\u2029", "\u0085"]
+
+
+def test_a_line_deep_enough_to_exhaust_the_stack_is_a_4xx_not_a_crash():
+    """20,000 levels is 40 KB — one percent of the byte limit — and `json.loads` recurses
+    once per level. `RecursionError` is not a `ValueError`, so it is not a `JSONDecodeError`
+    and the obvious handler misses it. Escaping here means the endpoint answers 500, the
+    surrogate reads that as transient, and it resends this batch forever."""
+    depth = 20_000
+    body = line(1).replace('"content": {"n": 1}', '"content": ' + "[" * depth + "]" * depth)
+    assert len(body) < DEFAULT_MAX_BATCH_BYTES
+
+    with pytest.raises(BatchRejected) as excinfo:
+        parse_batch(body)
+
+    assert excinfo.value.status == 400
+    assert "nests too deeply" in excinfo.value.reason
+
+
+@pytest.mark.parametrize("separator", LINE_SEPARATORS)
+def test_a_line_separator_inside_a_value_does_not_split_the_line(separator):
+    """`StimulusEvent.to_json` serialises with `ensure_ascii=False`, so a Theseus surrogate
+    puts these on the wire raw. `splitlines()` breaks on all three; `split("\\n")` does not.
+    Rejecting one would be a 400 — do not retry — so a transcript containing a line
+    separator would be discarded permanently and only for that content."""
+    message = f"before{separator}after"
+    body = line(1, content={"message": message})
+
+    events = parse_batch(body)
+
+    assert len(events) == 1
+    assert events[0].content == {"message": message}
+
+
+def test_the_separator_case_is_reachable_from_theseuss_own_serialiser():
+    """Not hypothetical: this is a round trip through the code a surrogate actually runs."""
+    message = "one\u2028two"
+    event = StimulusEvent(
+        id="01PRODUCERID00000000000001",
+        ts=datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc),
+        actor="george",
+        type="exchange",
+        content={"message": message},
+        origin="kitchen-surrogate",
+        seq=1,
+    )
+    wire = event.to_json()
+    assert "\u2028" in wire  # raw on the wire, not escaped
+
+    assert parse_batch(wire + "\n")[0].content == {"message": message}
+
+
+def test_a_body_that_is_not_utf8_is_rejected_rather_than_repaired():
+    """`errors="replace"` would write the replacement character onto an append-only tape,
+    where nothing downstream can tell it from content the producer meant. Bytes that are not
+    UTF-8 will not become UTF-8 by being resent."""
+    body = line(1).encode("utf-8").replace(b"sensor", b"sen\xffor")
+
+    with pytest.raises(BatchRejected) as excinfo:
+        parse_batch(body)
+
+    assert excinfo.value.status == 400
+    assert "UTF-8" in excinfo.value.reason
+
+
+def test_a_seq_above_the_ceiling_is_rejected():
+    """A mark of 10**100 is not a counter; accepting it discards that origin's entire
+    future, because nothing it ever sends again clears the high-water mark."""
+    with pytest.raises(BatchRejected, match="ceiling"):
+        parse_batch(line(1, seq=10**100))
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"content": None}, "non-object content"),
+        ({"content": "just a string"}, "non-object content"),
+        ({"type": None}, "no usable type"),
+        ({"type": ""}, "no usable type"),
+        ({"id": {}}, "no usable id"),
+        ({"actor": 7}, "no usable actor"),
+        ({"ts": "not a timestamp"}, "unparseable ts"),
+        ({"ts": None}, "no usable ts"),
+    ],
+)
+def test_the_rest_of_the_envelope_is_checked_too(overrides, expected):
+    """`from_json` indexes these straight out of the parsed dict, so without a check they
+    reach the tape as a `None` type or a dict id."""
+    with pytest.raises(BatchRejected, match=expected):
+        parse_batch(line(1, **overrides))
+
+
+def test_a_naive_ts_is_rejected_rather_than_read_in_the_hosts_zone():
+    """`_aware` attaches the *host's* zone to a naive timestamp — right for an old local
+    line, wrong for a surrogate elsewhere, and it moves the event hours from where it
+    belongs in the Assembler's sort."""
+    with pytest.raises(BatchRejected, match="no UTC offset"):
+        parse_batch(line(1, ts="2026-09-04T16:00:00"))
+
+
+def test_a_batch_claiming_the_hosts_own_origin_is_a_4xx():
+    """Without this it surfaces as a ValueError out of `append_many`, which the endpoint
+    answers as a 5xx and the surrogate retries forever — a misconfiguration no retry fixes."""
+    with pytest.raises(BatchRejected) as excinfo:
+        parse_batch(line(1, origin="local"), host_origin="local")
+
+    assert excinfo.value.status == 400
+    assert "own origin" in excinfo.value.reason
+
+
+def test_host_origin_is_not_checked_unless_it_is_given():
+    assert len(parse_batch(line(1, origin="local"))) == 1
+
+
+def test_batch_rejected_refuses_a_status_outside_the_4xx_class():
+    """This exception *is* the do-not-retry signal. Raising it with a 5xx would tell the
+    surrogate to abandon a batch it should have retried, and nothing downstream could
+    catch it."""
+    for status in (200, 500, 503):
+        with pytest.raises(ValueError, match="4xx"):
+            BatchRejected(status, "whatever")
+
+
+def test_batch_rejected_marks_a_truncated_reason():
+    """The reason is copied verbatim onto the surrogate's tape. A reader that cannot tell
+    "the host said exactly this" from "the host said this and more" is being misled."""
+    rejected = BatchRejected(400, "x" * 5000)
+
+    assert len(rejected.reason) == MAX_REASON_CHARS
+    assert rejected.reason.endswith("…")
+
+
+def test_batch_rejected_refuses_an_empty_reason():
+    with pytest.raises(ValueError):
+        BatchRejected(400, "   ")
+```
+
+**In `tests/test_stimulus_log.py`:** add `import io` to the imports, and these two tests.
+
+```python
+def test_append_many_rejects_two_foreign_origins(tmp_path):
+    """One all-or-nothing fsync must not span two dedupe streams. `parse_batch` enforces
+    the wire's one-origin rule at the door, but a caller that never goes through the door —
+    the surrogate side, a replay tool, a test — would put both streams in one write."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError, match="at most one origin"):
+        log.append_many([_replicated(1), _replicated(1, origin="android-01")])
+
+    assert log.read_all() == []
+
+
+def test_append_many_rolls_back_a_write_that_dies_part_way(tmp_path, monkeypatch):
+    """The failure this guards is not a crash — a crash can only tear the final line, which
+    `read_all` drops. It is an exception mid-write, ENOSPC being the realistic one: the
+    prefix is committed, the file ends mid-line, and the *next* successful append
+    concatenates onto that stump and turns it into an interior corrupt record. `read_all`
+    raises on those by design and forever, and `HighWaterMarks` derives itself by reading
+    the whole log — so the agent never boots again."""
+    log = make_log(tmp_path)
+    log.append(actor="george", type="exchange", content={"message": "first"})
+    committed = log.path.stat().st_size
+
+    real_open = open
+
+    class TornWriter(io.TextIOWrapper):
+        """Commits a prefix, then dies the way ENOSPC does."""
+
+        def write(self, s):
+            super().write(s[: len(s) // 3])
+            super().flush()
+            raise OSError(28, "No space left on device")
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        if "a" in mode:
+            return TornWriter(real_open(path, "ab"), encoding="utf-8")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    with pytest.raises(OSError):
+        log.append_many([_replicated(1), _replicated(2), _replicated(3)])
+    monkeypatch.undo()
+
+    assert log.path.stat().st_size == committed
+    assert len(log.read_all()) == 1
+    log.append(actor="george", type="exchange", content={"message": "later"})
+    assert len(log.read_all()) == 2  # not a permanently unreadable log
+```
+
+#### Verification, and the mutation gate
+
+`make test` is not the gate. Every new test must be shown to **fail** against the defect it
+describes. Run each revert below, record the exact pytest summary line for the reverted run **and**
+for the restored run, and put both in the report:
+
+| Revert | Tests that must fail |
+|---|---|
+| `_loads` back to a plain `json.loads` in a `try/except json.JSONDecodeError` | the deep-nesting test |
+| `split("\n")` back to `splitlines()` | the three separator cases + the serialiser round-trip |
+| `decode("utf-8")` back to `decode("utf-8", errors="replace")` | the not-UTF-8 test |
+| drop the `MAX_SEQ` branch | the ceiling test |
+| drop the `_check_envelope` call | the eight envelope cases + the naive-ts test |
+| drop the `host_origin` branch | the host-origin test |
+| drop the status check in `BatchRejected.__init__` | the 4xx-class test |
+| `clean_reason(reason)` back to `reason[:MAX_REASON_CHARS]` | the truncation-marker test + the empty-reason test |
+| drop the `foreign` check in `append_many` | `test_append_many_rejects_two_foreign_origins` |
+| drop the `try/except` in `_write_durably` | `test_append_many_rolls_back_a_write_that_dies_part_way` |
+
+Restore the fix after each revert. **A test that still passes against its own reverted fix is not a
+test** — stop and report that rather than proceeding.
+
+Then the whole offline suite:
+
+```
+poetry run pytest -q tests/ --ignore=tests/test_fact_retention.py --ignore=tests/e2e
+```
+
+Baseline before this task: **461 passed**.
