@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from theseus.replication_ingress import CoalescingTrigger
+from theseus.high_water import HighWaterMarks
+from theseus.replication_events import GAP
+from theseus.replication_ingress import CoalescingTrigger, ReplicationIngress
+from theseus.stimulus_log import StimulusLog
 
 # Every wait in this file is bounded. A threading test that can hang is a threading test
 # that will hang in CI at the worst moment, and a timeout that fires is a failure with a
@@ -189,3 +195,365 @@ def test_no_callback_without_a_request(trigger, recorder):
     """The worker waits; it does not poll and it does not fire on start."""
     assert not recorder.entered.wait(0.2)
     assert recorder.calls == []
+
+
+# --- The ingress ----------------------------------------------------------------
+SURROGATE = "kitchen-surrogate"
+
+
+def wire(seq: int, *, origin: str = SURROGATE, **overrides) -> str:
+    fields = {
+        "id": f"01PRODUCERID{seq:014d}",
+        "ts": f"2026-09-04T16:00:{seq % 60:02d}+00:00",
+        "actor": "sensor",
+        "type": "observation",
+        "content": {"n": seq},
+        "origin": origin,
+        "seq": seq,
+    }
+    fields.update(overrides)
+    return json.dumps(fields)
+
+
+def batch(*seqs: int, origin: str = SURROGATE) -> str:
+    return "\n".join(wire(seq, origin=origin) for seq in seqs) + "\n"
+
+
+@pytest.fixture
+def log(tmp_path):
+    return StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+
+
+@pytest.fixture
+def ingress(log):
+    return ReplicationIngress(log, HighWaterMarks(log))
+
+
+def seqs_on(log, origin=SURROGATE):
+    return [e.seq for e in log.read_all() if e.origin == origin]
+
+
+# --- The three dedupe cases, end to end -----------------------------------------
+def test_a_new_batch_is_committed(ingress, log):
+    result = ingress.ingest(batch(1, 2, 3))
+
+    assert result.status == 200
+    assert result.appended == 3
+    assert result.high_water == 3
+    assert seqs_on(log) == [1, 2, 3]
+
+
+def test_a_duplicate_batch_commits_nothing_and_is_still_a_2xx(ingress, log):
+    """A lost ack — the host committed, the response died in flight, the surrogate resent.
+    Its job on retry is to stop worrying, not to find out it was wrong."""
+    ingress.ingest(batch(1, 2, 3))
+
+    result = ingress.ingest(batch(1, 2, 3))
+
+    assert result.status == 200
+    assert result.duplicate
+    assert result.appended == 0
+    assert result.high_water == 3
+    assert seqs_on(log) == [1, 2, 3]
+
+
+def test_a_straddling_batch_commits_only_the_tail(ingress, log):
+    ingress.ingest(batch(1, 2, 3))
+
+    result = ingress.ingest(batch(2, 3, 4, 5))
+
+    assert result.appended == 2
+    assert seqs_on(log) == [1, 2, 3, 4, 5]
+    assert result.high_water == 5
+
+
+def test_a_jump_is_committed_with_a_marker_and_never_rejected(ingress, log):
+    ingress.ingest(batch(1))
+
+    result = ingress.ingest(batch(5, 6))
+
+    assert result.status == 200
+    assert result.inferred_hole == (2, 4)
+    assert result.appended == 3  # the marker, then the two events
+    assert seqs_on(log) == [1, 5, 6]
+
+    marker = [e for e in log.read_all() if e.type == GAP][0]
+    assert marker.origin == log.origin
+    assert marker.content["origin"] == SURROGATE
+    assert (marker.content["from_seq"], marker.content["to_seq"]) == (2, 4)
+    assert marker.content["declared"] is False
+
+
+def test_the_marker_and_its_events_land_in_one_write(ingress, log):
+    """One `append_many`, one fsync — so the marker and the events it explains share an
+    arrival instant. Two writes would let a crash commit the hole and lose the
+    explanation."""
+    ingress.ingest(batch(5, 6))
+
+    events = log.read_all()
+    assert [e.type for e in events] == [GAP, "observation", "observation"]
+    assert len({e.appended_ts for e in events}) == 1
+
+
+# --- Rejection ------------------------------------------------------------------
+def test_a_malformed_batch_is_a_4xx_and_commits_nothing(ingress, log):
+    result = ingress.ingest("{not json\n")
+
+    assert result.status == 400
+    assert result.reason
+    assert log.read_all() == []
+
+
+def test_an_oversized_batch_carries_its_own_status(log):
+    """413 rather than 400. Both are 4xx and both mean do not retry, but the surrogate
+    copies the reason onto its own tape, and "too many events" tells an operator to lower a
+    limit where "malformed" would send them looking for a bug."""
+    ingress = ReplicationIngress(log, HighWaterMarks(log), max_events=2)
+
+    result = ingress.ingest(batch(1, 2, 3))
+
+    assert result.status == 413
+    assert log.read_all() == []
+
+
+def test_a_rejection_does_not_move_the_mark(ingress, log):
+    ingress.ingest(batch(1, 2))
+
+    ingress.ingest("{not json\n")
+
+    assert ingress.ingest(batch(1, 2)).high_water == 2
+
+
+def test_a_batch_claiming_the_hosts_own_origin_is_a_4xx(ingress, log):
+    """Not a 5xx. Without the parser's guard this surfaced as a ValueError out of
+    `append_many`, which the endpoint would answer as transient and the surrogate would
+    retry forever over a misconfiguration no retry can fix."""
+    result = ingress.ingest(batch(1, origin=log.origin))
+
+    assert result.status == 400
+    assert log.read_all() == []
+
+
+# --- The mark is derived from the tape, not remembered beside it ----------------
+def test_the_mark_survives_a_restart(ingress, log):
+    """`HighWaterMarks` is a snapshot recovered from the log. If the ingress ever advanced
+    a mark without writing, or wrote without advancing, a fresh instance would disagree —
+    and disagreeing means either dropping real events or double-appending them."""
+    ingress.ingest(batch(1, 2, 3))
+    ingress.ingest(batch(7, 8))
+
+    recovered = HighWaterMarks(log)
+
+    assert recovered.high_water(SURROGATE) == 8
+
+
+# --- The trigger ----------------------------------------------------------------
+def test_a_committed_batch_asks_the_agent_to_think(log):
+    woken = threading.Event()
+    ingress = ReplicationIngress(log, HighWaterMarks(log), on_arrival=woken.set)
+    ingress.start()
+    try:
+        ingress.ingest(batch(1))
+        assert woken.wait(5.0)
+    finally:
+        ingress.stop()
+
+
+def test_a_duplicate_does_not_ask_the_agent_to_think(log):
+    """A lost ack is the surrogate re-asking a question already answered. Waking the agent
+    for it would turn a dropped response into a cognitive turn about nothing."""
+    calls = []
+    ingress = ReplicationIngress(log, HighWaterMarks(log), on_arrival=lambda: calls.append(1))
+    ingress.start()
+    try:
+        ingress.ingest(batch(1))
+        time.sleep(0.2)
+        before = len(calls)
+
+        ingress.ingest(batch(1))
+        time.sleep(0.2)
+
+        assert len(calls) == before
+    finally:
+        ingress.stop()
+
+
+def test_a_rejected_batch_does_not_ask_the_agent_to_think(log):
+    calls = []
+    ingress = ReplicationIngress(log, HighWaterMarks(log), on_arrival=lambda: calls.append(1))
+    ingress.start()
+    try:
+        ingress.ingest("{not json\n")
+        time.sleep(0.2)
+
+        assert calls == []
+    finally:
+        ingress.stop()
+
+
+def test_an_ingress_without_a_callback_still_works(ingress):
+    ingress.start()
+    try:
+        assert ingress.ingest(batch(1)).appended == 1
+    finally:
+        ingress.stop()
+
+
+# --- Concurrency ----------------------------------------------------------------
+def test_two_concurrent_deliveries_of_one_batch_commit_it_once(log, monkeypatch):
+    """The failure this guards is not hypothetical and not the surrogate's fault: the spec
+    allows one batch in flight, but an HTTP client that times out and retries puts two
+    concurrent requests for one origin in front of the ingress while the first is still
+    committing. If reading the mark, planning against it, writing and advancing are not one
+    atomic sequence, both requests read the same mark, both plan a full commit, and the
+    batch lands twice in the agent's permanent memory.
+
+    Made deterministic by widening the window rather than hoping to hit it: the write is
+    slowed, and both threads are released together by a barrier, so an unlocked ingress
+    reliably interleaves. Verified against the unlocked implementation — see the plan's
+    mutation gate."""
+    marks = HighWaterMarks(log)
+    ingress = ReplicationIngress(log, marks)
+
+    real_append_many = log.append_many
+
+    def slow_append_many(events):
+        time.sleep(0.1)
+        return real_append_many(events)
+
+    monkeypatch.setattr(log, "append_many", slow_append_many)
+
+    start = threading.Barrier(2)
+    results = []
+
+    def deliver():
+        start.wait(timeout=5.0)
+        results.append(ingress.ingest(batch(1, 2, 3)))
+
+    threads = [threading.Thread(target=deliver) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    assert seqs_on(log) == [1, 2, 3], "the batch was committed more than once"
+    assert sorted(r.appended for r in results) == [0, 3]
+    assert all(r.status == 200 for r in results)
+
+
+# --- The HTTP surface -----------------------------------------------------------
+def test_the_endpoint_answers_2xx_for_a_committed_batch(ingress, log):
+    client = TestClient(ingress.build_app())
+
+    response = client.post("/replicate", content=batch(1, 2))
+
+    assert response.status_code == 200
+    assert response.json()["high_water"] == 2
+    assert seqs_on(log) == [1, 2]
+
+
+def test_the_endpoint_answers_4xx_with_the_reason(ingress):
+    client = TestClient(ingress.build_app())
+
+    response = client.post("/replicate", content="{not json\n")
+
+    assert response.status_code == 400
+    assert "not JSON" in response.json()["reason"]
+
+
+def test_the_endpoint_can_be_mounted_on_an_existing_app(ingress, log):
+    """A host already serving a chat UI should not need a second port for this."""
+    app = FastAPI()
+
+    @app.get("/health")
+    def health():
+        return {"ok": True}
+
+    ingress.add_routes(app, path="/surrogate/replicate")
+    client = TestClient(app)
+
+    assert client.get("/health").status_code == 200
+    assert client.post("/surrogate/replicate", content=batch(1)).status_code == 200
+    assert seqs_on(log) == [1]
+
+
+def test_the_endpoint_reports_an_inferred_gap(ingress):
+    client = TestClient(ingress.build_app())
+    client.post("/replicate", content=batch(1))
+
+    response = client.post("/replicate", content=batch(5))
+
+    assert response.json()["inferred_gap"] == {"from_seq": 2, "to_seq": 4}
+
+
+def test_a_failed_write_does_not_move_the_mark(log, monkeypatch):
+    """The ordering only matters when the write fails, which is the case worth having.
+
+    A mark claiming events the log does not have silently discards the retry that would
+    have delivered them — the surrogate resends, the host says "already got it", and the
+    events are gone with nobody the wiser. If the process dies between the write and the
+    advance instead, the mark is merely behind: the retry re-delivers a batch the host
+    already has, dedupe answers 2xx, and nothing is written twice. Behind is recoverable;
+    ahead is not."""
+    marks = HighWaterMarks(log)
+    ingress = ReplicationIngress(log, marks)
+    ingress.ingest(batch(1, 2))
+
+    def failing(events):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(log, "append_many", failing)
+    with pytest.raises(OSError):
+        ingress.ingest(batch(3, 4))
+    monkeypatch.undo()
+
+    assert marks.high_water(SURROGATE) == 2, "the mark moved for a write that never landed"
+    assert ingress.ingest(batch(3, 4)).appended == 2, "the retry was discarded as a duplicate"
+
+
+def test_the_endpoint_does_not_block_the_event_loop(log, monkeypatch):
+    """`ingest` blocks on a lock and an fsync. Run on the event loop it would stall every
+    other request in the process — the chat UI included, when they share an app — for the
+    length of a disk write.
+
+    Raced rather than inspected: a slow replicate and a prompt health check are issued
+    together, and the health check must come back first. On the loop it cannot."""
+    import asyncio
+
+    import httpx
+
+    ingress = ReplicationIngress(log, HighWaterMarks(log))
+    real_ingest = ingress.ingest
+
+    def slow_ingest(body):
+        time.sleep(0.5)
+        return real_ingest(body)
+
+    monkeypatch.setattr(ingress, "ingest", slow_ingest)
+
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        return {"ok": True}
+
+    ingress.add_routes(app)
+
+    async def race():
+        order = []
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://ingress") as client:
+
+            async def replicate():
+                await client.post("/replicate", content=batch(1))
+                order.append("replicate")
+
+            async def check():
+                await asyncio.sleep(0.05)  # let the slow request get in first
+                await client.get("/health")
+                order.append("health")
+
+            await asyncio.gather(replicate(), check())
+        return order
+
+    assert asyncio.run(race()) == ["health", "replicate"]

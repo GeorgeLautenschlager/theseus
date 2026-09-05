@@ -10,7 +10,23 @@ from __future__ import annotations
 
 import threading
 import traceback
-from typing import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+
+from theseus.high_water import HighWaterMarks
+from theseus.replication_batch import (
+    DEFAULT_MAX_BATCH_BYTES,
+    DEFAULT_MAX_BATCH_EVENTS,
+    BatchRejected,
+    parse_batch,
+)
+from theseus.replication_dedupe import plan_batch
+from theseus.stimulus_log import StimulusLog
 
 
 class CoalescingTrigger:
@@ -98,3 +114,180 @@ class CoalescingTrigger:
                 # take the ingress's thread down with it. The events are committed either
                 # way, and the next arrival gets a fresh attempt.
                 traceback.print_exc()
+
+
+@dataclass(frozen=True)
+class Ingested:
+    """What one batch did, in the terms the surrogate and an operator both need.
+
+    `status` is what to answer: `2xx` for anything committed *or* already committed,
+    `4xx` for a batch that will never be acceptable. There is no `5xx` here — a `5xx` is
+    what an unhandled exception becomes, and the point of the two pure modules below this
+    one is that a well-formed batch cannot produce one.
+
+    `appended` counts every event written, including a gap marker the host minted itself,
+    which is why `inferred_hole` is reported beside it rather than folded into it.
+    """
+
+    status: int
+    origin: str | None
+    appended: int
+    high_water: int | None
+    inferred_hole: tuple[int, int] | None = None
+    reason: str | None = None
+
+    @property
+    def duplicate(self) -> bool:
+        """Committed nothing because the host already had all of it. Still a `2xx`: a
+        surrogate retrying after a lost ack is asking to stop worrying, not to be told it
+        was wrong."""
+        return self.status < 400 and self.appended == 0
+
+    def payload(self) -> dict[str, Any]:
+        """The response body. `high_water` is the useful field: it tells a surrogate where
+        the host actually is, which is what a cursor-holder needs to resynchronise after
+        any confusion about what got through."""
+        body: dict[str, Any] = {
+            "origin": self.origin,
+            "appended": self.appended,
+            "high_water": self.high_water,
+        }
+        if self.inferred_hole is not None:
+            body["inferred_gap"] = {
+                "from_seq": self.inferred_hole[0],
+                "to_seq": self.inferred_hole[1],
+            }
+        if self.reason is not None:
+            body["reason"] = self.reason
+        return body
+
+
+class ReplicationIngress:
+    """Where a surrogate's events land: parse, dedupe, commit, nudge.
+
+    The three steps before the nudge each belong to something else — `parse_batch` owns
+    acceptability and the `4xx` class, `plan_batch` owns what a batch adds, `append_many`
+    owns the all-or-nothing write. This class owns the order they happen in, the lock that
+    makes the sequence atomic, and the decision to answer the surrogate before the agent
+    has thought about anything.
+
+    **Why there is a lock.** The spec allows one batch in flight per surrogate, but that is
+    the surrogate's rule and it does not survive its own HTTP client: a request that times
+    out client-side and is retried puts two concurrent requests for one origin in front of
+    this class while the first is still committing. Reading the mark, planning against it,
+    writing, and advancing it must therefore be one atomic sequence. Split them and both
+    requests read the same mark, both plan a full commit, and the batch lands twice — in
+    the agent's permanent memory, which is the exact failure duplicate suppression exists
+    to prevent. `HighWaterMarks` locks its own read and its own write, but that is not
+    enough: what needs to be indivisible is the span between them.
+
+    One lock, not one per origin. It costs nothing real — `append_many` already serialises
+    every writer on the log's own lock and one fsync at a time is the actual ceiling — and
+    a lock per origin would be more state to get wrong for concurrency the host cannot use.
+
+    **Why the mark advances after the write.** A mark claiming events the log does not have
+    silently discards the retry that would have delivered them. If the process dies between
+    the write and the advance, the mark is merely behind, and a retry re-delivers a batch
+    the host already has — which the dedupe rules answer with a `2xx` and no second write.
+    Behind is recoverable; ahead is not.
+    """
+
+    def __init__(
+        self,
+        log: StimulusLog,
+        marks: HighWaterMarks,
+        *,
+        on_arrival: Callable[[], None] | None = None,
+        max_events: int = DEFAULT_MAX_BATCH_EVENTS,
+        max_bytes: int = DEFAULT_MAX_BATCH_BYTES,
+    ) -> None:
+        self._log = log
+        self._marks = marks
+        self._max_events = max_events
+        self._max_bytes = max_bytes
+        self._commit_lock = threading.Lock()
+        self._trigger = (
+            CoalescingTrigger(on_arrival) if on_arrival is not None else None
+        )
+
+    def start(self) -> None:
+        """Start the trigger's worker, if there is one. Safe to call without."""
+        if self._trigger is not None:
+            self._trigger.start()
+
+    def stop(self) -> None:
+        if self._trigger is not None:
+            self._trigger.stop()
+
+    def ingest(self, body: str | bytes) -> Ingested:
+        """Apply one batch. Blocking — an fsync and a lock — so never call this from a
+        coroutine on an event loop; `add_routes` hands it to a worker thread.
+
+        Exceptions are not caught here beyond `BatchRejected`. `plan_batch`'s `ValueError`s
+        are unreachable from this path — `parse_batch` has already rejected an empty batch,
+        two origins, a claim on the host's own name, and seqs that do not ascend — so one
+        escaping would be a genuine bug in this host, and a `5xx` is the right answer to
+        that: it tells the surrogate to keep the events and try again, which is exactly what
+        it should do while somebody fixes the host.
+        """
+        try:
+            events = parse_batch(
+                body,
+                host_origin=self._log.origin,
+                max_events=self._max_events,
+                max_bytes=self._max_bytes,
+            )
+        except BatchRejected as rejected:
+            return Ingested(
+                status=rejected.status,
+                origin=None,
+                appended=0,
+                high_water=None,
+                reason=rejected.reason,
+            )
+
+        origin = events[0].origin
+        with self._commit_lock:
+            plan = plan_batch(
+                events,
+                high_water=self._marks.high_water(origin),
+                host_origin=self._log.origin,
+                now=datetime.now(timezone.utc),
+            )
+            if plan.to_append:
+                self._log.append_many(plan.to_append)
+                self._marks.advance(origin, plan.new_high_water)
+            high_water = self._marks.high_water(origin)
+
+        # Outside the lock, and only for a batch that actually added something. A duplicate
+        # is the surrogate re-asking a question already answered; waking the agent for it
+        # would turn a lost ack into a cognitive turn about nothing.
+        if plan.to_append and self._trigger is not None:
+            self._trigger.request()
+
+        return Ingested(
+            status=200,
+            origin=origin,
+            appended=len(plan.to_append),
+            high_water=high_water,
+            inferred_hole=plan.inferred_hole,
+        )
+
+    def add_routes(self, app: FastAPI, *, path: str = "/replicate") -> None:
+        """Mount the endpoint on an existing app, so a host already serving a chat UI does
+        not need a second port for this."""
+
+        @app.post(path)
+        async def replicate(request: Request):
+            body = await request.body()
+            # `ingest` blocks on a lock and an fsync. Run on the event loop it would stall
+            # every other request in the process — the chat UI included, if they share an
+            # app — for the duration of a disk write.
+            result = await run_in_threadpool(self.ingest, body)
+            return JSONResponse(result.payload(), status_code=result.status)
+
+    def build_app(self) -> FastAPI:
+        """A standalone app, for a host running the ingress on its own port."""
+        app = FastAPI()
+        self.add_routes(app)
+        return app
