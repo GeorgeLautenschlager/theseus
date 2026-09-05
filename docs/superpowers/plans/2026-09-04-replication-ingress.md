@@ -1393,3 +1393,641 @@ poetry run pytest -q tests/ --ignore=tests/test_fact_retention.py --ignore=tests
 ```
 
 Baseline before this task: **461 passed**.
+
+---
+
+### Task 3 (#30): the dedupe planner — the three cases, as data
+
+`replication_batch` decides whether a batch is *acceptable*. This module decides what an acceptable
+batch actually *adds*, given what the host already has. It is the second of the two pure modules,
+and between them they make the ingress's whole decision testable without a server, a file or a
+sleep.
+
+#### The rules, from the spec
+
+> **Dedupe:** the host tracks a high-water `seq` per `origin`.
+> - Batch entirely at or below the high-water mark → duplicate. Discard, return `2xx`.
+> - Batch straddling the mark → append only the events above it, return `2xx`.
+> - Batch starting above `high_water + 1` → **gap. Append it and carry on.** If the surrogate
+>   declared the gap with a `stimulus.gap` marker, that marker is just another event on the tape.
+>   If it didn't, the host records an inferred-gap event of its own and continues. Never reject.
+
+Nothing in this module rejects a batch. That is not an oversight: the `4xx` class belongs at the
+door, and by the time a batch reaches here it is well-formed. A well-formed batch is never
+something the surrogate should be told to throw away.
+
+#### Four assumptions, verified rather than assumed
+
+Run against the current worktree before this task was written:
+
+```
+mixed batch ok: [('local', 1, 'stimulus.gap'), ('kitchen', 5, 'observation'), ('kitchen', 6, 'observation')]
+zero-width span ok: True
+log.origin: local == DEFAULT_ORIGIN: True
+kitchen mark: 6  host mark: 1
+```
+
+So: a host-minted marker carrying the host's origin rides in one `append_many` with a surrogate's
+events (this is exactly the case Task 2's fix round narrowed the origin invariant to allow); a
+zero-width span survives `inferred_gap`'s validation; and the marker's own `(host origin, seq)`
+does not pollute the surrogate's mark on recovery — `HighWaterMarks` reads them as two streams,
+which is what makes the mixed write safe.
+
+#### Decisions taken here
+
+**The marker goes in the same write as the events that revealed the hole, ahead of them.** A crash
+between two writes would commit the hole and lose the explanation, which is the one outcome the
+gap vocabulary exists to prevent. `to_append` is therefore returned already in write order.
+
+**A declared gap must cover the hole *entirely* for the host to stay quiet.** The surrogate's own
+marker rides in the batch because `seq` is assigned at its local write time — it evicts 5–9, then
+writes the marker as seq 10, so the batch that opens the hole is the batch that explains it. A
+marker explaining 5–7 of a 5–9 hole leaves 8–9 unaccounted for, and the protocol's posture is that
+a readable hole beats a silence, so a partial explanation still earns an inferred marker beside it.
+Two overlapping markers is a legible tape; a silently half-explained hole is not.
+
+**The inferred span is the host's honest bound, not a claim about when the missing events
+happened.** Its upper end is the first event that did arrive. Its lower end is whatever the caller
+can supply — the `ts` of the last event committed from that origin — and when there is none, both
+ends collapse onto the upper bound. **A zero-width span on an inferred gap therefore reads as
+"noticed here, no lower bound known"**, which is the truthful reading on first contact, rather than
+a fabricated interval.
+
+Task 4 will pass `previous_ts=None`, because nothing currently remembers the timestamp at a mark:
+`HighWaterMarks` tracks seqs only. Supplying it means folding one more field into the boot-time
+pass that object already makes. **That is a real improvement and it is deliberately not in this
+task** — it widens an already-merged module for fidelity the first version does not need. Noted as
+a follow-up, and flagged to George with the other open decisions.
+
+**First contact above seq 1 is a gap**, as recorded at plan time and still escalated. It needs no
+special case: an origin with no mark is `mark = 0`, and the hole `[1, first_seq - 1]` falls out of
+the same arithmetic as every other jump.
+
+**This module checks that seqs ascend and are integers, and `replication_batch` checks it too.**
+That is not the redundancy Task 2's fix round argued about. There the wire rule was being restated
+in a layer that did not depend on it; here the tail slice and the hole arithmetic are *only*
+correct on an ascending integer sequence, so the check is this function's own precondition. A
+caller that skips the parser — #31's surrogate side, a replay tool, a test — gets a `ValueError`
+naming the pair rather than a silently wrong hole.
+
+#### `src/theseus/replication_dedupe.py` — new file
+
+```python
+"""What a batch actually adds to the log, given what the host already has.
+
+`replication_batch` decides whether a batch is acceptable. This module decides what an
+acceptable batch *adds*. Nothing here rejects: a duplicate is discarded and answered `2xx`,
+a straddle commits its tail and is answered `2xx`, and a jump past the mark is committed
+*with a marker explaining the hole* and answered `2xx`. The `4xx` class belongs at the door,
+and by the time a batch reaches this module it is well-formed — which is never something a
+surrogate should be told to throw away.
+
+Pure: no log, no marks object, no clock, no I/O. Everything the decision needs is an
+argument and the decision itself is data, which is what lets the ingress's three cases be
+tested without a server, a file, or a sleep.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Sequence
+
+from theseus.replication_events import GAP, inferred_gap
+from theseus.stimulus_log import StimulusEvent
+
+# The host's name for its own diagnostic events. `origin` says which machine wrote it;
+# `actor` says who on that machine did, and a gap the host inferred was written by no one
+# the agent was talking to.
+HOST_ACTOR = "host"
+
+# `StimulusLog.append_many` re-mints `id` for everything it writes, so this is never the id
+# of anything on the tape. It is here because `StimulusEvent` requires one, and a value that
+# says so is better than a plausible-looking ULID that would be a lie if it ever survived.
+PLACEHOLDER_ID = "01HOSTMINTEDGAPPLACEHOLDER"
+
+
+@dataclass(frozen=True)
+class BatchPlan:
+    """What the ingress should do with one parsed batch.
+
+    `to_append` is already in the order it must be written: the host's own gap marker, when
+    it minted one, ahead of the events whose arrival revealed the hole. It goes to
+    `append_many` as a single call, because a crash between two writes would commit the hole
+    and lose the explanation.
+
+    An **empty `to_append` means the batch was entirely a duplicate** — every event at or
+    below the mark. The ingress commits nothing, advances nothing, and answers `2xx`: a
+    surrogate retrying after a lost ack is asking to stop worrying, not to be told it was
+    wrong.
+
+    `new_high_water` is the mark to advance to *after* the write is durable, and is `None`
+    exactly when there is nothing to write. Advancing before the commit would leave the mark
+    claiming events the log does not have — the direction that silently drops a retry.
+
+    `inferred_hole` is the inclusive range the host minted a marker for, or `None` when there
+    was no hole *or* the surrogate had already explained it. It is the plan's answer to "did
+    the host have to guess", which is what an operator wants to count.
+    """
+
+    to_append: tuple[StimulusEvent, ...]
+    new_high_water: int | None
+    inferred_hole: tuple[int, int] | None
+
+
+def plan_batch(
+    events: Sequence[StimulusEvent],
+    *,
+    high_water: int | None,
+    host_origin: str,
+    now: datetime,
+    previous_ts: datetime | None = None,
+) -> BatchPlan:
+    """Apply the dedupe rules to one well-formed batch.
+
+    `high_water` is the highest seq already committed for this batch's origin, or `None` if
+    nothing has ever arrived from it. `now` is the host's clock, passed in rather than read
+    so a test can pin it. `previous_ts` is the `ts` of the last event committed from this
+    origin, if the caller knows it — it is only ever the lower bound of an inferred gap's
+    span, and `None` is honest when nothing remembers it.
+
+    Raises `ValueError` on a batch this function's arithmetic cannot describe: empty, spanning
+    two origins, claiming the host's own origin, or not ascending by integer seq. Those are
+    caller bugs, not wire conditions — `replication_batch` answers the wire versions with a
+    `4xx` long before this — so they surface as the exception a programmer gets, not as a
+    silently wrong hole.
+    """
+    if not events:
+        raise ValueError("a batch must carry at least one event")
+
+    origins = {event.origin for event in events}
+    if len(origins) != 1:
+        raise ValueError(f"a batch must come from one origin, got {sorted(origins)}")
+    origin = events[0].origin
+    if origin == host_origin:
+        raise ValueError(
+            f"{origin!r} is the host's own origin; a replicated batch arrives under its "
+            f"producer's name, or two producers number one seq stream"
+        )
+    _check_ascending(events)
+
+    # An origin with no mark is a mark of 0: seqs start at 1, so nothing real sits at or
+    # below it, and the first-contact hole `[1, first_seq - 1]` falls out of the same
+    # arithmetic as every other jump rather than needing a case of its own.
+    mark = 0 if high_water is None else high_water
+    tail = tuple(event for event in events if event.seq > mark)
+    if not tail:
+        return BatchPlan(to_append=(), new_high_water=None, inferred_hole=None)
+
+    hole: tuple[int, int] | None = None
+    if tail[0].seq > mark + 1:
+        hole = (mark + 1, tail[0].seq - 1)
+        if _declared_in(events, origin, hole):
+            # The surrogate explained it itself, and its marker is already one of the events
+            # being committed. The host adds nothing — that is the whole distinction between
+            # a declared and an inferred gap, and minting a second marker beside the first
+            # would erase it.
+            hole = None
+
+    marker: tuple[StimulusEvent, ...] = ()
+    if hole is not None:
+        marker = (
+            _inferred_marker(
+                origin=origin,
+                hole=hole,
+                host_origin=host_origin,
+                now=now,
+                lower_bound=previous_ts,
+                upper_bound=tail[0].ts,
+            ),
+        )
+
+    return BatchPlan(
+        to_append=marker + tail,
+        new_high_water=tail[-1].seq,
+        inferred_hole=hole,
+    )
+
+
+def _check_ascending(events: Sequence[StimulusEvent]) -> None:
+    """The precondition the tail slice and the hole arithmetic both rest on.
+
+    `replication_batch` checks this too, and that is not the duplication its own fix round
+    argued against: there the wire's rule was being restated in a layer that did not depend
+    on it, whereas here it is this function's own correctness. A caller that skips the parser
+    — the #31 surrogate side, a replay tool, a test — gets a `ValueError` naming the pair
+    rather than a silently wrong hole.
+    """
+    for event in events:
+        if isinstance(event.seq, bool) or not isinstance(event.seq, int):
+            raise ValueError(
+                f"event {event.id!r} carries a non-integer seq {event.seq!r}; the tail "
+                f"slice and the hole arithmetic are only correct on integers"
+            )
+    for earlier, later in zip(events, events[1:]):
+        if later.seq <= earlier.seq:
+            raise ValueError(
+                f"a batch must ascend by seq; {later.seq} follows {earlier.seq}"
+            )
+
+
+def _declared_in(
+    events: Sequence[StimulusEvent], origin: str, hole: tuple[int, int]
+) -> bool:
+    """Did the surrogate already explain this hole itself?
+
+    Its marker rides in this very batch because `seq` is assigned at the surrogate's local
+    write time: it evicts 5–9, then writes the marker as seq 10, so the batch that opens the
+    hole is the batch that explains it.
+
+    Coverage must be total. A marker explaining 5–7 of a 5–9 hole leaves 8–9 unaccounted for,
+    and a readable hole beats a silence — so a partial explanation still earns an inferred
+    marker beside it. Two overlapping markers is a legible tape; a half-explained hole is not.
+
+    The content is read defensively because it came off the wire: `replication_events`
+    validates only markers *this* node builds, and nothing stops a buggy surrogate sending a
+    `stimulus.gap` whose range is a string, a bool, or about somebody else's origin. A marker
+    this function cannot read is a marker that explains nothing.
+    """
+    start, end = hole
+    for event in events:
+        if event.type != GAP or not isinstance(event.content, dict):
+            continue
+        if event.content.get("origin") != origin:
+            continue
+        from_seq = _as_seq(event.content.get("from_seq"))
+        to_seq = _as_seq(event.content.get("to_seq"))
+        if from_seq is not None and to_seq is not None:
+            if from_seq <= start and to_seq >= end:
+                return True
+    return False
+
+
+def _as_seq(value: Any) -> int | None:
+    """A wire value usable as a seq bound, or `None`.
+
+    `bool` is an `int` in Python, so `"from_seq": true` would otherwise compare as 1 and let
+    a malformed marker silence a real hole.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _inferred_marker(
+    *,
+    origin: str,
+    hole: tuple[int, int],
+    host_origin: str,
+    now: datetime,
+    lower_bound: datetime | None,
+    upper_bound: datetime,
+) -> StimulusEvent:
+    """The host's own account of a hole nobody declared.
+
+    It carries the **host's** origin and no seq, because the host wrote it; the surrogate's
+    origin names whose stream has the hole and lives in the content. That is what makes this
+    one of the two origins `StimulusLog.append_many` permits in a single write — and it has
+    to be in that write, or a crash between them commits the hole and loses the explanation.
+
+    The span is the host's honest bound, not a claim about when the missing events happened.
+    Its upper end is the first event that did arrive. Its lower end is whatever the caller
+    could supply, and when there is none both ends collapse onto the upper bound: **a
+    zero-width span on an inferred gap reads as "noticed here, no lower bound known"**, which
+    is the truth on first contact rather than a fabricated interval.
+    """
+    from_seq, to_seq = hole
+    end = _utc(upper_bound)
+    # A surrogate's clock can sit ahead of the host's mark. Taking the minimum keeps the span
+    # from inverting, which `inferred_gap` would reject — and rejecting here would lose the
+    # marker over a clock skew the marker itself exists to make visible.
+    start = end if lower_bound is None else min(_utc(lower_bound), end)
+    return StimulusEvent(
+        id=PLACEHOLDER_ID,
+        ts=now,
+        actor=HOST_ACTOR,
+        type=GAP,
+        content=inferred_gap(
+            origin=origin,
+            from_seq=from_seq,
+            to_seq=to_seq,
+            span_start=start,
+            span_end=end,
+        ),
+        origin=host_origin,
+    )
+
+
+def _utc(value: datetime) -> datetime:
+    """Comparable, by the same rule the rest of the package uses: a naive datetime is
+    host-local. Two timestamps from different nodes must never meet as a mixed pair."""
+    return value.astimezone(timezone.utc)
+```
+
+#### `tests/test_replication_dedupe.py` — new file
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from theseus.replication_dedupe import BatchPlan, HOST_ACTOR, plan_batch
+from theseus.replication_events import GAP, declared_gap
+from theseus.stimulus_log import StimulusEvent
+
+HOST = "local"
+SURROGATE = "kitchen-surrogate"
+BASE = datetime(2026, 9, 4, 16, 0, tzinfo=timezone.utc)
+NOW = BASE + timedelta(hours=1)
+
+
+def event(seq: int, *, origin: str = SURROGATE, ts: datetime | None = None) -> StimulusEvent:
+    return StimulusEvent(
+        id=f"01PRODUCERID{seq:014d}",
+        ts=BASE + timedelta(seconds=seq) if ts is None else ts,
+        actor="sensor",
+        type="observation",
+        content={"n": seq},
+        origin=origin,
+        seq=seq,
+    )
+
+
+def gap_event(seq: int, from_seq: int, to_seq: int, *, origin: str = SURROGATE):
+    """A gap the surrogate declared about its own stream, as it arrives in a batch."""
+    return StimulusEvent(
+        id=f"01PRODUCERID{seq:014d}",
+        ts=BASE + timedelta(seconds=seq),
+        actor="sensor",
+        type=GAP,
+        content=declared_gap(
+            origin=origin,
+            from_seq=from_seq,
+            to_seq=to_seq,
+            reason="storage_pressure",
+            span_start=BASE,
+            span_end=BASE + timedelta(minutes=1),
+        ),
+        origin=origin,
+        seq=seq,
+    )
+
+
+def plan(events, high_water=None, **kwargs):
+    return plan_batch(
+        events, high_water=high_water, host_origin=HOST, now=NOW, **kwargs
+    )
+
+
+# --- The three cases ------------------------------------------------------------
+def test_a_batch_entirely_below_the_mark_adds_nothing():
+    """A lost ack: the host committed, the response died, the surrogate resent. Its job on
+    retry is to stop worrying, not to find out it was wrong."""
+    result = plan([event(1), event(2)], high_water=5)
+
+    assert result == BatchPlan(to_append=(), new_high_water=None, inferred_hole=None)
+
+
+def test_a_batch_exactly_at_the_mark_adds_nothing():
+    result = plan([event(4), event(5)], high_water=5)
+
+    assert result.to_append == ()
+    assert result.new_high_water is None
+
+
+def test_a_batch_straddling_the_mark_commits_only_the_tail():
+    result = plan([event(4), event(5), event(6), event(7)], high_water=5)
+
+    assert [e.seq for e in result.to_append] == [6, 7]
+    assert result.new_high_water == 7
+    assert result.inferred_hole is None
+
+
+def test_a_contiguous_batch_commits_whole_and_infers_nothing():
+    result = plan([event(6), event(7)], high_water=5)
+
+    assert [e.seq for e in result.to_append] == [6, 7]
+    assert result.new_high_water == 7
+    assert result.inferred_hole is None
+
+
+def test_a_jump_past_the_mark_is_committed_with_a_marker_not_rejected():
+    """The spec's third case: append it and carry on. Never reject — the events in hand are
+    not the ones that went missing."""
+    result = plan([event(10), event(11)], high_water=5)
+
+    assert result.inferred_hole == (6, 9)
+    assert [e.seq for e in result.to_append] == [None, 10, 11]
+    assert result.new_high_water == 11
+
+
+def test_the_marker_is_written_before_the_events_that_revealed_the_hole():
+    """One write, marker first. Split across two, a crash commits the hole and loses the
+    explanation — the one outcome this vocabulary exists to prevent."""
+    result = plan([event(10)], high_water=5)
+
+    marker = result.to_append[0]
+    assert marker.type == GAP
+    assert marker.origin == HOST
+    assert marker.seq is None
+    assert marker.actor == HOST_ACTOR
+    assert marker.content["origin"] == SURROGATE
+    assert (marker.content["from_seq"], marker.content["to_seq"]) == (6, 9)
+    assert marker.content["declared"] is False
+
+
+def test_a_one_event_hole_is_an_inclusive_range():
+    result = plan([event(7)], high_water=5)
+
+    assert result.inferred_hole == (6, 6)
+    assert result.to_append[0].content["from_seq"] == 6
+    assert result.to_append[0].content["to_seq"] == 6
+
+
+# --- First contact --------------------------------------------------------------
+def test_first_contact_at_seq_1_is_not_a_gap():
+    result = plan([event(1), event(2)], high_water=None)
+
+    assert result.inferred_hole is None
+    assert [e.seq for e in result.to_append] == [1, 2]
+    assert result.new_high_water == 2
+
+
+def test_first_contact_above_seq_1_is_a_gap_from_1():
+    """An origin whose first batch starts at 5 means seqs 1-4 never arrived. Recording that
+    beats discarding the information that four events are missing."""
+    result = plan([event(5)], high_water=None)
+
+    assert result.inferred_hole == (1, 4)
+
+
+# --- Declared gaps --------------------------------------------------------------
+def test_a_declared_gap_covering_the_hole_stops_the_host_minting_one():
+    """The surrogate evicted 6-9 and said so; its marker rides in this batch as seq 10. The
+    host adds nothing, which is the whole distinction between declared and inferred."""
+    result = plan([gap_event(10, 6, 9), event(11)], high_water=5)
+
+    assert result.inferred_hole is None
+    assert [e.seq for e in result.to_append] == [10, 11]
+    assert result.to_append[0].content["declared"] is True
+
+
+def test_a_declared_gap_covering_more_than_the_hole_still_counts():
+    result = plan([gap_event(10, 1, 9), event(11)], high_water=5)
+
+    assert result.inferred_hole is None
+
+
+def test_a_declared_gap_covering_only_part_of_the_hole_does_not_silence_the_host():
+    """6-7 explained of a 6-9 hole leaves 8-9 unaccounted for. Two overlapping markers is a
+    legible tape; a half-explained hole is not."""
+    result = plan([gap_event(10, 6, 7), event(11)], high_water=5)
+
+    assert result.inferred_hole == (6, 9)
+    assert result.to_append[0].origin == HOST
+
+
+def test_a_declared_gap_about_another_origin_does_not_silence_the_host():
+    result = plan([gap_event(10, 6, 9, origin="android-01"), event(11)], high_water=5)
+
+    assert result.inferred_hole == (6, 9)
+
+
+@pytest.mark.parametrize("bound", [True, "6", None, 6.0])
+def test_a_declared_gap_whose_range_is_not_an_integer_explains_nothing(bound):
+    """`bool` is an `int` in Python, so `from_seq: true` would compare as 1 and let a
+    malformed marker silence a real hole. Nothing validates a marker off the wire."""
+    marker = gap_event(10, 6, 9)
+    marker = StimulusEvent(
+        id=marker.id, ts=marker.ts, actor=marker.actor, type=GAP,
+        content={**marker.content, "from_seq": bound},
+        origin=marker.origin, seq=marker.seq,
+    )
+
+    assert plan([marker, event(11)], high_water=5).inferred_hole == (6, 9)
+
+
+# --- The span -------------------------------------------------------------------
+def test_the_span_runs_from_the_supplied_bound_to_the_first_event_that_arrived():
+    previous = BASE - timedelta(minutes=30)
+    result = plan([event(10)], high_water=5, previous_ts=previous)
+
+    content = result.to_append[0].content
+    assert content["span_start"] == previous.isoformat()
+    assert content["span_end"] == event(10).ts.isoformat()
+
+
+def test_with_no_lower_bound_the_span_collapses_onto_the_first_event():
+    """Zero width reads as 'noticed here, no lower bound known' — the truth on first
+    contact, rather than a fabricated interval."""
+    result = plan([event(10)], high_water=5)
+
+    content = result.to_append[0].content
+    assert content["span_start"] == content["span_end"] == event(10).ts.isoformat()
+
+
+def test_a_lower_bound_ahead_of_the_first_event_does_not_invert_the_span():
+    """A surrogate's clock can sit ahead of the host's. Raising here would lose the marker
+    over exactly the skew the marker exists to make visible."""
+    result = plan([event(10)], high_water=5, previous_ts=BASE + timedelta(days=1))
+
+    content = result.to_append[0].content
+    assert content["span_start"] == content["span_end"]
+
+
+def test_a_naive_lower_bound_is_read_as_host_local_rather_than_raising():
+    result = plan([event(10)], high_water=5, previous_ts=datetime(2026, 9, 4, 0, 0))
+
+    assert result.to_append[0].content["span_start"] <= result.to_append[0].content["span_end"]
+
+
+def test_the_markers_own_ts_is_the_hosts_clock_not_the_producers():
+    """`ts` answers when it happened: the host noticed the hole now, it did not happen when
+    the surrogate's next event did."""
+    result = plan([event(10)], high_water=5)
+
+    assert result.to_append[0].ts == NOW
+
+
+# --- Preconditions --------------------------------------------------------------
+def test_an_empty_batch_is_a_caller_bug():
+    with pytest.raises(ValueError, match="at least one event"):
+        plan([])
+
+
+def test_two_origins_in_one_batch_is_a_caller_bug():
+    with pytest.raises(ValueError, match="one origin"):
+        plan([event(1), event(2, origin="android-01")])
+
+
+def test_a_batch_claiming_the_hosts_own_origin_is_a_caller_bug():
+    with pytest.raises(ValueError, match="host's own origin"):
+        plan([event(1, origin=HOST)])
+
+
+def test_seqs_that_do_not_ascend_are_a_caller_bug():
+    """The tail slice and the hole arithmetic are only correct on an ascending sequence, so
+    this is this function's own precondition, not a restatement of the wire's rule."""
+    with pytest.raises(ValueError, match="ascend"):
+        plan([event(7), event(6)])
+
+
+def test_a_repeated_seq_is_not_ascending():
+    with pytest.raises(ValueError, match="ascend"):
+        plan([event(6), event(6)])
+
+
+@pytest.mark.parametrize("seq", [None, True, "6", 6.0])
+def test_a_non_integer_seq_is_a_caller_bug(seq):
+    bad = StimulusEvent(
+        id="01X", ts=BASE, actor="sensor", type="observation",
+        content={}, origin=SURROGATE, seq=seq,
+    )
+
+    with pytest.raises(ValueError, match="non-integer seq"):
+        plan([bad])
+
+
+# --- The plan is usable by the thing that will use it ---------------------------
+def test_the_plan_can_be_appended_as_one_batch(tmp_path):
+    """The end the whole module serves: marker and events in one `append_many`, which is the
+    write the narrowed origin invariant was kept to allow."""
+    from theseus.stimulus_log import StimulusLog
+
+    log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+    result = plan([event(10), event(11)], high_water=5)
+
+    appended = log.append_many(result.to_append)
+
+    assert [(e.origin, e.seq, e.type) for e in appended] == [
+        (HOST, 1, GAP),
+        (SURROGATE, 10, "observation"),
+        (SURROGATE, 11, "observation"),
+    ]
+```
+
+Note the `[None, 10, 11]` assertion in `test_a_jump_past_the_mark_is_committed_with_a_marker_not_rejected`:
+the marker's `seq` is `None` because the host has not numbered it — `append_many` allocates the
+host's own seq at write time. That is the assertion, not an oversight.
+
+#### The mutation gate
+
+The controller runs this, not the implementer — a gate is N mechanical repetitions, and part C of
+the last round proved that is the wrong shape of work to dispatch. The implementer's job is the
+module and the tests; the gate is verification of the tests, which is the controller's.
+
+| Revert | Tests that must fail |
+|---|---|
+| `tail[0].seq > mark + 1` → `tail[0].seq > mark` | the contiguous-batch and straddle tests |
+| drop the `_declared_in` branch | the three declared-gap tests that expect silence |
+| `_declared_in` coverage `from_seq <= start and to_seq >= end` → any overlap | the partial-coverage test |
+| `_as_seq` returns `value` for a bool | the non-integer-bound parametrization |
+| `mark = 0 if high_water is None` → `mark = high_water or 0` … (no-op; skip) | — |
+| drop the `min()` in `_inferred_marker` | the inverted-span test |
+| `marker + tail` → `tail + marker` | the marker-ordering test |
+| drop `_check_ascending` | the ascending and non-integer precondition tests |
+| `new_high_water=tail[-1].seq` → `events[-1].seq` | (equivalent here; skip) |
+
+Baseline before this task: **483 passed**.
