@@ -273,7 +273,7 @@ def test_a_jump_is_committed_with_a_marker_and_never_rejected(ingress, log):
     result = ingress.ingest(batch(5, 6))
 
     assert result.status == 200
-    assert result.inferred_hole == (2, 4)
+    assert result.inferred_holes == ((2, 4),)
     assert result.appended == 3  # the marker, then the two events
     assert seqs_on(log) == [1, 5, 6]
 
@@ -483,7 +483,7 @@ def test_the_endpoint_reports_an_inferred_gap(ingress):
 
     response = client.post("/replicate", content=batch(5))
 
-    assert response.json()["inferred_gap"] == {"from_seq": 2, "to_seq": 4}
+    assert response.json()["inferred_gaps"] == [{"from_seq": 2, "to_seq": 4}]
 
 
 def test_a_failed_write_does_not_move_the_mark(log, monkeypatch):
@@ -557,3 +557,85 @@ def test_the_endpoint_does_not_block_the_event_loop(log, monkeypatch):
         return order
 
     assert asyncio.run(race()) == ["health", "replicate"]
+
+
+def test_two_ingresses_over_one_log_do_not_double_append(log, monkeypatch):
+    """`HighWaterMarks`' own docstring makes one instance per log the precondition, so
+    sharing one marks object between two ingresses is the documented-correct arrangement —
+    and it is exactly what a per-ingress lock breaks. Measured before the fix: the log came
+    back holding seqs [1, 2, 3, 1, 2, 3]."""
+    marks = HighWaterMarks(log)
+    first = ReplicationIngress(log, marks)
+    second = ReplicationIngress(log, marks)
+
+    real_append_many = log.append_many
+
+    def slow_append_many(events):
+        time.sleep(0.1)
+        return real_append_many(events)
+
+    monkeypatch.setattr(log, "append_many", slow_append_many)
+
+    start = threading.Barrier(2)
+    appended = []
+
+    def deliver(ingress):
+        start.wait(timeout=5.0)
+        appended.append(ingress.ingest(batch(1, 2, 3)).appended)
+
+    threads = [threading.Thread(target=deliver, args=(i,)) for i in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    assert seqs_on(log) == [1, 2, 3], "the batch was committed by both ingresses"
+    assert sorted(appended) == [0, 3]
+
+
+def test_a_stop_that_times_out_does_not_leak_a_second_worker(recorder):
+    """A cognitive cycle can outlast the stop timeout. If `stop` forgot the worker anyway,
+    the next `start` would add a second beside the one still running — the failure
+    `test_start_twice_does_not_run_two_workers` guards, reached by another route."""
+    trigger = CoalescingTrigger(recorder, name="stubborn-worker")
+    trigger.start()
+    recorder.gate.clear()
+    trigger.request()
+    assert recorder.entered.wait(TIMEOUT)
+
+    trigger.stop(timeout=0.05)  # the callback is still held open, so this times out
+    trigger.start()
+
+    live = [t for t in threading.enumerate() if t.name == "stubborn-worker"]
+    recorder.gate.set()
+    trigger.stop()
+    assert len(live) == 1, f"{len(live)} workers running after a timed-out stop and a start"
+
+
+def test_a_restart_does_not_fire_a_callback_nobody_asked_for(recorder):
+    """`stop` sets the pending flag to wake the worker. Left set, the next `start` would run
+    a cognitive turn with no arrival behind it."""
+    trigger = CoalescingTrigger(recorder)
+    trigger.start()
+    trigger.stop()
+
+    trigger.start()
+    try:
+        assert not recorder.entered.wait(0.2)
+        assert recorder.calls == []
+    finally:
+        trigger.stop()
+
+
+def test_an_oversized_body_is_refused_before_it_is_buffered(log):
+    """The declared length is checked before `request.body()` reads anything. Measured
+    without it: a 256 MB POST against a 1 KB limit answered a correct 413 after growing the
+    process by half a gigabyte."""
+    ingress = ReplicationIngress(log, HighWaterMarks(log), max_bytes=1024)
+    client = TestClient(ingress.build_app())
+
+    response = client.post("/replicate", content="x" * 200_000)
+
+    assert response.status_code == 413
+    assert "declares" in response.json()["reason"]
+    assert log.read_all() == []

@@ -63,10 +63,19 @@ class CoalescingTrigger:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        """Begin serving requests. Idempotent; starting twice is a no-op, not two threads."""
-        if self._thread is not None:
+        """Begin serving requests. Idempotent; starting twice is a no-op, not two threads.
+
+        `is_alive` rather than a bare `is not None`, so that a `stop` whose join timed out
+        cannot be followed by a `start` that adds a second worker beside the one still
+        running. Two workers is the failure this idempotence exists to prevent, and a
+        timed-out stop is another way to reach it.
+        """
+        if self._thread is not None and self._thread.is_alive():
             return
         self._stopping.clear()
+        # A `stop` sets `_pending` to wake the worker. Left set, the next `start` would fire
+        # a callback nobody asked for.
+        self._pending.clear()
         self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
         self._thread.start()
 
@@ -83,10 +92,14 @@ class CoalescingTrigger:
         thread = self._thread
         if thread is None:
             return
-        self._thread = None
         self._stopping.set()
         self._pending.set()  # wake the worker so it can notice it is stopping
         thread.join(timeout)
+        # Only forgotten once it is actually gone. A worker still running past the timeout —
+        # a cognitive cycle can outlast it — stays on record, so a later `start` sees it and
+        # declines to add a second beside it.
+        if not thread.is_alive():
+            self._thread = None
 
     def request(self) -> None:
         """Ask for a callback. Never blocks, never runs the callback on this thread.
@@ -126,14 +139,14 @@ class Ingested:
     one is that a well-formed batch cannot produce one.
 
     `appended` counts every event written, including a gap marker the host minted itself,
-    which is why `inferred_hole` is reported beside it rather than folded into it.
+    which is why `inferred_holes` is reported beside it rather than folded into it.
     """
 
     status: int
     origin: str | None
     appended: int
     high_water: int | None
-    inferred_hole: tuple[int, int] | None = None
+    inferred_holes: tuple[tuple[int, int], ...] = ()
     reason: str | None = None
 
     @property
@@ -152,11 +165,10 @@ class Ingested:
             "appended": self.appended,
             "high_water": self.high_water,
         }
-        if self.inferred_hole is not None:
-            body["inferred_gap"] = {
-                "from_seq": self.inferred_hole[0],
-                "to_seq": self.inferred_hole[1],
-            }
+        if self.inferred_holes:
+            body["inferred_gaps"] = [
+                {"from_seq": start, "to_seq": end} for start, end in self.inferred_holes
+            ]
         if self.reason is not None:
             body["reason"] = self.reason
         return body
@@ -184,6 +196,15 @@ class ReplicationIngress:
     One lock, not one per origin. It costs nothing real — `append_many` already serialises
     every writer on the log's own lock and one fsync at a time is the actual ceiling — and
     a lock per origin would be more state to get wrong for concurrency the host cannot use.
+    It is taken from the `HighWaterMarks` rather than created here, so that it is one lock per
+    *log* rather than one per ingress; see that class for why the difference bites.
+
+    **A listener must not call `ingest`.** `StimulusLog` notifies listeners outside its own
+    lock, and explicitly allows one to append — but this class holds `_commit_lock` across
+    `append_many`, so a listener runs underneath it. `threading.Lock` is not reentrant, so a
+    listener that ingests deadlocks that thread permanently and no batch from any origin ever
+    commits again. A relay — a host forwarding what it receives — is the plausible way to
+    write this by accident.
 
     **Why the mark advances after the write.** A mark claiming events the log does not have
     silently discards the retry that would have delivered them. If the process dies between
@@ -205,7 +226,10 @@ class ReplicationIngress:
         self._marks = marks
         self._max_events = max_events
         self._max_bytes = max_bytes
-        self._commit_lock = threading.Lock()
+        # From the marks object, not a fresh one: see `HighWaterMarks.commit_lock`. A lock
+        # created here would be one per ingress, and two ingresses over one log would each
+        # hold their own and double-append a concurrently retried batch.
+        self._commit_lock = marks.commit_lock
         self._trigger = (
             CoalescingTrigger(on_arrival) if on_arrival is not None else None
         )
@@ -270,7 +294,7 @@ class ReplicationIngress:
             origin=origin,
             appended=len(plan.to_append),
             high_water=high_water,
-            inferred_hole=plan.inferred_hole,
+            inferred_holes=plan.inferred_holes,
         )
 
     def add_routes(self, app: FastAPI, *, path: str = "/replicate") -> None:
@@ -279,6 +303,31 @@ class ReplicationIngress:
 
         @app.post(path)
         async def replicate(request: Request):
+            # Refused on the declared length, before a byte is buffered. `parse_batch` also
+            # checks the size, but only once `request.body()` has read the whole thing into
+            # memory: a 256 MB POST against a 1 KB limit was measured answering a correct 413
+            # after growing the process by half a gigabyte. On a Pi-class host that is the
+            # agent dying rather than a batch being refused.
+            #
+            # This trusts the header, so it closes the honest-client case and not the
+            # adversarial one — a chunked or lying client still reaches the check below.
+            # Authentication is a Phase-1 non-goal, so an unbounded stream is still a way to
+            # hurt this endpoint; the header check is the cheap half of the answer.
+            declared = request.headers.get("content-length")
+            if declared is not None and declared.isdigit():
+                if int(declared) > self._max_bytes:
+                    rejected = Ingested(
+                        status=413,
+                        origin=None,
+                        appended=0,
+                        high_water=None,
+                        reason=(
+                            f"batch declares {declared} bytes, over the "
+                            f"{self._max_bytes} byte limit"
+                        ),
+                    )
+                    return JSONResponse(rejected.payload(), status_code=413)
+
             body = await request.body()
             # `ingest` blocks on a lock and an fsync. Run on the event loop it would stall
             # every other request in the process — the chat UI included, if they share an

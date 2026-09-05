@@ -66,7 +66,7 @@ def test_a_batch_entirely_below_the_mark_adds_nothing():
     retry is to stop worrying, not to find out it was wrong."""
     result = plan([event(1), event(2)], high_water=5)
 
-    assert result == BatchPlan(to_append=(), new_high_water=None, inferred_hole=None)
+    assert result == BatchPlan(to_append=(), new_high_water=None, inferred_holes=())
 
 
 def test_a_batch_exactly_at_the_mark_adds_nothing():
@@ -81,7 +81,7 @@ def test_a_batch_straddling_the_mark_commits_only_the_tail():
 
     assert [e.seq for e in result.to_append] == [6, 7]
     assert result.new_high_water == 7
-    assert result.inferred_hole is None
+    assert result.inferred_holes == ()
 
 
 def test_a_contiguous_batch_commits_whole_and_infers_nothing():
@@ -89,7 +89,7 @@ def test_a_contiguous_batch_commits_whole_and_infers_nothing():
 
     assert [e.seq for e in result.to_append] == [6, 7]
     assert result.new_high_water == 7
-    assert result.inferred_hole is None
+    assert result.inferred_holes == ()
 
 
 def test_a_jump_past_the_mark_is_committed_with_a_marker_not_rejected():
@@ -97,7 +97,7 @@ def test_a_jump_past_the_mark_is_committed_with_a_marker_not_rejected():
     not the ones that went missing."""
     result = plan([event(10), event(11)], high_water=5)
 
-    assert result.inferred_hole == (6, 9)
+    assert result.inferred_holes == ((6, 9),)
     assert [e.seq for e in result.to_append] == [None, 10, 11]
     assert result.new_high_water == 11
 
@@ -120,7 +120,7 @@ def test_the_marker_is_written_before_the_events_that_revealed_the_hole():
 def test_a_one_event_hole_is_an_inclusive_range():
     result = plan([event(7)], high_water=5)
 
-    assert result.inferred_hole == (6, 6)
+    assert result.inferred_holes == ((6, 6),)
     assert result.to_append[0].content["from_seq"] == 6
     assert result.to_append[0].content["to_seq"] == 6
 
@@ -129,7 +129,7 @@ def test_a_one_event_hole_is_an_inclusive_range():
 def test_first_contact_at_seq_1_is_not_a_gap():
     result = plan([event(1), event(2)], high_water=None)
 
-    assert result.inferred_hole is None
+    assert result.inferred_holes == ()
     assert [e.seq for e in result.to_append] == [1, 2]
     assert result.new_high_water == 2
 
@@ -139,7 +139,7 @@ def test_first_contact_above_seq_1_is_a_gap_from_1():
     beats discarding the information that four events are missing."""
     result = plan([event(5)], high_water=None)
 
-    assert result.inferred_hole == (1, 4)
+    assert result.inferred_holes == ((1, 4),)
 
 
 # --- Declared gaps --------------------------------------------------------------
@@ -148,7 +148,7 @@ def test_a_declared_gap_covering_the_hole_stops_the_host_minting_one():
     host adds nothing, which is the whole distinction between declared and inferred."""
     result = plan([gap_event(10, 6, 9), event(11)], high_water=5)
 
-    assert result.inferred_hole is None
+    assert result.inferred_holes == ()
     assert [e.seq for e in result.to_append] == [10, 11]
     assert result.to_append[0].content["declared"] is True
 
@@ -156,28 +156,45 @@ def test_a_declared_gap_covering_the_hole_stops_the_host_minting_one():
 def test_a_declared_gap_covering_more_than_the_hole_still_counts():
     result = plan([gap_event(10, 1, 9), event(11)], high_water=5)
 
-    assert result.inferred_hole is None
+    assert result.inferred_holes == ()
 
 
-def test_a_declared_gap_covering_only_part_of_the_hole_does_not_silence_the_host():
-    """6-7 explained of a 6-9 hole leaves 8-9 unaccounted for. Two overlapping markers is a
-    legible tape; a half-explained hole is not."""
+def test_a_declared_gap_covering_only_part_of_the_hole_leaves_the_residue():
+    """6-7 explained of a 6-9 hole leaves 8-9 unaccounted for — and 8-9 is exactly what the
+    host mints for. Marking the whole 6-9 again would contradict a marker sitting beside it
+    in the same write, and say the host had to guess about events the surrogate just
+    explained."""
     result = plan([gap_event(10, 6, 7), event(11)], high_water=5)
 
-    assert result.inferred_hole == (6, 9)
+    assert result.inferred_holes == ((8, 9),)
     assert result.to_append[0].origin == HOST
+    assert (
+        result.to_append[0].content["from_seq"],
+        result.to_append[0].content["to_seq"],
+    ) == (8, 9)
+
+
+def test_two_declared_gaps_covering_a_hole_between_them_silence_the_host():
+    """Ordinary surrogate behaviour: evict 6-7 under storage pressure, then lose 8-9 to a
+    dead link. Nothing here was undiagnosed, so a third marker claiming the host had to
+    guess would erase the distinction the vocabulary exists to carry."""
+    result = plan([gap_event(10, 6, 7), gap_event(11, 8, 9), event(12)], high_water=5)
+
+    assert result.inferred_holes == ()
+    assert [e.seq for e in result.to_append] == [10, 11, 12]
 
 
 def test_a_declared_gap_about_another_origin_does_not_silence_the_host():
     result = plan([gap_event(10, 6, 9, about="android-01"), event(11)], high_water=5)
 
-    assert result.inferred_hole == (6, 9)
+    assert result.inferred_holes == ((6, 9),)
 
 
 @pytest.mark.parametrize("bound", [True, "6", None, 6.0])
 def test_a_declared_gap_whose_range_is_not_an_integer_explains_nothing(bound):
     """`bool` is an `int` in Python, so `from_seq: true` would compare as 1 and let a
-    malformed marker silence a real hole. Nothing validates a marker off the wire."""
+    malformed marker silence a real hole. `parse_batch` now rejects such a marker at the
+    door, but this function is reachable from callers that never went through it."""
     marker = gap_event(10, 6, 9)
     marker = StimulusEvent(
         id=marker.id, ts=marker.ts, actor=marker.actor, type=GAP,
@@ -185,7 +202,56 @@ def test_a_declared_gap_whose_range_is_not_an_integer_explains_nothing(bound):
         origin=marker.origin, seq=marker.seq,
     )
 
-    assert plan([marker, event(11)], high_water=5).inferred_hole == (6, 9)
+    assert plan([marker, event(11)], high_water=5).inferred_holes == ((6, 9),)
+
+
+# --- Holes inside a batch -------------------------------------------------------
+def test_a_hole_between_two_events_of_one_batch_is_recorded():
+    """`parse_batch` accepts ascending-but-not-contiguous batches on purpose, so a surrogate
+    whose buffer has real holes is not told to throw away what it still has. That makes an
+    internal hole an ordinary shape, and the commit steps over it exactly as it steps over a
+    leading one."""
+    result = plan([event(5), event(9)], high_water=4)
+
+    assert result.inferred_holes == ((6, 8),)
+    assert result.new_high_water == 9
+
+
+def test_the_tape_does_not_depend_on_how_the_backlog_was_chunked():
+    """The same hole, delivered two ways. Before internal holes were counted, `[5, 9]` in one
+    batch advanced the mark to 9 and recorded nothing — 6-8 permanently undeliverable *and*
+    unaccounted for — while `[5]` then `[9]` recorded it properly."""
+    together = plan([event(5), event(9)], high_water=4)
+
+    apart = plan([event(9)], high_water=5)
+
+    assert together.inferred_holes == apart.inferred_holes == ((6, 8),)
+
+
+def test_several_holes_in_one_batch_each_get_a_marker():
+    result = plan([event(3), event(7), event(12)], high_water=1)
+
+    assert result.inferred_holes == ((2, 2), (4, 6), (8, 11))
+    assert [e.type for e in result.to_append] == [GAP, GAP, GAP] + ["observation"] * 3
+    assert [
+        (e.content["from_seq"], e.content["to_seq"]) for e in result.to_append[:3]
+    ] == [(2, 2), (4, 6), (8, 11)]
+
+
+def test_a_declared_marker_can_explain_an_internal_hole_too():
+    result = plan([event(5), gap_event(9, 6, 8), event(10)], high_water=4)
+
+    assert result.inferred_holes == ()
+
+
+def test_a_marker_below_the_mark_explains_nothing():
+    """It is a duplicate — the host already has it — and it is discarded with every other
+    duplicate. Counting it would let an already-committed marker silence a hole that nothing
+    in this batch accounts for."""
+    result = plan([gap_event(6, 11, 19), event(20)], high_water=10)
+
+    assert [e.seq for e in result.to_append if e.seq is not None] == [20]
+    assert result.inferred_holes == ((11, 19),)
 
 
 # --- The span -------------------------------------------------------------------

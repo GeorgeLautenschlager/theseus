@@ -25,7 +25,14 @@ import math
 from datetime import datetime
 from typing import Any
 
-from theseus.replication_events import clean_reason
+from theseus.replication_events import (
+    BATCH_REJECTED,
+    DECLARED_REASONS,
+    GAP,
+    INFERRED_REASON,
+    MAX_REASON_CHARS,
+    clean_reason,
+)
 from theseus.stimulus_log import StimulusEvent
 
 # A batch is bounded twice, because the two limits fail differently: a count keeps one
@@ -183,6 +190,7 @@ def _parse_line(number: int, text: str) -> StimulusEvent:
     _check_origin(number, raw.get("origin"))
     _check_seq(number, raw.get("seq"))
     _check_envelope(number, raw)
+    _check_marker(number, raw)
 
     try:
         event = StimulusEvent.from_json(text)
@@ -203,7 +211,13 @@ def _parse_line(number: int, text: str) -> StimulusEvent:
         # into the `4xx` they always were. It costs one extra serialisation per line, which
         # is the cheapest possible price for the module's central promise.
         event.to_json().encode("utf-8")
-    except (KeyError, ValueError, TypeError, RecursionError) as exc:
+    except (KeyError, ValueError, TypeError, RecursionError, OverflowError) as exc:
+        # `OverflowError` is an `ArithmeticError`, not a `ValueError`, so it needs naming
+        # separately: `to_json` raises it for any `ts` whose UTC conversion leaves the
+        # `datetime` range — a positive offset at year 1, a negative one at year 9999.
+        # That is not only an adversarial input. .NET's `DateTime.MinValue` is
+        # `0001-01-01T00:00:00`, so an uninitialised timestamp from a Windows surrogate
+        # anywhere east of Greenwich emits exactly it, in 162 bytes.
         raise BatchRejected(400, f"line {number} is not a usable event: {exc}") from exc
     return event
 
@@ -330,6 +344,164 @@ def _check_content(number: int, content: dict[str, Any]) -> None:
                 f"line {number} carries {value} in content; it is not JSON any reader "
                 f"outside Python can parse, and the tape is append-only",
             )
+
+
+def _check_marker(number: int, raw: dict[str, Any]) -> None:
+    """Re-apply `replication_events`' rules to a marker that arrived over the wire.
+
+    Those constructors validate only what *this* node builds; a remote surrogate goes
+    through none of them. Both modules' docstrings say the ingress must re-apply them at the
+    door rather than inventing a second definition of a well-formed marker — and until this
+    check existed only the *envelope* was re-applied, so a surrogate could put an inverted
+    range, an inverted span, a `5xx` in a field documented as `4xx`-only, a 5000-character
+    reason where the bound is 500, or `reason: "inferred"` onto a permanent tape.
+
+    That last one is the reason this is not merely tidiness. `INFERRED_REASON` is host-minted
+    precisely so a hole the host *diagnosed* can be told apart from one a surrogate
+    *reported*; a surrogate able to claim it erases the only distinction the gap vocabulary
+    carries, and an agent reading its own tape could no longer tell "my sensor told me it
+    dropped these" from "something over there may be dead".
+
+    A malformed marker is a `4xx` like any other malformed line: no amount of resending
+    makes it well-formed, and the alternative is writing a lie that cannot be taken back.
+    """
+    if raw["type"] == GAP:
+        _check_marker_origin(number, raw)
+        _check_marker_range(number, raw)
+        _check_declared_reason(number, raw)
+        _check_marker_span(number, raw)
+    elif raw["type"] == BATCH_REJECTED:
+        _check_marker_origin(number, raw)
+        _check_marker_range(number, raw)
+        _check_rejection_status(number, raw)
+        _check_rejection_reason(number, raw)
+
+
+def _marker_field(number: int, raw: dict[str, Any], field: str) -> Any:
+    content = raw["content"]
+    if field not in content:
+        raise BatchRejected(
+            400, f"line {number} is a {raw['type']} with no {field}"
+        )
+    return content[field]
+
+
+def _check_marker_origin(number: int, raw: dict[str, Any]) -> None:
+    origin = _marker_field(number, raw, "origin")
+    if not isinstance(origin, str) or not origin.strip():
+        raise BatchRejected(
+            400,
+            f"line {number} is a {raw['type']} about no usable origin (got {origin!r})",
+        )
+
+
+def _check_marker_range(number: int, raw: dict[str, Any]) -> None:
+    """Inclusive at both ends, so a one-event hole has them equal. An inverted or
+    below-1 range describes no span of events that could exist."""
+    bounds = []
+    for field in ("from_seq", "to_seq"):
+        value = _marker_field(number, raw, field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise BatchRejected(
+                400, f"line {number} has a non-integer {field} ({value!r})"
+            )
+        if value < 1:
+            raise BatchRejected(
+                400, f"line {number} has {field} {value}; seqs start at 1"
+            )
+        bounds.append(value)
+    if bounds[1] < bounds[0]:
+        raise BatchRejected(
+            400,
+            f"line {number} has an inverted range: from_seq {bounds[0]} is above "
+            f"to_seq {bounds[1]}",
+        )
+
+
+def _check_declared_reason(number: int, raw: dict[str, Any]) -> None:
+    """A gap off the wire is a gap somebody *declared*, so it must say which kind, and it
+    must not claim the host's word for a hole nobody declared."""
+    reason = _marker_field(number, raw, "reason")
+    if reason == INFERRED_REASON:
+        raise BatchRejected(
+            400,
+            f"line {number} claims reason {INFERRED_REASON!r}, which only the host mints; "
+            f"a declared gap must say which of {DECLARED_REASONS} it was",
+        )
+    if reason not in DECLARED_REASONS:
+        raise BatchRejected(
+            400,
+            f"line {number} has an unknown gap reason ({reason!r}); expected one of "
+            f"{DECLARED_REASONS}",
+        )
+    declared = raw["content"].get("declared")
+    if declared is not True:
+        raise BatchRejected(
+            400,
+            f"line {number} declares reason {reason!r} but carries declared={declared!r}; "
+            f"a reader that finds those disagreeing cannot tell what it is looking at",
+        )
+
+
+def _check_marker_span(number: int, raw: dict[str, Any]) -> None:
+    span = []
+    for field in ("span_start", "span_end"):
+        value = _marker_field(number, raw, field)
+        if not isinstance(value, str):
+            raise BatchRejected(
+                400, f"line {number} has a non-string {field} ({value!r})"
+            )
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise BatchRejected(
+                400, f"line {number} has an unparseable {field} ({value!r})"
+            ) from exc
+        if parsed.tzinfo is None:
+            raise BatchRejected(
+                400,
+                f"line {number} has a {field} with no UTC offset ({value!r}); it would be "
+                f"read in the host's zone, not the producer's",
+            )
+        span.append(parsed)
+    if span[1] < span[0]:
+        raise BatchRejected(
+            400,
+            f"line {number} has an inverted span: span_start {span[0]} is after "
+            f"span_end {span[1]}",
+        )
+
+
+def _check_rejection_status(number: int, raw: dict[str, Any]) -> None:
+    """`5xx` is retried, not rejected. One recorded here would claim a batch was abandoned
+    while the surrogate is in fact still trying to send it."""
+    status = _marker_field(number, raw, "status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        raise BatchRejected(
+            400, f"line {number} has a non-integer status ({status!r})"
+        )
+    if not 400 <= status < 500:
+        raise BatchRejected(
+            400,
+            f"line {number} records status {status}; a rejection is 4xx — permanently "
+            f"unacceptable — and a 5xx was never a rejection at all",
+        )
+
+
+def _check_rejection_reason(number: int, raw: dict[str, Any]) -> None:
+    """Bounded here as well as on the write side: this is a remote host's words being
+    copied onto a permanent, append-only tape by way of the surrogate."""
+    reason = _marker_field(number, raw, "reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise BatchRejected(
+            400, f"line {number} records a rejection with no reason ({reason!r})"
+        )
+    if len(reason) > MAX_REASON_CHARS:
+        raise BatchRejected(
+            400,
+            f"line {number} records a {len(reason)}-character reason, over the "
+            f"{MAX_REASON_CHARS} bound",
+        )
 
 
 def _check_ts(number: int, ts: Any) -> None:

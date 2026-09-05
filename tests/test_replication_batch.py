@@ -458,3 +458,140 @@ def test_batch_rejected_still_refuses_a_status_outside_the_4xx_class():
     for status in (200, 500, 503):
         with pytest.raises(ValueError, match="4xx"):
             BatchRejected(status, "whatever")
+
+
+# --- The writability contract, continued ----------------------------------------
+@pytest.mark.parametrize(
+    "ts",
+    [
+        "0001-01-01T00:00:00+01:00",
+        "0001-01-01T00:00:00+00:01",
+        "0001-01-01T00:00:00+05:30",
+        "9999-12-31T23:59:59-05:00",
+    ],
+)
+def test_a_timestamp_that_cannot_be_converted_to_utc_is_a_4xx(ts, tmp_path):
+    """`to_json` raises `OverflowError` for any `ts` whose UTC conversion leaves the
+    `datetime` range. `OverflowError` is an `ArithmeticError`, not a `ValueError`, so it slips
+    past the obvious handler and escapes as a 500 — the surrogate reads transient and retries
+    a 162-byte body forever.
+
+    Not only adversarial. .NET's `DateTime.MinValue` is `0001-01-01T00:00:00`, so an
+    uninitialised timestamp from a Windows surrogate anywhere east of Greenwich is exactly
+    this, and the Phase-1 target surrogate is a Windows desktop."""
+    assert commit(line(1, ts=ts), tmp_path) == 400
+
+
+def test_a_negative_offset_at_year_one_still_works(tmp_path):
+    """The bound is real, not a blanket ban on old timestamps: it is the UTC conversion that
+    overflows, so the other direction is fine."""
+    assert commit(line(1, ts="0001-01-01T00:00:00-08:00"), tmp_path) is None
+
+
+# --- Markers off the wire -------------------------------------------------------
+def gap_line(n=1, **content_overrides):
+    content = {
+        "origin": "kitchen-surrogate",
+        "from_seq": 5,
+        "to_seq": 9,
+        "reason": "storage_pressure",
+        "span_start": "2026-09-04T16:00:00+00:00",
+        "span_end": "2026-09-04T16:05:00+00:00",
+        "declared": True,
+    }
+    content.update(content_overrides)
+    return line(n, type="stimulus.gap", content=content)
+
+
+def rejection_line(n=1, **content_overrides):
+    content = {
+        "origin": "kitchen-surrogate",
+        "from_seq": 5,
+        "to_seq": 9,
+        "status": 400,
+        "reason": "malformed",
+    }
+    content.update(content_overrides)
+    return line(n, type="replication.batch_rejected", content=content)
+
+
+def test_a_well_formed_declared_gap_is_accepted():
+    assert len(parse(gap_line())) == 1
+
+
+def test_a_well_formed_rejection_marker_is_accepted():
+    assert len(parse(rejection_line())) == 1
+
+
+def test_a_surrogate_may_not_claim_the_hosts_word_for_an_undiagnosed_hole():
+    """`inferred` is host-minted precisely so a hole the host *diagnosed* can be told apart
+    from one a surrogate *reported*. A surrogate able to claim it erases the only distinction
+    the gap vocabulary carries."""
+    with pytest.raises(BatchRejected, match="only the host mints"):
+        parse(gap_line(reason="inferred"))
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"reason": "because"}, "unknown gap reason"),
+        ({"reason": None}, "unknown gap reason"),
+        ({"declared": False}, "declared="),
+        ({"declared": None}, "declared="),
+        ({"origin": ""}, "no usable origin"),
+        ({"origin": 7}, "no usable origin"),
+        ({"from_seq": 9, "to_seq": 5}, "inverted range"),
+        ({"from_seq": 0}, "seqs start at 1"),
+        ({"to_seq": True}, "non-integer to_seq"),
+        ({"span_start": "2026-09-04T17:00:00+00:00"}, "inverted span"),
+        ({"span_start": "2026-09-04T16:00:00"}, "no UTC offset"),
+        ({"span_end": "not a time"}, "unparseable span_end"),
+        ({"span_end": 7}, "non-string span_end"),
+    ],
+)
+def test_a_malformed_declared_gap_is_rejected(overrides, expected):
+    """`replication_events` validates only markers *this* node builds; both modules'
+    docstrings say the ingress must re-apply those rules to anything off the wire. Until it
+    did, every one of these landed on a permanent tape."""
+    with pytest.raises(BatchRejected, match=expected):
+        parse(gap_line(**overrides))
+
+
+@pytest.mark.parametrize("missing", ["origin", "from_seq", "to_seq", "reason", "span_start"])
+def test_a_declared_gap_missing_a_field_is_rejected(missing):
+    content = {k: v for k, v in {
+        "origin": "kitchen-surrogate", "from_seq": 5, "to_seq": 9,
+        "reason": "storage_pressure",
+        "span_start": "2026-09-04T16:00:00+00:00",
+        "span_end": "2026-09-04T16:05:00+00:00", "declared": True,
+    }.items() if k != missing}
+
+    with pytest.raises(BatchRejected, match=f"no {missing}"):
+        parse(line(1, type="stimulus.gap", content=content))
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"status": 500}, "a 5xx was never a rejection"),
+        ({"status": 200}, "a 5xx was never a rejection"),
+        ({"status": "400"}, "non-integer status"),
+        ({"reason": ""}, "no reason"),
+        ({"reason": None}, "no reason"),
+        ({"reason": "x" * 5000}, "over the 500 bound"),
+        ({"from_seq": 9, "to_seq": 5}, "inverted range"),
+    ],
+)
+def test_a_malformed_rejection_marker_is_rejected(overrides, expected):
+    """A `5xx` is retried, not rejected — one recorded here would claim a batch was abandoned
+    while the surrogate is still trying to send it. And the reason is a remote host's words
+    being copied onto an append-only tape by way of the surrogate, so the same bound applies
+    on the way in as on the way out."""
+    with pytest.raises(BatchRejected, match=expected):
+        parse(rejection_line(**overrides))
+
+
+def test_an_ordinary_event_is_not_held_to_the_marker_schema():
+    """Only the two marker types are checked. An observation whose content happens to carry a
+    `status` or a `reason` is just an observation."""
+    assert len(parse(line(1, content={"status": 500, "reason": "", "from_seq": 9}))) == 1

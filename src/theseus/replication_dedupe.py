@@ -50,14 +50,20 @@ class BatchPlan:
     exactly when there is nothing to write. Advancing before the commit would leave the mark
     claiming events the log does not have — the direction that silently drops a retry.
 
-    `inferred_hole` is the inclusive range the host minted a marker for, or `None` when there
-    was no hole *or* the surrogate had already explained it. It is the plan's answer to "did
-    the host have to guess", which is what an operator wants to count.
+    `inferred_holes` are the inclusive ranges the host minted markers for — empty when there
+    was no hole, or when the batch's own declared markers already accounted for all of it. It
+    is the plan's answer to "how much did the host have to guess", which is what an operator
+    wants to count.
+
+    There can be more than one. `parse_batch` accepts a batch whose seqs ascend without being
+    contiguous — a surrogate that evicted events under storage pressure has real holes in its
+    buffer — so a single batch can reveal a hole before its first event *and* between any two
+    of them.
     """
 
     to_append: tuple[StimulusEvent, ...]
     new_high_water: int | None
-    inferred_hole: tuple[int, int] | None
+    inferred_holes: tuple[tuple[int, int], ...] = ()
 
 
 def plan_batch(
@@ -102,36 +108,88 @@ def plan_batch(
     mark = 0 if high_water is None else high_water
     tail = tuple(event for event in events if event.seq > mark)
     if not tail:
-        return BatchPlan(to_append=(), new_high_water=None, inferred_hole=None)
+        return BatchPlan(to_append=(), new_high_water=None)
 
-    hole: tuple[int, int] | None = None
-    if tail[0].seq > mark + 1:
-        hole = (mark + 1, tail[0].seq - 1)
-        if _declared_in(events, origin, hole):
-            # The surrogate explained it itself, and its marker is already one of the events
-            # being committed. The host adds nothing — that is the whole distinction between
-            # a declared and an inferred gap, and minting a second marker beside the first
-            # would erase it.
-            hole = None
+    # Every hole the commit will step over, then whatever the batch explains for itself
+    # subtracted from it. The host mints for the residue only: what nobody accounted for.
+    unexplained = _unexplained(_holes(mark, tail), _declared_ranges(tail, origin))
 
-    marker: tuple[StimulusEvent, ...] = ()
-    if hole is not None:
-        marker = (
-            _inferred_marker(
-                origin=origin,
-                hole=hole,
-                host_origin=host_origin,
-                now=now,
-                lower_bound=previous_ts,
-                upper_bound=tail[0].ts,
-            ),
+    markers = tuple(
+        _inferred_marker(
+            origin=origin,
+            hole=hole,
+            host_origin=host_origin,
+            now=now,
+            lower_bound=previous_ts,
+            upper_bound=tail[0].ts,
         )
+        for hole in unexplained
+    )
 
     return BatchPlan(
-        to_append=marker + tail,
+        to_append=markers + tail,
         new_high_water=tail[-1].seq,
-        inferred_hole=hole,
+        inferred_holes=unexplained,
     )
+
+
+def _holes(mark: int, tail: Sequence[StimulusEvent]) -> tuple[tuple[int, int], ...]:
+    """Every seq range this commit steps over without delivering, inclusive.
+
+    Two kinds, and they were not always treated alike. The *leading* hole sits between the
+    mark and the batch's first event. An *internal* hole sits between two events of the same
+    batch — which exists because `parse_batch` deliberately accepts ascending-but-not-
+    contiguous batches, so that a surrogate whose buffer has real holes in it is not told to
+    throw away the events it still has.
+
+    Before internal holes were counted, delivering `[5, 9]` after a mark of 4 advanced the
+    mark to 9 and recorded nothing: seqs 6-8 became permanently undeliverable *and*
+    unaccounted for, while the very same hole split across two batches (`[5]` then `[9]`) was
+    recorded properly. The tape should not depend on how a surrogate happened to chunk its
+    backlog.
+    """
+    holes = []
+    if tail[0].seq > mark + 1:
+        holes.append((mark + 1, tail[0].seq - 1))
+    for earlier, later in zip(tail, tail[1:]):
+        if later.seq > earlier.seq + 1:
+            holes.append((earlier.seq + 1, later.seq - 1))
+    return tuple(holes)
+
+
+def _unexplained(
+    holes: Sequence[tuple[int, int]], declared: Sequence[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
+    """The holes left over once the batch's own declared markers are subtracted.
+
+    Subtraction, rather than asking whether any single marker covers a hole. Two markers can
+    jointly account for one hole and often will: a surrogate that evicts 5-7 under storage
+    pressure and then loses 8-9 to a dead link declares two ranges for what the host sees as
+    one gap. Requiring a single covering marker mints an `inferred` marker beside them saying
+    the surrogate may be dead — erasing the one distinction the gap vocabulary carries, and
+    inflating the count an operator reads as "how often did the host have to guess".
+
+    A partial explanation still leaves a residue, and the residue still earns a marker: 5-7
+    explained of a 5-9 hole leaves 8-9 genuinely unaccounted for, and a readable hole beats a
+    silence.
+    """
+    remaining: list[tuple[int, int]] = []
+    covers = sorted(declared)
+    for start, end in holes:
+        cursor = start
+        for cover_start, cover_end in covers:
+            if cover_end < cursor:
+                continue
+            if cover_start > end:
+                break
+            if cover_start > cursor:
+                remaining.append((cursor, min(cover_start - 1, end)))
+            cursor = max(cursor, cover_end + 1)
+            if cursor > end:
+                break
+        if cursor <= end:
+            remaining.append((cursor, end))
+    return tuple(remaining)
 
 
 def _check_ascending(events: Sequence[StimulusEvent]) -> None:
@@ -156,36 +214,34 @@ def _check_ascending(events: Sequence[StimulusEvent]) -> None:
             )
 
 
-def _declared_in(
-    events: Sequence[StimulusEvent], origin: str, hole: tuple[int, int]
-) -> bool:
-    """Did the surrogate already explain this hole itself?
+def _declared_ranges(
+    tail: Sequence[StimulusEvent], origin: str
+) -> tuple[tuple[int, int], ...]:
+    """The ranges this batch explains about its own stream, for subtracting from the holes.
 
-    Its marker rides in this very batch because `seq` is assigned at the surrogate's local
-    write time: it evicts 5–9, then writes the marker as seq 10, so the batch that opens the
-    hole is the batch that explains it.
+    A surrogate's marker rides in the batch that opens the hole, because `seq` is assigned at
+    its local write time: it evicts 5-9, then writes the marker as seq 10.
 
-    Coverage must be total. A marker explaining 5–7 of a 5–9 hole leaves 8–9 unaccounted for,
-    and a readable hole beats a silence — so a partial explanation still earns an inferred
-    marker beside it. Two overlapping markers is a legible tape; a half-explained hole is not.
+    Only the `tail` is scanned, never the whole batch. A marker below the mark is one the host
+    already has, and is discarded here along with every other duplicate — counting it would
+    let an already-committed marker silence a hole nothing in this batch explains.
 
-    The content is read defensively because it came off the wire: `replication_events`
-    validates only markers *this* node builds, and nothing stops a buggy surrogate sending a
-    `stimulus.gap` whose range is a string, a bool, or about somebody else's origin. A marker
-    this function cannot read is a marker that explains nothing.
+    The content is read defensively even though `parse_batch` now re-applies
+    `replication_events`' rules at the door: this function is reachable from a caller that
+    never went through that door, and a marker it cannot read is a marker that explains
+    nothing.
     """
-    start, end = hole
-    for event in events:
+    ranges = []
+    for event in tail:
         if event.type != GAP or not isinstance(event.content, dict):
             continue
         if event.content.get("origin") != origin:
             continue
         from_seq = _as_seq(event.content.get("from_seq"))
         to_seq = _as_seq(event.content.get("to_seq"))
-        if from_seq is not None and to_seq is not None:
-            if from_seq <= start and to_seq >= end:
-                return True
-    return False
+        if from_seq is not None and to_seq is not None and to_seq >= from_seq:
+            ranges.append((from_seq, to_seq))
+    return tuple(ranges)
 
 
 def _as_seq(value: Any) -> int | None:

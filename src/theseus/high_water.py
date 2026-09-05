@@ -76,6 +76,20 @@ class HighWaterMarks:
         # *backwards* — the direction that re-appends a retried batch into the agent's
         # permanent memory. `StimulusLog` locks its own counter for the same reason.
         self._lock = threading.Lock()
+
+        # Held by the ingress across its whole read-mark → plan → write → advance sequence,
+        # which the two locks above cannot cover: they make each individual read and write
+        # indivisible, and what the dedupe rules need indivisible is the *span between* them.
+        #
+        # It lives here rather than on the ingress because the invariant belongs to this
+        # object. One `HighWaterMarks` per log is this class's stated precondition, so a lock
+        # here is one lock per log; a lock on the ingress is one per ingress, and two
+        # ingresses sharing one marks object — the arrangement this docstring recommends —
+        # would then hold different locks and double-append a concurrently retried batch.
+        # Measured: two ingresses, one marks object, one batch delivered to both at once, and
+        # the log came back holding seqs [1, 2, 3, 1, 2, 3].
+        self.commit_lock = threading.Lock()
+
         for event in log.read_all():
             seq = _committed_seq(event)
             if seq is not None:
