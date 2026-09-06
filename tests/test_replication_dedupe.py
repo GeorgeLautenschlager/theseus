@@ -296,6 +296,67 @@ def test_the_markers_own_ts_is_the_hosts_clock_not_the_producers():
     assert result.to_append[0].ts == NOW
 
 
+# --- Per-hole spans -------------------------------------------------------------
+def test_an_internal_hole_spans_the_events_it_sits_between():
+    """The hole is between seq 3 and seq 7, so its honest bounds are their timestamps —
+    not the mark's last event and the batch's first. The once-per-batch bounds ended
+    before the events they claimed to cover."""
+    result = plan([event(3), event(7)], high_water=2, previous_ts=event(2).ts)
+
+    assert result.inferred_holes == ((4, 6),)
+    content = result.to_append[0].content
+    assert content["span_start"] == event(3).ts.isoformat()
+    assert content["span_end"] == event(7).ts.isoformat()
+
+
+def test_a_leading_hole_still_spans_from_the_mark_to_the_first_event():
+    """The leading hole was the one case the old bounds were right for; per-hole
+    arithmetic must not move it."""
+    result = plan([event(5), event(6)], high_water=2, previous_ts=event(2).ts)
+
+    assert result.inferred_holes == ((3, 4),)
+    content = result.to_append[0].content
+    assert content["span_start"] == event(2).ts.isoformat()
+    assert content["span_end"] == event(5).ts.isoformat()
+
+
+def test_a_batch_with_both_kinds_of_hole_bounds_each_one_its_own_way():
+    """One batch, two holes: leading (3, 4) and internal (6, 6). Each marker carries the
+    bounds of its own hole — which differ, so a single pair passed to both cannot be right."""
+    result = plan([event(5), event(7)], high_water=2, previous_ts=event(2).ts)
+
+    assert result.inferred_holes == ((3, 4), (6, 6))
+    leading, internal = result.to_append[:2]
+    assert leading.content["span_start"] == event(2).ts.isoformat()
+    assert leading.content["span_end"] == event(5).ts.isoformat()
+    assert internal.content["span_start"] == event(5).ts.isoformat()
+    assert internal.content["span_end"] == event(7).ts.isoformat()
+
+
+def test_a_fragment_left_by_a_partial_declaration_keeps_honest_bounds():
+    """A declared marker covering 6-7 of a 6-8 hole leaves fragment (8, 8) — and its
+    bounds come from the events around *that* fragment: seq 5 behind it, the surrogate's
+    own marker ahead of it. Carrying the original hole's bounds across the subtraction
+    would span past what was explained."""
+    result = plan([event(5), gap_event(9, 6, 7), event(10)], high_water=4)
+
+    assert result.inferred_holes == ((8, 8),)
+    content = result.to_append[0].content
+    assert (content["from_seq"], content["to_seq"]) == (8, 8)
+    assert content["span_start"] == event(5).ts.isoformat()
+    assert content["span_end"] == gap_event(9, 6, 7).ts.isoformat()
+
+
+def test_first_contact_above_seq_1_still_collapses_to_zero_width():
+    """Nothing committed for the origin means no lower bound is known anywhere — not even
+    per hole. The leading hole's span says exactly that."""
+    result = plan([event(5)], high_water=None)
+
+    assert result.inferred_holes == ((1, 4),)
+    content = result.to_append[0].content
+    assert content["span_start"] == content["span_end"] == event(5).ts.isoformat()
+
+
 # --- Preconditions --------------------------------------------------------------
 def test_an_empty_batch_is_a_caller_bug():
     with pytest.raises(ValueError, match="at least one event"):

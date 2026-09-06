@@ -114,20 +114,22 @@ def plan_batch(
     # subtracted from it. The host mints for the residue only: what nobody accounted for.
     unexplained = _unexplained(_holes(mark, tail), _declared_ranges(tail, origin))
 
-    markers = tuple(
-        _inferred_marker(
-            origin=origin,
-            hole=hole,
-            host_origin=host_origin,
-            now=now,
-            lower_bound=previous_ts,
-            upper_bound=tail[0].ts,
+    markers = []
+    for hole in unexplained:
+        lower, upper = _bounds_for(hole, tail, previous_ts)
+        markers.append(
+            _inferred_marker(
+                origin=origin,
+                hole=hole,
+                host_origin=host_origin,
+                now=now,
+                lower_bound=lower,
+                upper_bound=upper,
+            )
         )
-        for hole in unexplained
-    )
 
     return BatchPlan(
-        to_append=markers + tail,
+        to_append=tuple(markers) + tail,
         new_high_water=tail[-1].seq,
         inferred_holes=unexplained,
     )
@@ -190,6 +192,36 @@ def _unexplained(
         if cursor <= end:
             remaining.append((cursor, end))
     return tuple(remaining)
+
+
+def _bounds_for(
+    hole: tuple[int, int],
+    tail: Sequence[StimulusEvent],
+    previous_ts: datetime | None,
+) -> tuple[datetime | None, datetime]:
+    """The host's honest span for one unexplained fragment, from its own seqs.
+
+    Derived against `tail` at the point markers are built, not carried from before
+    `_unexplained` ran: subtraction can split a hole into fragments, and each fragment
+    sits between different events. The lower bound is the last tail event behind it; the
+    upper bound, the first ahead of it. A leading fragment has nothing behind it in the
+    batch, so it falls back to `previous_ts` — and to the zero-width collapse when that
+    is `None` too.
+
+    Every hole `_holes` can produce sits before some tail event (it was made by one),
+    so the upper bound always exists; the assert names the invariant rather than
+    guarding it, because there is no honest value for a bound that cannot be missing.
+    """
+    from_seq, to_seq = hole
+    lower = previous_ts
+    upper: datetime | None = None
+    for event in tail:  # ascending by seq
+        if event.seq < from_seq:
+            lower = event.ts
+        if upper is None and event.seq > to_seq:
+            upper = event.ts
+    assert upper is not None, "every hole sits before the tail event that made it"
+    return lower, upper
 
 
 def _check_ascending(events: Sequence[StimulusEvent]) -> None:

@@ -6,7 +6,7 @@ from theseus.memory import Memory
 from theseus.memory_module import Episode, MemoryModule
 from theseus.memory_note import MemoryNote
 from theseus.memory_store import MemoryStore
-from theseus.replication_ingress import ReplicationIngress
+from theseus.replication_ingress import ReentrantIngest, ReplicationIngress
 from theseus.schedule import Schedule
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.time_observer import TimeObserver
@@ -35,6 +35,7 @@ __all__ = [
     "StimulusEvent",
     "StimulusLog",
     "TimeObserver",
+    "ReentrantIngest",
     "ReplicationIngress",
     "RecallTool",
     "Tool",

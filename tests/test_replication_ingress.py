@@ -847,6 +847,20 @@ def test_an_oversized_body_is_refused_before_it_is_buffered(log):
     assert log.read_all() == []
 
 
+def test_a_body_of_exactly_the_limit_is_committed(log):
+    """The streaming bound and `parse_batch`'s own check both reject *over* the limit,
+    so a body exactly at it must land. An off-by-one in either place — `>` becoming
+    `>=` — fails here, with nothing else pinning the two checks to agree."""
+    body = batch(1)
+    ingress = ReplicationIngress(log, HighWaterMarks(log), max_bytes=len(body))
+    client = TestClient(ingress.build_app())
+
+    response = client.post("/replicate", content=body)
+
+    assert response.status_code == 200
+    assert seqs_on(log) == [1]
+
+
 def _asgi_post(app, chunks: list[bytes], *, content_length: int | None):
     """Drive the ASGI app directly so a test can declare one length and send another, and
     count exactly how many body bytes the endpoint pulled before it answered. `TestClient`
