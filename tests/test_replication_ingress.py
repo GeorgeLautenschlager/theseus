@@ -295,6 +295,79 @@ def test_the_marker_and_its_events_land_in_one_write(ingress, log):
     assert len({e.appended_ts for e in events}) == 1
 
 
+# --- The lower bound of an inferred span ----------------------------------------
+def _marker(log, about: str = SURROGATE):
+    return [e for e in log.read_all() if e.type == GAP and e.content["origin"] == about][0]
+
+
+def test_a_second_batchs_inferred_gap_spans_from_the_first_batches_last_event(ingress, log):
+    """The host knows where this origin's stream last arrived: the `ts` of its last
+    committed event. The gap's span starts there — a lower bound the host actually has,
+    not a guess."""
+    ingress.ingest(batch(1, 2))
+    ingress.ingest(batch(5))
+
+    events = {e.seq: e for e in log.read_all() if e.origin == SURROGATE}
+    marker = _marker(log)
+
+    assert marker.content["span_start"] == events[2].ts.isoformat()
+    assert marker.content["span_end"] == events[5].ts.isoformat()
+    assert marker.content["span_start"] != marker.content["span_end"]
+
+
+def test_a_first_batchs_inferred_gap_stays_zero_width(ingress, log):
+    """Nothing committed from the origin means no lower bound is known. The zero-width span
+    says exactly that — the remembered clock must not fabricate a bound where there is
+    none."""
+    ingress.ingest(batch(5))
+
+    marker = _marker(log)
+
+    assert marker.content["span_start"] == marker.content["span_end"]
+
+
+def test_the_remembered_clock_is_per_origin(ingress, log):
+    """One clock per origin, not one per ingress. A hole in beta's stream spans from beta's
+    own last event — not from whatever alpha committed most recently."""
+    ingress.ingest(batch(1, origin="beta"))
+    ingress.ingest(batch(1, 2, origin="alpha"))  # the latest commit overall is alpha's
+
+    ingress.ingest(batch(5, origin="beta"))
+
+    beta = {e.seq: e for e in log.read_all() if e.origin == "beta"}
+
+    assert _marker(log, about="beta").content["span_start"] == beta[1].ts.isoformat()
+
+
+def test_a_duplicate_batch_does_not_move_the_remembered_clock(ingress, log):
+    """A lost-ack retry appends nothing — and must not rewrite where the next gap's span
+    starts from. The clock moves only when an event actually lands."""
+    ingress.ingest(batch(1, 2))
+    ingress.ingest(batch(1, 2))
+
+    ingress.ingest(batch(5))
+
+    events = {e.seq: e for e in log.read_all() if e.origin == SURROGATE}
+
+    assert _marker(log).content["span_start"] == events[2].ts.isoformat()
+
+
+def test_a_host_minted_marker_is_not_the_origins_clock(ingress, log):
+    """A marker's own `ts` is the host's clock — when the hole was noticed. Remembering it
+    as the origin's clock would make every later span start from a moment on the host,
+    not a moment in the origin's stream."""
+    ingress.ingest(batch(1, 2))
+    ingress.ingest(batch(5, 6))  # mints the (3, 4) gap, appends 5 and 6
+
+    ingress.ingest(batch(9))  # hole (7, 8): its span must start at seq 6's ts
+
+    events = {e.seq: e for e in log.read_all() if e.origin == SURROGATE}
+    markers = [e for e in log.read_all() if e.type == GAP]
+
+    assert (markers[-1].content["from_seq"], markers[-1].content["to_seq"]) == (7, 8)
+    assert markers[-1].content["span_start"] == events[6].ts.isoformat()
+
+
 # --- Rejection ------------------------------------------------------------------
 def test_a_malformed_batch_is_a_4xx_and_commits_nothing(ingress, log):
     result = ingress.ingest("{not json\n")

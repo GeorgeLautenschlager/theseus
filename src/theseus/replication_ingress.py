@@ -230,6 +230,12 @@ class ReplicationIngress:
         # created here would be one per ingress, and two ingresses over one log would each
         # hold their own and double-append a concurrently retried batch.
         self._commit_lock = marks.commit_lock
+        # The last committed `ts` per origin, in memory only. It is the lower bound of an
+        # inferred gap's span — and it dies with the process on purpose: after a restart
+        # the honest answer is `None`, which mints a zero-width span saying "no lower bound
+        # known" rather than one that pretends to remember. Deriving it from the log at boot
+        # would touch `HighWaterMarks`; that is a follow-up, not this round.
+        self._last_ts: dict[str, datetime] = {}
         self._trigger = (
             CoalescingTrigger(on_arrival) if on_arrival is not None else None
         )
@@ -277,10 +283,15 @@ class ReplicationIngress:
                 high_water=self._marks.high_water(origin),
                 host_origin=self._log.origin,
                 now=datetime.now(timezone.utc),
+                previous_ts=self._last_ts.get(origin),
             )
             if plan.to_append:
                 self._log.append_many(plan.to_append)
                 self._marks.advance(origin, plan.new_high_water)
+                # Markers are prepended to the write, so its last event is a replicated one —
+                # the origin's clock, not the host's mint time. A duplicate appends nothing
+                # and moves nothing: a retry must not rewrite where the next span starts.
+                self._last_ts[origin] = plan.to_append[-1].ts
             high_water = self._marks.high_water(origin)
 
         # Outside the lock, and only for a batch that actually added something. A duplicate
