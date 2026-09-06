@@ -8,6 +8,10 @@ from theseus.memory_note import MemoryNote
 from theseus.memory_store import MemoryStore
 from theseus.replication_ingress import ReentrantIngest, ReplicationIngress
 from theseus.schedule import Schedule
+from theseus.surrogates.cursor import AckedCursor
+from theseus.surrogates.http_transport import HttpTransport
+from theseus.surrogates.replicator import Replicator
+from theseus.surrogates.transport import StimulusTransport
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.time_observer import TimeObserver
 from theseus.tools import (
@@ -37,6 +41,10 @@ __all__ = [
     "TimeObserver",
     "ReentrantIngest",
     "ReplicationIngress",
+    "AckedCursor",
+    "HttpTransport",
+    "Replicator",
+    "StimulusTransport",
     "RecallTool",
     "Tool",
     "ToolCall",
