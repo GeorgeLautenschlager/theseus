@@ -29,6 +29,7 @@ packages = [{ include = "theseus", from = "src" }]
 pytest = ">=8"
 
 # Screen-capture deps for surrogates; install with `poetry install --with surrogates`.
+httpx = "^0.28.1"
 [tool.poetry.group.surrogates]
 optional = true
 

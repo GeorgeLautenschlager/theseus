@@ -1,10 +1,12 @@
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
+from theseus.high_water import HighWaterMarks
 from theseus.ooda_core import OODACore
 from theseus.memory import Memory
 from theseus.memory_module import Episode, MemoryModule
 from theseus.memory_note import MemoryNote
 from theseus.memory_store import MemoryStore
+from theseus.replication_ingress import ReplicationIngress
 from theseus.schedule import Schedule
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.time_observer import TimeObserver
@@ -22,6 +24,7 @@ from theseus.tools import (
 __all__ = [
     "AgenticMemory",
     "Autocore",
+    "HighWaterMarks",
     "OODACore",
     "Episode",
     "Memory",
@@ -32,6 +35,7 @@ __all__ = [
     "StimulusEvent",
     "StimulusLog",
     "TimeObserver",
+    "ReplicationIngress",
     "RecallTool",
     "Tool",
     "ToolCall",
