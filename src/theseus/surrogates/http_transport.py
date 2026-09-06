@@ -30,7 +30,17 @@ class HttpTransport:
 
     def send(self, body: str) -> TransportResult:
         own_client = self._client is None
-        client = self._client if not own_client else httpx.Client(timeout=self._timeout)
+        # `follow_redirects=False` is the protocol, not a default worth inheriting. A `3xx`
+        # from a misconfigured host or a proxy must reach the replicator as a non-2xx so the
+        # drain stops; following it silently would POST the batch somewhere nobody chose and
+        # report whatever that answered as the ack. httpx already defaults to False — pinned
+        # explicitly because `TestClient`, which the tests inject, defaults to True, so the
+        # seam would otherwise disagree with production on exactly this axis.
+        client = (
+            self._client
+            if not own_client
+            else httpx.Client(timeout=self._timeout, follow_redirects=False)
+        )
         try:
             response = client.post(
                 self._url,

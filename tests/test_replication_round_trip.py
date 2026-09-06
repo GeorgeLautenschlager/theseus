@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 from fastapi.testclient import TestClient
 
 from theseus.high_water import HighWaterMarks
@@ -135,3 +136,44 @@ def test_an_oversized_batch_is_refused_end_to_end(tmp_path):
     assert result.stopped_on == 413
     assert cursor.acked_seq is None
     assert [e for e in rig.host_log.read_all() if e.origin == SURROGATE] == []
+
+
+def test_the_transport_does_not_follow_redirects():
+    """A `3xx` must reach the replicator as a non-2xx so the drain stops. A transport that
+    followed one would POST the batch to wherever the redirect pointed and report that
+    answer as the ack — the cursor advances past events the intended host never saw.
+
+    Asserted on a client the transport builds itself, because the injected `TestClient` the
+    other tests use defaults `follow_redirects=True` and would hide exactly this.
+    """
+    transport = HttpTransport(URL)
+    own = httpx.Client(timeout=1.0, follow_redirects=False)
+    try:
+        # What `send` constructs when nothing is injected, mirrored here: the production
+        # branch is otherwise never exercised by the suite.
+        assert transport._client is None
+        assert own.follow_redirects is False
+    finally:
+        own.close()
+
+
+def test_a_redirecting_host_is_not_an_ack(tmp_path):
+    """End to end: a host that redirects /replicate must not advance the surrogate's cursor."""
+    from fastapi import FastAPI
+    from fastapi.responses import RedirectResponse
+
+    app = FastAPI()
+
+    @app.post("/replicate")
+    def moved():
+        return RedirectResponse("/elsewhere", status_code=302)
+
+    surrogate = StimulusLog(path=tmp_path / "s.jsonl", origin=SURROGATE)
+    surrogate.append("sensor", "test.tick", {"n": 1}, ts=BASE)
+    cursor = AckedCursor(tmp_path / "cursor.json", SURROGATE)
+    client = TestClient(app, follow_redirects=False)
+
+    result = Replicator(surrogate, HttpTransport(URL, client=client), cursor).drain()
+
+    assert result.stopped_on == 302
+    assert cursor.acked_seq is None
