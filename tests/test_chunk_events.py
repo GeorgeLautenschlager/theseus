@@ -82,6 +82,24 @@ def test_every_batch_fits_what_the_host_accepts():
         assert body_bytes(batch) <= max_bytes
 
 
+def test_the_separator_newlines_are_counted_against_the_limit():
+    """A body is lines *joined by* newlines, so N events cost N separators. Counting only
+    the JSON under-measures by N bytes — too small to show up unless the limit sits exactly
+    on the boundary, which is where a surrogate and a host actually disagree.
+
+    `max_bytes` here is exactly two bare `to_json()` lengths: room for two events only if
+    the newlines are free. They are not, so the honest answer is batches of one.
+    """
+    events = [make_event(i) for i in range(1, 3)]
+    bare = sum(len(e.to_json().encode("utf-8")) for e in events)
+
+    batches = chunk_events(events, max_events=50, max_bytes=bare)
+
+    for batch in batches:
+        assert body_bytes(batch) <= bare
+    assert [len(b) for b in batches] == [1, 1]
+
+
 def test_no_event_is_lost_or_duplicated_across_batches():
     events = [make_event(i) for i in range(1, 8)]
     sizes = [line_bytes(e) for e in events]
