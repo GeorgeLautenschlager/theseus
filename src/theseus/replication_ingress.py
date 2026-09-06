@@ -174,6 +174,16 @@ class Ingested:
         return body
 
 
+class ReentrantIngest(RuntimeError):
+    """`ingest` was entered on a thread that already holds the commit lock.
+
+    The only path there is a listener calling `ingest`: the log notifies listeners on the
+    appending thread, and `ReplicationIngress` holds its commit lock across the write that
+    triggers the notification. Raised instead of deadlocking, so a relay that forwards what
+    it receives hears about it at once. Catch this specifically — a bare `RuntimeError`
+    would be indistinguishable from anything else going wrong under the lock."""
+
+
 class ReplicationIngress:
     """Where a surrogate's events land: parse, dedupe, commit, nudge.
 
@@ -199,12 +209,14 @@ class ReplicationIngress:
     It is taken from the `HighWaterMarks` rather than created here, so that it is one lock per
     *log* rather than one per ingress; see that class for why the difference bites.
 
-    **A listener must not call `ingest`.** `StimulusLog` notifies listeners outside its own
-    lock, and explicitly allows one to append — but this class holds `_commit_lock` across
-    `append_many`, so a listener runs underneath it. `threading.Lock` is not reentrant, so a
-    listener that ingests deadlocks that thread permanently and no batch from any origin ever
-    commits again. A relay — a host forwarding what it receives — is the plausible way to
-    write this by accident.
+    **A listener must not call `ingest` — enforced.** `StimulusLog` notifies listeners outside
+    its own lock, and explicitly allows one to append — but this class holds `_commit_lock`
+    across `append_many`, so a listener runs underneath it. The commit is therefore tracked
+    per thread: `ingest` entered on the thread that already holds the lock raises
+    `ReentrantIngest` immediately, naming the cause, instead of deadlocking that thread
+    permanently. Two different threads still serialise on the lock exactly as before; only
+    same-thread re-entry raises. A relay — a host forwarding what it receives — is the
+    plausible way to write this by accident, and now hears about it at once.
 
     **Why the mark advances after the write.** A mark claiming events the log does not have
     silently discards the retry that would have delivered them. If the process dies between
@@ -230,6 +242,11 @@ class ReplicationIngress:
         # created here would be one per ingress, and two ingresses over one log would each
         # hold their own and double-append a concurrently retried batch.
         self._commit_lock = marks.commit_lock
+        # The thread currently holding `_commit_lock`, or None. It exists only for the
+        # same-thread case: a listener that calls `ingest` from inside its own commit must
+        # raise at once, not block on a lock it already holds. Different threads never see
+        # this value and still serialise on the lock itself.
+        self._lock_holder: int | None = None
         # The last committed `ts` per origin, in memory only. It is the lower bound of an
         # inferred gap's span — and it dies with the process on purpose: after a restart
         # the honest answer is `None`, which mints a zero-width span saying "no lower bound
@@ -277,22 +294,38 @@ class ReplicationIngress:
             )
 
         origin = events[0].origin
-        with self._commit_lock:
-            plan = plan_batch(
-                events,
-                high_water=self._marks.high_water(origin),
-                host_origin=self._log.origin,
-                now=datetime.now(timezone.utc),
-                previous_ts=self._last_ts.get(origin),
+        if threading.get_ident() == self._lock_holder:
+            # The only path here is a listener calling `ingest` from inside its own commit —
+            # the log notifies on the appending thread, which is this one. Raising instead
+            # of blocking turns a permanent, undiagnosable deadlock into an immediate error
+            # that names the cause. The log swallows listener exceptions, so this surfaces
+            # to the listener itself and never un-commits the batch underneath it.
+            raise ReentrantIngest(
+                "re-entrant ingest: a listener called ingest from inside a commit — the log "
+                "notifies listeners on the appending thread while this ingress still holds "
+                "its commit lock; a relay that forwards what it receives must not do so "
+                "synchronously"
             )
-            if plan.to_append:
-                self._log.append_many(plan.to_append)
-                self._marks.advance(origin, plan.new_high_water)
-                # Markers are prepended to the write, so its last event is a replicated one —
-                # the origin's clock, not the host's mint time. A duplicate appends nothing
-                # and moves nothing: a retry must not rewrite where the next span starts.
-                self._last_ts[origin] = plan.to_append[-1].ts
-            high_water = self._marks.high_water(origin)
+        with self._commit_lock:
+            self._lock_holder = threading.get_ident()
+            try:
+                plan = plan_batch(
+                    events,
+                    high_water=self._marks.high_water(origin),
+                    host_origin=self._log.origin,
+                    now=datetime.now(timezone.utc),
+                    previous_ts=self._last_ts.get(origin),
+                )
+                if plan.to_append:
+                    self._log.append_many(plan.to_append)
+                    self._marks.advance(origin, plan.new_high_water)
+                    # Markers are prepended to the write, so its last event is a replicated one —
+                    # the origin's clock, not the host's mint time. A duplicate appends nothing
+                    # and moves nothing: a retry must not rewrite where the next span starts.
+                    self._last_ts[origin] = plan.to_append[-1].ts
+                high_water = self._marks.high_water(origin)
+            finally:
+                self._lock_holder = None
 
         # Outside the lock, and only for a batch that actually added something. A duplicate
         # is the surrogate re-asking a question already answered; waking the agent for it

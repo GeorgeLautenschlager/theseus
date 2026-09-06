@@ -10,7 +10,11 @@ from fastapi.testclient import TestClient
 
 from theseus.high_water import HighWaterMarks
 from theseus.replication_events import GAP
-from theseus.replication_ingress import CoalescingTrigger, ReplicationIngress
+from theseus.replication_ingress import (
+    CoalescingTrigger,
+    ReentrantIngest,
+    ReplicationIngress,
+)
 from theseus.stimulus_log import StimulusLog
 
 # Every wait in this file is bounded. A threading test that can hang is a threading test
@@ -512,6 +516,81 @@ def test_two_concurrent_deliveries_of_one_batch_commit_it_once(log, monkeypatch)
     assert seqs_on(log) == [1, 2, 3], "the batch was committed more than once"
     assert sorted(r.appended for r in results) == [0, 3]
     assert all(r.status == 200 for r in results)
+
+
+# --- Re-entrant ingest: a listener that forwards what it receives ---------------
+def test_a_listener_that_ingests_raises_instead_of_deadlocking(log):
+    """The relay bug, bounded. A listener that forwards what it receives calls `ingest`
+    from inside the commit — on the thread that holds `_commit_lock`. Before the fix that
+    blocked forever, so the outer ingest runs on a worker thread joined with a timeout:
+    a wrong implementation fails by hitting the bound rather than hanging the suite."""
+    ingress = ReplicationIngress(log, HighWaterMarks(log))
+    errors: list[Exception] = []
+
+    def relay(event):
+        try:
+            ingress.ingest(batch(4, 5))
+        except Exception as error:
+            errors.append(error)
+
+    unsubscribe = log.subscribe(relay)
+    # Daemon: a wrong implementation leaves this thread blocked forever, and a live
+    # non-daemon thread would hang the suite at teardown — the timeout must be the
+    # whole cost of a deadlock, not a build that never finishes.
+    worker = threading.Thread(target=lambda: ingress.ingest(batch(1, 2, 3)), daemon=True)
+    worker.start()
+    worker.join(TIMEOUT)
+    assert not worker.is_alive(), "the re-entrant ingest deadlocked instead of raising"
+    unsubscribe()
+
+    assert errors, "the re-entrant ingest never raised"
+    assert all(isinstance(error, ReentrantIngest) for error in errors), (
+        f"expected ReentrantIngest from the re-entry, got {errors!r}"
+    )
+
+
+def test_the_reentry_error_names_the_cause(log):
+    ingress = ReplicationIngress(log, HighWaterMarks(log))
+    errors: list[Exception] = []
+
+    def relay(event):
+        try:
+            ingress.ingest(batch(4, 5))
+        except Exception as error:
+            errors.append(error)
+
+    unsubscribe = log.subscribe(relay)
+    worker = threading.Thread(target=lambda: ingress.ingest(batch(1, 2, 3)), daemon=True)
+    worker.start()
+    worker.join(TIMEOUT)
+    assert not worker.is_alive(), "the re-entrant ingest deadlocked instead of raising"
+    unsubscribe()
+
+    message = " ".join(str(error).lower() for error in errors)
+    assert "listener" in message and "re-entrant" in message, (
+        f"the re-entry error must name the cause, got: {errors!r}"
+    )
+
+
+def test_the_reentry_does_not_uncommit_the_batch_that_caused_it(log):
+    """The relay firing is a bug in the listener, not a reason to un-commit. The batch
+    that notified it is on disk and its mark advanced: the write happened before the
+    notification, and the log swallows listener errors by design."""
+    marks = HighWaterMarks(log)
+    ingress = ReplicationIngress(log, marks)
+
+    def relay(event):
+        ingress.ingest(batch(4, 5))
+
+    unsubscribe = log.subscribe(relay)
+    worker = threading.Thread(target=lambda: ingress.ingest(batch(1, 2, 3)), daemon=True)
+    worker.start()
+    worker.join(TIMEOUT)
+    assert not worker.is_alive(), "the re-entrant ingest deadlocked"
+    unsubscribe()
+
+    assert seqs_on(log) == [1, 2, 3], "the batch that notified the relay was un-committed"
+    assert marks.high_water(SURROGATE) == 3, "the mark did not advance past the committed batch"
 
 
 # --- The HTTP surface -----------------------------------------------------------
