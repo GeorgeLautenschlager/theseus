@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from theseus.replication_batch import (
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.transport import StimulusTransport
+
+logger = logging.getLogger(__name__)
 
 
 def chunk_events(
@@ -61,6 +64,8 @@ class DrainResult:
     events_sent: int
     acked_seq: int | None      # the cursor after this drain
     stopped_on: int | None     # the non-2xx status that ended it, or None if it drained fully
+    skipped_unsequenced: int = 0  # own-origin lines with no seq (pre-envelope): unreplicable by design
+    skipped_duplicate: int = 0    # repeat seqs dropped so the host's strict-ascending check cannot 400
 
 
 class Replicator:
@@ -93,15 +98,39 @@ class Replicator:
         with self._lock:
             acked = self._cursor.acked_seq
             pending: list[StimulusEvent] = []
+            skipped_unsequenced = 0
+            skipped_duplicate = 0
+            seen_seqs: set[int] = set()
             for event in self._log.read_all():
                 # Only this log's own origin — shipping host-origin events back would put two
-                # numbering authorities on one seq stream. `seq is None` lines predate the
-                # envelope and carry no dedupe identity, so they are not part of the stream.
-                if event.origin != self._log.origin or event.seq is None:
+                # numbering authorities on one seq stream.
+                if event.origin != self._log.origin:
+                    continue
+                if event.seq is None:
+                    # Predates the envelope: no dedupe identity, so it cannot be replicated —
+                    # shipping it earns a 400. Skip, but count; silence here is data loss.
+                    skipped_unsequenced += 1
                     continue
                 if acked is not None and event.seq <= acked:
                     continue
+                if event.seq in seen_seqs:
+                    # A repeat seq means two processes wrote this log (forbidden by the log's
+                    # contract, unenforceable across processes) or a restored backup. The host
+                    # 400s any batch whose seqs do not strictly ascend, so without this drop the
+                    # whole channel wedges — and the host would dedupe it anyway.
+                    skipped_duplicate += 1
+                    continue
+                seen_seqs.add(event.seq)
                 pending.append(event)
+            if skipped_unsequenced or skipped_duplicate:
+                # One line per drain, not per event: a 468-line legacy log must not produce
+                # 468 log lines.
+                logger.warning(
+                    "drain skipped %d event(s) that predate the seq envelope and cannot be "
+                    "replicated, and %d duplicate seq(s)",
+                    skipped_unsequenced,
+                    skipped_duplicate,
+                )
             # The log is arrival-ordered, but seq order is what the host's dedupe actually
             # depends on — it should not rest on a coincidence.
             pending.sort(key=lambda e: e.seq)
@@ -131,4 +160,6 @@ class Replicator:
                 events_sent=sent_events,
                 acked_seq=self._cursor.acked_seq,
                 stopped_on=stopped_on,
+                skipped_unsequenced=skipped_unsequenced,
+                skipped_duplicate=skipped_duplicate,
             )

@@ -8,6 +8,7 @@ broken implementation fails instead of hanging the suite.
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import time
@@ -307,3 +308,113 @@ def test_the_drain_orders_by_seq_not_by_file_order(tmp_path):
 
     assert seqs_in(transport.bodies) == [1, 2, 3, 4]
     assert cursor.acked_seq == 4
+
+
+def _raw_line(n: int, *, origin: str | None = None, seq: int | None = None) -> str:
+    """One pre-envelope log line: no `origin`, no `seq` — exactly what a log that
+    outlived the envelope upgrade contains. `log.append()` cannot produce these."""
+    d: dict = {
+        "id": f"raw-{n}",
+        "ts": f"2026-01-01T00:00:{n % 60:02d}+00:00",
+        "actor": "legacy",
+        "type": "legacy.event",
+        "content": {"n": n},
+    }
+    if origin is not None:
+        d["origin"] = origin
+    if seq is not None:
+        d["seq"] = seq
+    return json.dumps(d) + "\n"
+
+
+def test_pre_envelope_events_are_skipped_counted_and_reported(tmp_path):
+    """Lines that predate the seq envelope carry no dedupe identity, so they are not
+    part of the stream. Skipping them is correct; shipping them earns a 400. The defect
+    this pins is silence: they must be counted and reported, not vanish."""
+    path = tmp_path / "log.jsonl"
+    path.write_text(_raw_line(1) + _raw_line(2), encoding="utf-8")
+    log = StimulusLog(path, origin=ORIGIN)
+    append_n(log, 2)
+    transport = ScriptedTransport()
+    cursor = AckedCursor(tmp_path / "cursor.json", ORIGIN)
+
+    result = Replicator(log, transport, cursor).drain()
+
+    assert seqs_in(transport.bodies) == [1, 2]   # only the real events shipped
+    assert result.events_sent == 2
+    assert result.stopped_on is None             # and the drain still completes
+    assert result.skipped_unsequenced == 2
+    assert result.skipped_duplicate == 0
+
+
+def test_pre_envelope_skip_is_logged_once_not_per_event(tmp_path, caplog):
+    """A 468-line legacy log must not produce 468 log lines: one warning per drain."""
+    path = tmp_path / "log.jsonl"
+    path.write_text(_raw_line(1) + _raw_line(2) + _raw_line(3), encoding="utf-8")
+    log = StimulusLog(path, origin=ORIGIN)
+    append_n(log, 1)
+    transport = ScriptedTransport()
+    cursor = AckedCursor(tmp_path / "cursor.json", ORIGIN)
+
+    with caplog.at_level(logging.WARNING, logger="theseus.surrogates.replicator"):
+        Replicator(log, transport, cursor).drain()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "predate" in warnings[0].getMessage().lower()
+
+
+def test_duplicate_seq_does_not_wedge_the_channel(tmp_path):
+    """A duplicate seq means two processes wrote one log (forbidden but unenforceable)
+or a restored backup. The host 400s any batch whose seqs do not strictly ascend, so
+    without dedupe this log ships nothing — not even seq 1 — on every drain, forever.
+    Dropping the later occurrence is safe: the host would dedupe it anyway."""
+    path = tmp_path / "log.jsonl"
+    lines = []
+    for n, seq in enumerate([1, 2, 2, 3]):
+        d = json.loads(_raw_line(n))
+        d["id"] = f"dup-{seq}-{n}"   # the two seq-2 events are distinguishable
+        d["origin"] = ORIGIN
+        d["seq"] = seq
+        lines.append(json.dumps(d) + "\n")
+    path.write_text("".join(lines), encoding="utf-8")
+    log = StimulusLog(path, origin=ORIGIN)
+    transport = ScriptedTransport()
+    cursor = AckedCursor(tmp_path / "cursor.json", ORIGIN)
+
+    result = Replicator(log, transport, cursor).drain()
+
+    assert seqs_in(transport.bodies) == [1, 2, 3]   # the duplicate never reaches the wire
+    shipped = {json.loads(l)["id"]: json.loads(l)["seq"] for b in transport.bodies for l in b.splitlines() if l}
+    assert shipped["dup-2-1"] == 2                  # first occurrence kept, later one dropped
+    assert "dup-2-2" not in shipped
+    assert result.skipped_duplicate == 1
+    assert result.stopped_on is None                # the channel is not wedged
+    assert cursor.acked_seq == 3
+
+
+def test_clean_drain_reports_zero_for_both_counters(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 5)
+    transport = ScriptedTransport()
+    cursor = AckedCursor(tmp_path / "cursor.json", ORIGIN)
+
+    result = Replicator(log, transport, cursor).drain()
+
+    assert result.skipped_unsequenced == 0
+    assert result.skipped_duplicate == 0
+    assert result.stopped_on is None
+
+
+def test_3xx_stops_the_drain_and_does_not_advance_cursor(tmp_path):
+    """A 301/302 from a misconfigured host or proxy is not an ack. The success check is
+    pinned here: mutating it to `status >= 400` must fail this test."""
+    log = make_log(tmp_path)
+    append_n(log, 1)
+    transport = ScriptedTransport([302])
+    cursor = AckedCursor(tmp_path / "cursor.json", ORIGIN)
+
+    result = Replicator(log, transport, cursor).drain()
+
+    assert result.stopped_on == 302
+    assert result.acked_seq is None   # the cursor did not advance
