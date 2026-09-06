@@ -210,13 +210,16 @@ class ReplicationIngress:
     *log* rather than one per ingress; see that class for why the difference bites.
 
     **A listener must not call `ingest` — enforced.** `StimulusLog` notifies listeners outside
-    its own lock, and explicitly allows one to append — but this class holds `_commit_lock`
+    its own lock, and explicitly allows one to append — but this class holds the commit lock
     across `append_many`, so a listener runs underneath it. The commit is therefore tracked
     per thread: `ingest` entered on the thread that already holds the lock raises
     `ReentrantIngest` immediately, naming the cause, instead of deadlocking that thread
     permanently. Two different threads still serialise on the lock exactly as before; only
-    same-thread re-entry raises. A relay — a host forwarding what it receives — is the
-    plausible way to write this by accident, and now hears about it at once.
+    same-thread re-entry raises. The flag lives on the marks object beside the lock — one
+    per log, shared by every ingress over it — so the guard also holds when a listener calls
+    a *different* ingress over the same log, not just this instance. A relay — a host
+    forwarding what it receives — is the plausible way to write this by accident, and now
+    hears about it at once.
 
     **Why the mark advances after the write.** A mark claiming events the log does not have
     silently discards the retry that would have delivered them. If the process dies between
@@ -240,19 +243,10 @@ class ReplicationIngress:
         self._max_bytes = max_bytes
         # From the marks object, not a fresh one: see `HighWaterMarks.commit_lock`. A lock
         # created here would be one per ingress, and two ingresses over one log would each
-        # hold their own and double-append a concurrently retried batch.
+        # hold their own and double-append a concurrently retried batch. The re-entry flag
+        # and the remembered clock are read and written through the same object, for the
+        # same reason.
         self._commit_lock = marks.commit_lock
-        # The thread currently holding `_commit_lock`, or None. It exists only for the
-        # same-thread case: a listener that calls `ingest` from inside its own commit must
-        # raise at once, not block on a lock it already holds. Different threads never see
-        # this value and still serialise on the lock itself.
-        self._lock_holder: int | None = None
-        # The last committed `ts` per origin, in memory only. It is the lower bound of an
-        # inferred gap's span — and it dies with the process on purpose: after a restart
-        # the honest answer is `None`, which mints a zero-width span saying "no lower bound
-        # known" rather than one that pretends to remember. Deriving it from the log at boot
-        # would touch `HighWaterMarks`; that is a follow-up, not this round.
-        self._last_ts: dict[str, datetime] = {}
         self._trigger = (
             CoalescingTrigger(on_arrival) if on_arrival is not None else None
         )
@@ -294,7 +288,7 @@ class ReplicationIngress:
             )
 
         origin = events[0].origin
-        if threading.get_ident() == self._lock_holder:
+        if threading.get_ident() == self._marks.lock_holder:
             # The only path here is a listener calling `ingest` from inside its own commit —
             # the log notifies on the appending thread, which is this one. Raising instead
             # of blocking turns a permanent, undiagnosable deadlock into an immediate error
@@ -307,14 +301,14 @@ class ReplicationIngress:
                 "synchronously"
             )
         with self._commit_lock:
-            self._lock_holder = threading.get_ident()
+            self._marks.lock_holder = threading.get_ident()
             try:
                 plan = plan_batch(
                     events,
                     high_water=self._marks.high_water(origin),
                     host_origin=self._log.origin,
                     now=datetime.now(timezone.utc),
-                    previous_ts=self._last_ts.get(origin),
+                    previous_ts=self._marks.last_ts.get(origin),
                 )
                 if plan.to_append:
                     self._log.append_many(plan.to_append)
@@ -322,10 +316,10 @@ class ReplicationIngress:
                     # Markers are prepended to the write, so its last event is a replicated one —
                     # the origin's clock, not the host's mint time. A duplicate appends nothing
                     # and moves nothing: a retry must not rewrite where the next span starts.
-                    self._last_ts[origin] = plan.to_append[-1].ts
+                    self._marks.last_ts[origin] = plan.to_append[-1].ts
                 high_water = self._marks.high_water(origin)
             finally:
-                self._lock_holder = None
+                self._marks.lock_holder = None
 
         # Outside the lock, and only for a batch that actually added something. A duplicate
         # is the surrogate re-asking a question already answered; waking the agent for it

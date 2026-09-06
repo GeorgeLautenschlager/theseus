@@ -343,13 +343,37 @@ def test_the_remembered_clock_is_per_origin(ingress, log):
     assert _marker(log, about="beta").content["span_start"] == beta[1].ts.isoformat()
 
 
-def test_a_duplicate_batch_does_not_move_the_remembered_clock(ingress, log):
-    """A lost-ack retry appends nothing — and must not rewrite where the next gap's span
-    starts from. The clock moves only when an event actually lands."""
-    ingress.ingest(batch(1, 2))
-    ingress.ingest(batch(1, 2))
+def test_a_stale_partial_retry_does_not_move_the_remembered_clock(ingress, log):
+    """A lost-ack retry that re-sends only the head of an already-committed batch carries
+    older timestamps than the mark. If a duplicate rewrote the remembered clock, the next
+    gap's span would start from seq 1's ts instead of seq 3's.
 
-    ingress.ingest(batch(5))
+    The old version of this test was vacuous: `wire()` derives `ts` from `seq`, so a full
+    duplicate carries identical timestamps and the question had no observable answer — it
+    passed even with the clock written outside the `to_append` guard. A stale partial retry
+    is what makes the two implementations observably different."""
+    ingress.ingest(batch(1, 2, 3))
+    ingress.ingest(batch(1))  # wholly below the mark: appends nothing
+
+    ingress.ingest(batch(9))  # hole (4, 8)
+
+    events = {e.seq: e for e in log.read_all() if e.origin == SURROGATE}
+
+    marker = _marker(log)
+    assert (marker.content["from_seq"], marker.content["to_seq"]) == (4, 8)
+    assert marker.content["span_start"] == events[3].ts.isoformat()
+
+
+def test_two_ingresses_over_one_log_share_the_remembered_clock(log):
+    """The lower bound of an inferred span is per-log state, not per-ingress. Commit
+    through ingress A, then drive a gap through ingress B: the minted span must start from
+    what A committed — not from nothing."""
+    marks = HighWaterMarks(log)
+    first = ReplicationIngress(log, marks)
+    second = ReplicationIngress(log, marks)
+
+    first.ingest(batch(1, 2))
+    second.ingest(batch(5))
 
     events = {e.seq: e for e in log.read_all() if e.origin == SURROGATE}
 
@@ -538,6 +562,36 @@ def test_a_listener_that_ingests_raises_instead_of_deadlocking(log):
     # non-daemon thread would hang the suite at teardown — the timeout must be the
     # whole cost of a deadlock, not a build that never finishes.
     worker = threading.Thread(target=lambda: ingress.ingest(batch(1, 2, 3)), daemon=True)
+    worker.start()
+    worker.join(TIMEOUT)
+    assert not worker.is_alive(), "the re-entrant ingest deadlocked instead of raising"
+    unsubscribe()
+
+    assert errors, "the re-entrant ingest never raised"
+    assert all(isinstance(error, ReentrantIngest) for error in errors), (
+        f"expected ReentrantIngest from the re-entry, got {errors!r}"
+    )
+
+
+def test_a_listener_ingesting_through_a_second_ingress_raises_instead_of_deadlocking(log):
+    """The re-entry guard must live where the lock lives. With it on the ingress, two
+    ingresses over one marks object each keep their own holder flag: a listener calling
+    the *second* ingress's `ingest` sees None on its instance, passes the re-entry check,
+    and blocks forever on the lock the first holds. Bounded as before — a wrong
+    implementation fails by hitting the join timeout rather than hanging the suite."""
+    marks = HighWaterMarks(log)
+    first = ReplicationIngress(log, marks)
+    second = ReplicationIngress(log, marks)
+    errors: list[Exception] = []
+
+    def relay(event):
+        try:
+            second.ingest(batch(4, 5))
+        except Exception as error:
+            errors.append(error)
+
+    unsubscribe = log.subscribe(relay)
+    worker = threading.Thread(target=lambda: first.ingest(batch(1, 2, 3)), daemon=True)
     worker.start()
     worker.join(TIMEOUT)
     assert not worker.is_alive(), "the re-entrant ingest deadlocked instead of raising"

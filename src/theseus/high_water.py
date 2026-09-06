@@ -18,6 +18,7 @@ or jumps past a mark is the ingress's job.
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 
@@ -89,6 +90,18 @@ class HighWaterMarks:
         # Measured: two ingresses, one marks object, one batch delivered to both at once, and
         # the log came back holding seqs [1, 2, 3, 1, 2, 3].
         self.commit_lock = threading.Lock()
+
+        # The same argument applies verbatim to the two pieces of bookkeeping that belong
+        # with this lock, so they live here beside it. `lock_holder` is the thread currently
+        # holding `commit_lock`, or None: with it on the ingress instead, a listener calling
+        # a *second* ingress's `ingest` sees None on its instance, passes the re-entry check,
+        # and blocks forever on the lock the first holds. `last_ts` is the last committed
+        # `ts` per origin — in memory only, so after a restart the honest answer is `None`
+        # and an inferred span mints zero-width rather than pretending to remember — and
+        # with it on the ingress instead, two ingresses over one log keep divergent lower
+        # bounds and mint inconsistent gap spans for the same stream.
+        self.lock_holder: int | None = None
+        self.last_ts: dict[str, datetime] = {}
 
         for event in log.read_all():
             seq = _committed_seq(event)
