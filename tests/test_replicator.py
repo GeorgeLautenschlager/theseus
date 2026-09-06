@@ -271,3 +271,39 @@ def test_a_second_fake_transport_drives_the_same_replicator(tmp_path):
 
     assert seqs_in(transport.sent) == list(range(1, 10))
     assert result == DrainResult(batches_sent=3, events_sent=9, acked_seq=9, stopped_on=None)
+
+
+def test_the_drain_orders_by_seq_not_by_file_order(tmp_path):
+    """The log is arrival-ordered and a surrogate is the sole writer of its own origin, so
+    seq order and file order normally coincide. The host's dedupe depends on ascending seq,
+    not on that coincidence — a foreign writer or a hand-edited log breaks it, and the
+    straddle rule would then silently drop the events that arrived out of order.
+
+    Written as a raw file so file order genuinely disagrees with seq order.
+    """
+    path = tmp_path / "log.jsonl"
+    out_of_order = [3, 1, 4, 2]
+    path.write_text(
+        "".join(
+            json.dumps({
+                "id": f"01OUTOFORDER{seq:017d}",
+                "ts": f"2026-09-04T16:00:{seq:02d}+00:00",
+                "actor": "sensor",
+                "type": "observation",
+                "content": {"n": seq},
+                "origin": ORIGIN,
+                "seq": seq,
+                "appended_ts": f"2026-09-04T16:00:{seq:02d}+00:00",
+            }) + "\n"
+            for seq in out_of_order
+        ),
+        encoding="utf-8",
+    )
+    log = StimulusLog(path, origin=ORIGIN)
+    transport = ScriptedTransport([200])
+    cursor = AckedCursor(tmp_path / "cursor.json", ORIGIN)
+
+    Replicator(log, transport, cursor).drain()
+
+    assert seqs_in(transport.bodies) == [1, 2, 3, 4]
+    assert cursor.acked_seq == 4
