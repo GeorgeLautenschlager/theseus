@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -459,3 +461,240 @@ def test_a_naive_timestamp_from_a_foreign_line_is_read_as_aware(tmp_path):
     assert event.appended_ts.tzinfo is not None
     # And the pair a sort would compare is now comparable.
     assert event.ts <= datetime.now(timezone.utc)
+
+
+# One hour back from the wall clock, expressed once and reused in the assertion that needs
+# it: the re-mint test asserts appended_ts (minted from now) sorts after this producer ts,
+# so the fixture must sit in the past, and a relative base cannot desynchronize from its
+# own check.
+_PRODUCER_BASE = datetime.now(timezone.utc) - timedelta(hours=1)
+
+
+def _replicated(n: int, message: str = "hi", origin: str = "kitchen-surrogate", seq=...):
+    """One event shaped as it arrives off the wire: the producer's id and appended_ts are
+    placeholders, because this log re-mints both. `n` is the default seq; pass `seq=` to
+    override it independently."""
+    return StimulusEvent(
+        id="01PRODUCERSIDWILLBEDROPPED",
+        ts=_PRODUCER_BASE + timedelta(seconds=n),
+        actor="sensor",
+        type="observation",
+        content={"message": message},
+        origin=origin,
+        seq=n if seq is ... else seq,
+    )
+
+
+def _local():
+    """An event shaped the way this log's own appends are: no origin of its own, no seq."""
+    return StimulusEvent(
+        id="01PLACEHOLDER",
+        ts=datetime(2026, 9, 4, tzinfo=timezone.utc),
+        actor="george",
+        type="exchange",
+        content={},
+    )
+
+
+def _replicated_without_seq():
+    return StimulusEvent(
+        id="01PLACEHOLDER",
+        ts=datetime(2026, 9, 4, tzinfo=timezone.utc),
+        actor="sensor",
+        type="observation",
+        content={},
+        origin="kitchen-surrogate",
+    )
+
+
+def test_append_many_writes_the_whole_batch(tmp_path):
+    log = make_log(tmp_path)
+
+    appended = log.append_many([_replicated(1), _replicated(2), _replicated(3)])
+
+    assert [e.seq for e in appended] == [1, 2, 3]
+    assert [e.seq for e in log.read_all()] == [1, 2, 3]
+    assert {e.origin for e in log.read_all()} == {"kitchen-surrogate"}
+
+
+def test_append_many_re_mints_id_and_appended_ts(tmp_path):
+    """Identity across nodes is (origin, seq), never id. The producer's id is its own."""
+    log = make_log(tmp_path)
+
+    (appended,) = log.append_many([_replicated(1)])
+
+    assert appended.id != "01PRODUCERSIDWILLBEDROPPED"
+    assert appended.appended_ts > appended.ts
+    assert appended.ts == _PRODUCER_BASE + timedelta(seconds=1)
+
+
+def test_append_many_ids_are_strictly_increasing(tmp_path):
+    """A whole batch lands inside one millisecond, and `older_batch` bisects a list of ids
+    expecting it sorted. Independent random suffixes would collide with that; a batch
+    mints a monotonic run instead."""
+    log = make_log(tmp_path)
+
+    appended = log.append_many([_replicated(n) for n in range(1, 51)])
+
+    ids = [e.id for e in appended]
+    assert ids == sorted(ids)
+    assert len(set(ids)) == 50
+
+
+def test_append_many_is_one_fsync_for_the_whole_batch(tmp_path, monkeypatch):
+    """All-or-nothing application: the spec forbids a partial state the surrogate would
+    have to reason about. One open, one write, one fsync."""
+    log = make_log(tmp_path)
+    fsyncs = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(
+        os, "fsync", lambda fd: (fsyncs.append(fd), real_fsync(fd))[1]
+    )
+
+    log.append_many([_replicated(n) for n in range(1, 11)])
+
+    assert len(fsyncs) == 1
+
+
+def test_append_many_notifies_listeners_for_every_event(tmp_path):
+    log = make_log(tmp_path)
+    seen = []
+    log.subscribe(seen.append)
+
+    appended = log.append_many([_replicated(1), _replicated(2)])
+
+    assert seen == appended
+
+
+def test_append_many_notifies_after_the_whole_batch_is_durable(tmp_path):
+    """A listener must never see event 1 while event 2 of the same batch could still be
+    lost — the batch is the unit that is all-or-nothing."""
+    log = make_log(tmp_path)
+    on_disk = []
+    log.subscribe(lambda event: on_disk.append(len(log.read_all())))
+
+    log.append_many([_replicated(1), _replicated(2)])
+
+    assert on_disk == [2, 2]
+
+
+def test_append_many_may_mix_local_and_replicated_events(tmp_path):
+    """The ingress's real write: a host-minted gap marker explaining a hole in a
+    surrogate's stream, in the same batch as the events it explains. The marker carries
+    this log's origin, the events carry the surrogate's, and they must land together."""
+    log = make_log(tmp_path)
+    marker = StimulusEvent(
+        id="01PLACEHOLDER",
+        ts=datetime(2026, 9, 4, tzinfo=timezone.utc),
+        actor="host",
+        type="stimulus.gap",
+        content={"origin": "kitchen-surrogate", "from_seq": 1, "to_seq": 4},
+    )
+
+    appended = log.append_many([marker, _replicated(5), _replicated(6)])
+
+    assert [(e.origin, e.seq) for e in appended] == [
+        (DEFAULT_ORIGIN, 1),
+        ("kitchen-surrogate", 5),
+        ("kitchen-surrogate", 6),
+    ]
+    assert len(log.read_all()) == 3
+
+
+def test_append_many_local_events_continue_the_logs_own_counter(tmp_path):
+    log = make_log(tmp_path)
+    log.append(actor="george", type="exchange", content={})
+
+    appended = log.append_many([_local(), _local()])
+
+    assert [e.seq for e in appended] == [2, 3]
+    assert log.append(actor="george", type="exchange", content={}).seq == 4
+
+
+@pytest.mark.parametrize(
+    "bad, expected",
+    [
+        (lambda: _replicated(1, origin=DEFAULT_ORIGIN), "own origin"),
+        (lambda: _replicated(1, origin=""), "non-empty name"),
+        (lambda: _replicated_without_seq(), "must carry the seq"),
+        (lambda: _replicated(1, seq=0), "1 or greater"),
+        (lambda: _replicated(1, seq=True), "must be an integer"),
+    ],
+)
+def test_append_many_applies_the_replicated_contract_to_every_event(
+    tmp_path, bad, expected
+):
+    """Delete the per-event validation loop and every one of these must fail. The whole
+    point of sharing `_check_replicated` with `append` is that a batch cannot get past a
+    check a single append would have caught."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError, match=expected):
+        log.append_many([_replicated(9), bad()])
+
+    assert log.read_all() == []
+
+
+def test_append_many_of_nothing_is_a_no_op(tmp_path):
+    log = make_log(tmp_path)
+
+    assert log.append_many([]) == []
+    assert log.read_all() == []
+
+
+def test_append_many_does_not_disturb_the_local_counter(tmp_path):
+    log = make_log(tmp_path)
+    log.append(actor="george", type="exchange", content={})
+
+    log.append_many([_replicated(90), _replicated(91)])
+
+    assert log.append(actor="george", type="exchange", content={}).seq == 2
+
+
+def test_append_many_rejects_two_foreign_origins(tmp_path):
+    """One all-or-nothing fsync must not span two dedupe streams. `parse_batch` enforces
+    the wire's one-origin rule at the door, but a caller that never goes through the door —
+    the surrogate side, a replay tool, a test — would put both streams in one write."""
+    log = make_log(tmp_path)
+
+    with pytest.raises(ValueError, match="at most one origin"):
+        log.append_many([_replicated(1), _replicated(1, origin="android-01")])
+
+    assert log.read_all() == []
+
+
+def test_append_many_rolls_back_a_write_that_dies_part_way(tmp_path, monkeypatch):
+    """The failure this guards is not a crash — a crash can only tear the final line, which
+    `read_all` drops. It is an exception mid-write, ENOSPC being the realistic one: the
+    prefix is committed, the file ends mid-line, and the *next* successful append
+    concatenates onto that stump and turns it into an interior corrupt record. `read_all`
+    raises on those by design and forever, and `HighWaterMarks` derives itself by reading
+    the whole log — so the agent never boots again."""
+    log = make_log(tmp_path)
+    log.append(actor="george", type="exchange", content={"message": "first"})
+    committed = log.path.stat().st_size
+
+    real_open = open
+
+    class TornWriter(io.TextIOWrapper):
+        """Commits a prefix, then dies the way ENOSPC does."""
+
+        def write(self, s):
+            super().write(s[: len(s) // 3])
+            super().flush()
+            raise OSError(28, "No space left on device")
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        if "a" in mode:
+            return TornWriter(real_open(path, "ab"), encoding="utf-8")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    with pytest.raises(OSError):
+        log.append_many([_replicated(1), _replicated(2), _replicated(3)])
+    monkeypatch.undo()
+
+    assert log.path.stat().st_size == committed
+    assert len(log.read_all()) == 1
+    log.append(actor="george", type="exchange", content={"message": "later"})
+    assert len(log.read_all()) == 2  # not a permanently unreadable log

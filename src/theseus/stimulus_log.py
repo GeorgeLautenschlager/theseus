@@ -23,7 +23,7 @@ import os
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -48,6 +48,32 @@ def new_id(ms: int | None = None) -> str:
     ms = int(time.time() * 1000) if ms is None else ms
     rand = int.from_bytes(os.urandom(10), "big")
     return _b32(ms, 10) + _b32(rand, 16)  # 26 chars
+
+
+def _id_run(ms: int, count: int) -> list[str]:
+    """`count` ids for one instant, strictly increasing.
+
+    `new_id` gives each id an independent random suffix, which is fine at human rates
+    where the millisecond prefix does the ordering. A replicated batch is not that: fifty
+    events land in one write, share a millisecond, and are then distinguished only by
+    chance — while `older_batch` in the debug pagination bisects a list of ids and needs it
+    sorted ascending.
+
+    So a batch draws one random base and walks it. The base is drawn below `2**80 - count`
+    so the walk cannot wrap, which would put the run out of order at exactly the moment it
+    matters.
+
+    This orders a batch against *itself*, and nothing more. Two separate writes landing in
+    one millisecond — a local `append` beside an `append_many`, or two appends — still draw
+    independent bases and can come out in either order, because the two paths share no
+    state. Measured on a memory-backed filesystem, that is a coin flip whenever it happens,
+    and `older_batch` in the debug pagination bisects file-order ids, so it silently returns
+    an empty page when they disagree. Closing that needs the log to remember the last id it
+    minted and walk up from it; until then, id order is arrival order within a write and a
+    near-certainty between writes, not a guarantee.
+    """
+    base = int.from_bytes(os.urandom(10), "big") % ((1 << 80) - count)
+    return [_b32(ms, 10) + _b32(base + i, 16) for i in range(count)]
 
 
 # The origin a log stamps on its own events when none is configured. `origin` answers
@@ -157,12 +183,15 @@ class StimulusEvent:
 
 # --- Log ------------------------------------------------------------------------
 class StimulusLog:
-    """Append-only JSONL. One event per line. fsync per append.
+    """Append-only JSONL. One event per line. fsync per append, or per batch — see
+    `append_many`.
 
     Reads tolerate a torn trailing line (crash mid-write): the partial final
     line is dropped on read, never raised. Corruption of an *interior* line is
     a real error and is raised, because that should never happen to an
-    append-only file and silently skipping it would hide data loss.
+    append-only file and silently skipping it would hide data loss. A batch appended
+    through `append_many` is one write, so the same holds for it: a crash can only tear
+    its final line.
 
     Listeners registered with `subscribe` are called with each appended event, on
     the appending thread, once the write is durable.
@@ -242,6 +271,69 @@ class StimulusLog:
                 highest = max(highest, event.seq)
         return highest + 1
 
+    def _check_replicated(self, origin: str | None, seq: int | None) -> None:
+        """The contract for an event this log did not produce: `origin` and `seq` are
+        supplied together, the origin is somebody else's, and the seq is a real one.
+
+        Shared by `append` and `append_many` so the two cannot drift — an ingress that
+        could get a batch past a check a single append would have caught is exactly the
+        hole this protocol's dedupe depends on not existing.
+        """
+        if not origin:
+            raise ValueError("origin must be a non-empty name")
+        if origin == self.origin:
+            raise ValueError(
+                f"{origin!r} is this log's own origin and it allocates those seqs "
+                f"itself. A replicated append must arrive under its producer's own "
+                f"origin name — two producers sharing one name break the per-origin "
+                f"monotonicity that duplicate suppression depends on."
+            )
+        if seq is None:
+            raise ValueError(
+                f"a replicated append (origin {origin!r}) must carry the seq its "
+                f"producer assigned"
+            )
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise ValueError(f"seq must be an integer (got {seq!r})")
+        if seq < 1:
+            raise ValueError(
+                f"seq must be 1 or greater (got {seq!r}); starting at 1 keeps 0 below "
+                f"every real seq, as a safe comparison floor for a reader tracking what "
+                f"it has accepted"
+            )
+
+    def _write_durably(self, payload: str) -> None:
+        """Append `payload` and fsync, leaving the file untouched if anything fails.
+
+        Without the rollback, a write that dies part-way — ENOSPC is the realistic one —
+        commits a prefix and leaves the file ending mid-line. The next successful append
+        then concatenates onto that stump, turning it into an *interior* corrupt record,
+        which `read_all` raises on by design and forever. Since `HighWaterMarks` derives
+        itself by reading the whole log, that is an agent that cannot boot again.
+
+        A crash, as opposed to an exception, needs no help: it can only ever tear the
+        final line, which `read_all` already drops.
+
+        Caller must hold `_append_lock`, so the truncate cannot race another writer.
+        """
+        committed = self.path.stat().st_size
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            os.truncate(self.path, committed)
+            raise
+
+    def _next_local_seq(self) -> int:
+        """The next seq for this log's own origin. Caller must hold `_append_lock`."""
+        if self._next_seq is None:
+            self._next_seq = self._recover_next_seq()
+        seq = self._next_seq
+        self._next_seq = seq + 1
+        return seq
+
     def append(
         self,
         actor: str,
@@ -270,34 +362,15 @@ class StimulusLog:
         Identity across nodes is `(origin, seq)`, never `id`.
         """
         origin = self.origin if origin is None else origin
-        if not origin:
-            raise ValueError("origin must be a non-empty name")
-        if origin == self.origin:
-            if seq is not None:
-                raise ValueError(
-                    f"{origin!r} is this log's own origin and it allocates those seqs "
-                    f"itself. A replicated append must arrive under its producer's own "
-                    f"origin name — two producers sharing one name break the per-origin "
-                    f"monotonicity that duplicate suppression depends on."
-                )
-        elif seq is None:
-            raise ValueError(
-                f"a replicated append (origin {origin!r}) must carry the seq its "
-                f"producer assigned"
-            )
-        elif seq < 1:
-            raise ValueError(
-                f"seq must be 1 or greater (got {seq!r}); starting at 1 keeps 0 below "
-                f"every real seq, as a safe comparison floor for a reader tracking what "
-                f"it has accepted"
-            )
+        # A local append is the one shape that carries no seq, because the allocator below
+        # supplies it. Everything else is somebody else's event and goes through the
+        # replicated contract.
+        if not (origin == self.origin and seq is None):
+            self._check_replicated(origin, seq)
 
         with self._append_lock:
             if seq is None:
-                if self._next_seq is None:
-                    self._next_seq = self._recover_next_seq()
-                seq = self._next_seq
-                self._next_seq = seq + 1
+                seq = self._next_local_seq()
 
             # Minted under the lock, not before it: a thread that stamped `ts` and then
             # blocked on another thread's fsync would otherwise land after an event with a
@@ -315,15 +388,107 @@ class StimulusLog:
                 seq=seq,
                 appended_ts=appended_ts,
             )
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(event.to_json() + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            self._write_durably(event.to_json() + "\n")
 
         # Outside the lock: a listener is free to append, and holding the lock across a
         # callback would deadlock it.
         self._notify(event)
         return event
+
+    def append_many(self, events: Iterable[StimulusEvent]) -> list[StimulusEvent]:
+        """Append a replicated batch, all of it or none of it.
+
+        The spec forbids a partial state the surrogate would have to reason about, so the
+        whole batch goes down under one `open`/`write`/`fsync`. That also makes a crash
+        mid-batch harmless in a way a per-event loop is not: the only line that can tear is
+        the last one, which `read_all` already recovers from, while an interior tear — the
+        one case it raises on — becomes unreachable.
+
+        Takes events as parsed off the wire and returns the ones actually written. `id` and
+        `appended_ts` are re-minted here, exactly as in `append`: identity across nodes is
+        `(origin, seq)`, never `id`. `ts` is the producer's own and is left alone.
+
+        A batch may mix this log's own events with replicated ones, and the ingress needs
+        it to: a host-minted gap marker explaining a hole in a surrogate's stream carries
+        this log's origin, while the events it explains carry the surrogate's. Splitting
+        those across two writes would mean a crash between them loses the explanation while
+        the events it described are already committed. Local events are numbered here from
+        this log's own counter; replicated ones keep the seq their producer assigned.
+
+        Beyond the per-event contract `_check_replicated` applies, the one *batch-shaped*
+        rule the log polices is origins: at most one other than this log's own may appear
+        in a write. That is exactly what the wire allows — one surrogate's range plus,
+        sometimes, this host's own gap marker explaining a hole in it — so the rule here is
+        the wire rule as it looks after the marker is added; two foreign origins mean a
+        caller that never went through `replication_batch.parse_batch`'s door.
+
+        Whether the seqs ascend, repeat or leave holes is **not** checked here. That is the
+        wire protocol's business and `parse_batch` enforces it; restating it in the storage
+        layer would be a second, divergent copy of a rule in the layer least able to explain
+        a rejection.
+        """
+        events = list(events)
+        if not events:
+            return []
+
+        for event in events:
+            # The same two shapes `append` takes: a local event this log numbers itself,
+            # or a replicated one carrying its producer's origin and seq. A batch may mix
+            # them, and the ingress needs it to — a host-minted gap marker explaining a
+            # hole in a surrogate's stream carries this log's origin while the events it
+            # explains carry the surrogate's, and the two have to land in one write or a
+            # crash between them loses the explanation.
+            if not (event.origin == self.origin and event.seq is None):
+                self._check_replicated(event.origin, event.seq)
+
+        # At most one origin other than this log's own. The spec's wire batch is one
+        # origin's range, and `parse_batch` enforces that at the door; what reaches here is
+        # that batch plus, sometimes, this host's own gap marker explaining a hole in it. So
+        # the rule the *storage* layer holds is the wire rule as it looks after the marker
+        # is added. Two foreign origins in one write is a caller that never went through the
+        # door — the #31 surrogate side, a replay tool, a test — putting one all-or-nothing
+        # fsync across two dedupe streams, which is a bug in that caller, not a wire
+        # condition. It costs a set comprehension over a list already in hand.
+        #
+        # The argument is knowingly half-applied. "One fsync should not commit an ambiguous
+        # stream" bites just as hard on a repeated or descending seq *within* one origin,
+        # and those still go straight onto the tape from here. They are caught at the door
+        # instead, because ordering is the wire's rule to state and this layer could not
+        # explain a rejection of it; the origin case is kept because it is the one a caller
+        # bypassing the door gets wrong silently rather than loudly.
+        #
+        # This runs after the loop above, so every origin here is a non-empty string and the
+        # sort cannot raise TypeError on a mixed None.
+        foreign = {event.origin for event in events if event.origin != self.origin}
+        if len(foreign) > 1:
+            raise ValueError(
+                f"a batch may carry at most one origin beside this log's own "
+                f"({self.origin!r}), got {sorted(foreign)}"
+            )
+
+        with self._append_lock:
+            appended_ts = datetime.now(timezone.utc)
+            event_ids = _id_run(int(appended_ts.timestamp() * 1000), len(events))
+            minted = [
+                StimulusEvent(
+                    id=event_id,
+                    ts=event.ts,
+                    actor=event.actor,
+                    type=event.type,
+                    content=event.content,
+                    origin=event.origin,
+                    seq=self._next_local_seq() if event.seq is None else event.seq,
+                    appended_ts=appended_ts,
+                )
+                for event_id, event in zip(event_ids, events)
+            ]
+            self._write_durably("".join(event.to_json() + "\n" for event in minted))
+
+        # Outside the lock, and only once the whole batch is durable: a listener must never
+        # see the first event of a batch while the last could still be lost.
+        for event in minted:
+            self._notify(event)
+        return minted
 
     def _notify(self, event: StimulusEvent) -> None:
         """Fan the event out to listeners, snapshotting the list so a listener may

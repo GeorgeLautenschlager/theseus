@@ -18,6 +18,7 @@ or jumps past a mark is the ingress's job.
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 
@@ -76,6 +77,32 @@ class HighWaterMarks:
         # *backwards* — the direction that re-appends a retried batch into the agent's
         # permanent memory. `StimulusLog` locks its own counter for the same reason.
         self._lock = threading.Lock()
+
+        # Held by the ingress across its whole read-mark → plan → write → advance sequence,
+        # which the two locks above cannot cover: they make each individual read and write
+        # indivisible, and what the dedupe rules need indivisible is the *span between* them.
+        #
+        # It lives here rather than on the ingress because the invariant belongs to this
+        # object. One `HighWaterMarks` per log is this class's stated precondition, so a lock
+        # here is one lock per log; a lock on the ingress is one per ingress, and two
+        # ingresses sharing one marks object — the arrangement this docstring recommends —
+        # would then hold different locks and double-append a concurrently retried batch.
+        # Measured: two ingresses, one marks object, one batch delivered to both at once, and
+        # the log came back holding seqs [1, 2, 3, 1, 2, 3].
+        self.commit_lock = threading.Lock()
+
+        # The same argument applies verbatim to the two pieces of bookkeeping that belong
+        # with this lock, so they live here beside it. `lock_holder` is the thread currently
+        # holding `commit_lock`, or None: with it on the ingress instead, a listener calling
+        # a *second* ingress's `ingest` sees None on its instance, passes the re-entry check,
+        # and blocks forever on the lock the first holds. `last_ts` is the last committed
+        # `ts` per origin — in memory only, so after a restart the honest answer is `None`
+        # and an inferred span mints zero-width rather than pretending to remember — and
+        # with it on the ingress instead, two ingresses over one log keep divergent lower
+        # bounds and mint inconsistent gap spans for the same stream.
+        self.lock_holder: int | None = None
+        self.last_ts: dict[str, datetime] = {}
+
         for event in log.read_all():
             seq = _committed_seq(event)
             if seq is not None:
