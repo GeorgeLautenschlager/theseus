@@ -27,9 +27,10 @@ packages = [{ include = "theseus", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8"
+# `fastapi.testclient` needs it; the replication ingress's route tests are the only callers.
+httpx = "^0.28.1"
 
 # Screen-capture deps for surrogates; install with `poetry install --with surrogates`.
-httpx = "^0.28.1"
 [tool.poetry.group.surrogates]
 optional = true
 
