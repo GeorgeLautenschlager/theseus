@@ -60,8 +60,9 @@ def chunk_events(
 class DrainResult:
     """Where a drain ended up: what shipped, where the cursor landed, why it stopped."""
 
-    batches_sent: int
-    events_sent: int
+    batches_attempted: int   # sent to the transport, acked or not
+    events_attempted: int    # ditto; `seq` is not contiguous, so the acked_seq
+                             # delta is not a count and cannot stand in for this
     acked_seq: int | None      # the cursor after this drain
     stopped_on: int | None     # the non-2xx status that ended it, or None if it drained fully
     skipped_unsequenced: int = 0  # own-origin lines with no seq (pre-envelope): unreplicable by design
@@ -138,16 +139,16 @@ class Replicator:
                 pending, max_events=self._max_events, max_bytes=self._max_bytes
             )
 
-            sent_batches = 0
-            sent_events = 0
+            attempted_batches = 0
+            attempted_events = 0
             stopped_on: int | None = None
             for batch in batches:
                 # The wire body is exactly what the host's `parse_batch` measures: each
                 # event's line plus its newline.
                 body = "".join(e.to_json() + "\n" for e in batch)
                 result = self._transport.send(body)
-                sent_batches += 1
-                sent_events += len(batch)
+                attempted_batches += 1
+                attempted_events += len(batch)
                 if not 200 <= result.status < 300:
                     stopped_on = result.status
                     break
@@ -156,8 +157,8 @@ class Replicator:
                 self._cursor.advance(batch[-1].seq)
 
             return DrainResult(
-                batches_sent=sent_batches,
-                events_sent=sent_events,
+                batches_attempted=attempted_batches,
+                events_attempted=attempted_events,
                 acked_seq=self._cursor.acked_seq,
                 stopped_on=stopped_on,
                 skipped_unsequenced=skipped_unsequenced,

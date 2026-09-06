@@ -6,8 +6,10 @@ derived from the log. The log records what the surrogate *did*; only the host kn
 what it *accepted*, and that answer arrives over the wire as a `2xx`. So this is a
 sidecar beside the log, written after each ack, never before or during: behind is
 recoverable (a re-sent batch is deduped to another `2xx`), ahead is not (skipped
-events are gone). A crash between the ack and the write costs exactly one re-sent
-batch.
+events are gone). A process crash between the ack and the write costs exactly one
+re-sent batch. A *power* loss can cost one more: `os.replace` is atomic, but the rename
+is not durable until the parent directory is fsynced, which this does not do. Both
+failures land on the recoverable side, which is why the gap is affordable.
 
 Recovery fails only in the safe direction. A missing file means "nothing acked yet" —
 deliberately `None`, not `0`. An unreadable, malformed, or foreign-origin file also

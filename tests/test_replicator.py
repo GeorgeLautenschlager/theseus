@@ -108,7 +108,7 @@ def test_backlog_drains_in_seq_order_across_batches(tmp_path):
     # 25 events at 7 per batch: 7+7+7+4, nothing missing or repeated across the bodies.
     assert len(transport.bodies) == 4
     assert seqs_in(transport.bodies) == list(range(1, 26))
-    assert result == DrainResult(batches_sent=4, events_sent=25, acked_seq=25, stopped_on=None)
+    assert result == DrainResult(batches_attempted=4, events_attempted=25, acked_seq=25, stopped_on=None)
 
 
 def test_cursor_advances_only_on_2xx(tmp_path):
@@ -177,7 +177,7 @@ def test_only_the_surrogates_own_origin_is_shipped(tmp_path):
     result = rep.drain()
 
     assert seqs_in(transport.bodies) == [1, 2, 3, 4, 5]
-    assert result.events_sent == 5
+    assert result.events_attempted == 5
 
 
 def test_already_acked_events_are_not_resent(tmp_path):
@@ -193,7 +193,7 @@ def test_already_acked_events_are_not_resent(tmp_path):
     append_n(log, 4, start=6)
     second = rep.drain()
 
-    new_bodies = transport.bodies[first.batches_sent:]
+    new_bodies = transport.bodies[first.batches_attempted:]
     assert seqs_in(new_bodies) == [7, 8, 9, 10]
 
 
@@ -205,7 +205,7 @@ def test_empty_backlog_never_touches_the_transport(tmp_path):
 
     result = rep.drain()
 
-    assert result == DrainResult(batches_sent=0, events_sent=0, acked_seq=None, stopped_on=None)
+    assert result == DrainResult(batches_attempted=0, events_attempted=0, acked_seq=None, stopped_on=None)
     assert transport.calls == 0
 
 
@@ -271,7 +271,7 @@ def test_a_second_fake_transport_drives_the_same_replicator(tmp_path):
     result = rep.drain()
 
     assert seqs_in(transport.sent) == list(range(1, 10))
-    assert result == DrainResult(batches_sent=3, events_sent=9, acked_seq=9, stopped_on=None)
+    assert result == DrainResult(batches_attempted=3, events_attempted=9, acked_seq=9, stopped_on=None)
 
 
 def test_the_drain_orders_by_seq_not_by_file_order(tmp_path):
@@ -341,7 +341,7 @@ def test_pre_envelope_events_are_skipped_counted_and_reported(tmp_path):
     result = Replicator(log, transport, cursor).drain()
 
     assert seqs_in(transport.bodies) == [1, 2]   # only the real events shipped
-    assert result.events_sent == 2
+    assert result.events_attempted == 2
     assert result.stopped_on is None             # and the drain still completes
     assert result.skipped_unsequenced == 2
     assert result.skipped_duplicate == 0
@@ -418,3 +418,21 @@ def test_3xx_stops_the_drain_and_does_not_advance_cursor(tmp_path):
 
     assert result.stopped_on == 302
     assert result.acked_seq is None   # the cursor did not advance
+
+
+def test_the_batch_limits_are_the_hosts_own(tmp_path):
+    """Two constants for one protocol limit is how a surrogate and a host come to disagree
+    about what fits. A surrogate whose default `max_bytes` is larger than the host's builds
+    batches the host 413s, and the drain stalls on a batch it believes is legal.
+
+    Asserted on the defaults directly: a round-trip test cannot see this, because the host
+    rejects the batch either way — it just costs a wasted request and a stall.
+    """
+    from theseus.replication_batch import DEFAULT_MAX_BATCH_BYTES, DEFAULT_MAX_BATCH_EVENTS
+
+    replicator = Replicator(
+        make_log(tmp_path), ScriptedTransport([]), AckedCursor(tmp_path / "c.json", ORIGIN)
+    )
+
+    assert replicator._max_events == DEFAULT_MAX_BATCH_EVENTS
+    assert replicator._max_bytes == DEFAULT_MAX_BATCH_BYTES

@@ -57,7 +57,7 @@ def test_a_backlog_drains_in_seq_order_across_batches(tmp_path):
     cursor, result = _drain(rig, tmp_path)
 
     assert result.stopped_on is None
-    assert result.events_sent == n
+    assert result.events_attempted == n
     host_events = [e for e in rig.host_log.read_all() if e.origin == SURROGATE]
     assert [e.seq for e in host_events] == list(range(1, n + 1))
     # The surrogate's own clock survives the trip: ts is meaning, not arrival order.

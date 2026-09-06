@@ -25,7 +25,10 @@ def test_fresh_cursor_has_acked_nothing(tmp_path):
 
 def test_advanced_cursor_survives_reload(tmp_path):
     path = tmp_path / "cursor.json"
-    AckedCursor(path, origin=ORIGIN).advance(7)
+    live = AckedCursor(path, origin=ORIGIN)
+    live.advance(7)
+
+    assert live.acked_seq == 7
     assert AckedCursor(path, origin=ORIGIN).acked_seq == 7
 
 
@@ -66,12 +69,33 @@ def test_crash_mid_write_leaves_previous_value(tmp_path, monkeypatch):
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert on_disk["acked_seq"] == 3
     assert AckedCursor(path, origin=ORIGIN).acked_seq == 3
+    # And the live object did not run ahead of what actually landed. It is the failed write
+    # that makes this observable at all — on a successful one the two always agree, which is
+    # why asserting it anywhere else proves nothing.
+    assert cursor.acked_seq == 3
 
 
-def test_corrupt_cursor_file_loads_as_none(tmp_path):
-    (tmp_path / "cursor.json").write_text("not json at all {{{", encoding="utf-8")
-    cursor = _cursor(tmp_path)
-    assert cursor.acked_seq is None
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json at all {{{",
+        # Every case below carries the RIGHT origin, so the origin guard cannot be what
+        # rejects it — otherwise this test would prove only that guard, over and over.
+        '{"origin": "%(o)s", "acked_seq": true}',   # bool is an int in Python; seq 1 it is not
+        '{"origin": "%(o)s", "acked_seq": 2.5}',
+        '{"origin": "%(o)s", "acked_seq": -3}',
+        '{"origin": "%(o)s", "acked_seq": "7"}',
+        '{"origin": "%(o)s"}',
+        '["%(o)s", 7]',
+    ],
+)
+def test_an_unusable_cursor_file_loads_as_none(tmp_path, payload):
+    """Every one of these fails in the safe direction — the surrogate re-sends and the host
+    dedupes. `true` is the one that bites without the bool guard: `isinstance(True, int)` is
+    True, so it would load as seq 1 and skip the real seq 1 permanently."""
+    (tmp_path / "cursor.json").write_text(payload % {"o": ORIGIN}, encoding="utf-8")
+
+    assert _cursor(tmp_path).acked_seq is None
 
 
 def test_cursor_naming_different_origin_is_ignored(tmp_path):
