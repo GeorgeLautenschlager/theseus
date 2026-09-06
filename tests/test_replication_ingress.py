@@ -791,3 +791,98 @@ def test_an_oversized_body_is_refused_before_it_is_buffered(log):
     assert response.status_code == 413
     assert "declares" in response.json()["reason"]
     assert log.read_all() == []
+
+
+def _asgi_post(app, chunks: list[bytes], *, content_length: int | None):
+    """Drive the ASGI app directly so a test can declare one length and send another, and
+    count exactly how many body bytes the endpoint pulled before it answered. `TestClient`
+    cannot lie about a declared length for us, and an in-process transport may pump a
+    generator ahead of the app, so "how far did it get" is only measurable here."""
+    import asyncio
+
+    headers = [(b"content-type", b"application/json")]
+    if content_length is not None:
+        headers.append((b"content-length", str(content_length).encode()))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/replicate",
+        "raw_path": b"/replicate",
+        "query_string": b"",
+        "headers": headers,
+        "server": ("testserver", 80),
+        "client": ("testclient", 54321),
+    }
+    pending = list(chunks)
+    pulled = 0
+
+    async def receive():
+        nonlocal pulled
+        if pending:
+            chunk = pending.pop(0)
+            pulled += len(chunk)
+            return {"type": "http.request", "body": chunk, "more_body": bool(pending)}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return status, json.loads(body), pulled
+
+
+def test_a_chunked_oversized_body_is_rejected(log):
+    """No Content-Length: httpx sends a generator body chunked, which is the request shape
+    the declared-length fast path cannot see. Over the limit it is refused and nothing
+    lands."""
+    ingress = ReplicationIngress(log, HighWaterMarks(log), max_bytes=1024)
+    client = TestClient(ingress.build_app())
+
+    def chunks():
+        for _ in range(3):
+            yield b"x" * 512
+
+    response = client.post("/replicate", content=chunks())
+
+    assert response.status_code == 413
+    assert log.read_all() == []
+
+
+def test_a_body_that_lies_about_its_length_is_rejected(log):
+    """Declares a length under the limit and sends more than it declared. The fast path
+    sees the lie as honest; the streaming bound sees the bytes."""
+    ingress = ReplicationIngress(log, HighWaterMarks(log), max_bytes=1024)
+
+    status, payload, _ = _asgi_post(
+        ingress.build_app(),
+        [b"x" * 600] * 3,
+        content_length=600,
+    )
+
+    assert status == 413
+    assert payload["reason"]
+    assert log.read_all() == []
+
+
+def test_the_stream_stops_early_on_an_oversized_body(log):
+    """The bound is on the read, not the answer: the moment the running total passes the
+    limit the endpoint stops pulling. An oversized stream is never fully consumed."""
+    ingress = ReplicationIngress(log, HighWaterMarks(log), max_bytes=1024)
+
+    status, payload, pulled = _asgi_post(
+        ingress.build_app(),
+        [b"x" * 512] * 64,
+        content_length=None,
+    )
+
+    assert status == 413
+    assert pulled <= 1024 + 512, f"endpoint kept reading: pulled {pulled} of 32768 bytes"
+    assert log.read_all() == []

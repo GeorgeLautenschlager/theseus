@@ -348,15 +348,13 @@ class ReplicationIngress:
         @app.post(path)
         async def replicate(request: Request):
             # Refused on the declared length, before a byte is buffered. `parse_batch` also
-            # checks the size, but only once `request.body()` has read the whole thing into
-            # memory: a 256 MB POST against a 1 KB limit was measured answering a correct 413
-            # after growing the process by half a gigabyte. On a Pi-class host that is the
-            # agent dying rather than a batch being refused.
+            # checks the size, but only once the body has been read into memory: a 256 MB POST
+            # against a 1 KB limit was measured answering a correct 413 after growing the
+            # process by half a gigabyte. On a Pi-class host that is the agent dying rather
+            # than a batch being refused.
             #
-            # This trusts the header, so it closes the honest-client case and not the
-            # adversarial one — a chunked or lying client still reaches the check below.
-            # Authentication is a Phase-1 non-goal, so an unbounded stream is still a way to
-            # hurt this endpoint; the header check is the cheap half of the answer.
+            # This trusts the header, so it closes the honest-client case: an oversized client
+            # that tells the truth never uploads a byte.
             declared = request.headers.get("content-length")
             if declared is not None and declared.isdigit():
                 if int(declared) > self._max_bytes:
@@ -372,7 +370,26 @@ class ReplicationIngress:
                     )
                     return JSONResponse(rejected.payload(), status_code=413)
 
-            body = await request.body()
+            # The streaming half of the same check: a chunked request, or one that lies about
+            # its length, is bounded while it arrives — accumulate, and the moment the running
+            # total passes `max_bytes` answer 413 without reading the rest. This bounds the
+            # body, not the connection: a hostile client still gets a connection, and auth
+            # (#40) and backpressure (#38) are the answer to that.
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > self._max_bytes:
+                    rejected = Ingested(
+                        status=413,
+                        origin=None,
+                        appended=0,
+                        high_water=None,
+                        reason=f"batch exceeds the {self._max_bytes} byte limit",
+                    )
+                    return JSONResponse(rejected.payload(), status_code=413)
+                chunks.append(chunk)
+            body = b"".join(chunks)
             # `ingest` blocks on a lock and an fsync. Run on the event loop it would stall
             # every other request in the process — the chat UI included, if they share an
             # app — for the duration of a disk write.
