@@ -25,7 +25,8 @@ from theseus.surrogates.replicator import Replicator
 HOST = "local"
 SURROGATE = "kitchen"
 URL = "http://testserver/replicate"
-BASE = datetime(2026, 9, 6, 12, 0, 0, tzinfo=timezone.utc)
+# Recent enough that no event trips the six-hour age abandonment (Task 4).
+BASE = datetime.now(tz=timezone.utc).replace(microsecond=0)
 
 
 def _rig(tmp_path, *, host_max_bytes: int | None = None):

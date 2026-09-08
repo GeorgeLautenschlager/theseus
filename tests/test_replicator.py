@@ -18,11 +18,12 @@ from pathlib import Path
 import pytest
 from fastapi.responses import JSONResponse
 
-from theseus.replication_events import BATCH_REJECTED
+from theseus.replication_events import BATCH_REJECTED, GAP
 from theseus.surrogates.clock import SystemClock
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
 from theseus.surrogates.replicator import DrainResult, Replicator
+from theseus.surrogates.retry import RetryBudget
 from theseus.surrogates.transport import TransportResult
 from theseus.stimulus_log import StimulusLog
 
@@ -299,7 +300,7 @@ def test_the_drain_orders_by_seq_not_by_file_order(tmp_path):
         "".join(
             json.dumps({
                 "id": f"01OUTOFORDER{seq:017d}",
-                "ts": f"2026-09-04T16:00:{seq:02d}+00:00",
+                "ts": datetime.now(timezone.utc).isoformat(),
                 "actor": "sensor",
                 "type": "observation",
                 "content": {"n": seq},
@@ -323,10 +324,12 @@ def test_the_drain_orders_by_seq_not_by_file_order(tmp_path):
 
 def _raw_line(n: int, *, origin: str | None = None, seq: int | None = None) -> str:
     """One pre-envelope log line: no `origin`, no `seq` — exactly what a log that
-    outlived the envelope upgrade contains. `log.append()` cannot produce these."""
+    outlived the envelope upgrade contains. `log.append()` cannot produce these.
+    The `ts` is fresh: a stale one would now trip the age abandonment (Task 4)
+    before the behaviour under test ever runs."""
     d: dict = {
         "id": f"raw-{n}",
-        "ts": f"2026-01-01T00:00:{n % 60:02d}+00:00",
+        "ts": datetime.now(timezone.utc).isoformat(),
         "actor": "legacy",
         "type": "legacy.event",
         "content": {"n": n},
@@ -670,17 +673,165 @@ def test_a_3xx_stops_without_retrying_or_abandoning(tmp_path):
     assert not [e for e in log.read_all() if e.type == BATCH_REJECTED]
 
 
-def test_retry_exhaustion_stops_the_drain_for_now(tmp_path):
-    # Task 4 adds abandonment; for this task, exhausting attempts stops like any non-2xx.
+def gaps_in(log: StimulusLog) -> list[dict]:
+    """The declared-gap markers a drain left on the surrogate's own log."""
+    return [e.content for e in log.read_all() if e.type == GAP]
+
+
+# --- Task 4: the abandon rule -----------------------------------------------
+
+
+def test_attempt_exhaustion_abandons_and_moves_on(tmp_path):
+    """Five 500s spend the whole budget on batch 1; the surrogate declares the gap on its
+    own log, steps past it, and batch 2 still ships. The channel does not wedge."""
     log = make_log(tmp_path)
-    append_n(log, 2)
+    append_n(log, 4)
     cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
-    transport = ScriptedTransport([500] * 5)
-    clock = FakeClock()
-    rep = Replicator(log, transport, cursor, clock=clock, random_fn=lambda: 0.5)
+    transport = ScriptedTransport([500] * 5 + [200])
+    rep = Replicator(
+        log, transport, cursor, max_events=2, clock=FakeClock(), random_fn=lambda: 0.5
+    )
 
     result = rep.drain()
 
-    assert transport.calls == 5
-    assert result.stopped_on == 500
-    assert cursor.acked_seq is None
+    # Exactly max_attempts calls for batch 1, then batch 2 once.
+    assert transport.calls == 6
+    assert seqs_in(transport.bodies) == [1, 2] * 5 + [3, 4]
+    gaps = gaps_in(log)
+    assert len(gaps) == 1
+    assert gaps[0]["reason"] == "retry_exhausted"
+    assert gaps[0]["declared"] is True
+    assert gaps[0]["from_seq"] == 1 and gaps[0]["to_seq"] == 2
+    assert cursor.acked_seq == 4
+    assert result.stopped_on is None
+    assert result.abandoned_batches == 1
+
+
+def test_age_exhaustion_abandons_without_sending(tmp_path):
+    """A batch whose oldest event is past max_age is abandoned before any attempt: the
+    transport is never called for it, and the next batch drains."""
+    log = make_log(tmp_path)
+    clock = FakeClock()
+    stale = clock.now() - timedelta(hours=7)
+    log.append("tester", "test.event", {"n": 0}, ts=stale)
+    log.append("tester", "test.event", {"n": 1}, ts=stale)
+    append_n(log, 2, start=2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([200])
+    rep = Replicator(log, transport, cursor, max_events=2, clock=clock)
+
+    result = rep.drain()
+
+    assert transport.calls == 1
+    assert seqs_in(transport.bodies) == [3, 4]
+    gaps = gaps_in(log)
+    assert len(gaps) == 1
+    assert gaps[0]["reason"] == "retry_exhausted"
+    assert gaps[0]["from_seq"] == 1 and gaps[0]["to_seq"] == 2
+    assert cursor.acked_seq == 4
+    assert result.abandoned_batches == 1
+
+
+def test_age_exhaustion_with_attempts_remaining(tmp_path):
+    """Age and attempts are independent bounds: the aged batch is abandoned although it
+    never spent a single attempt."""
+    log = make_log(tmp_path)
+    clock = FakeClock()
+    stale = clock.now() - timedelta(hours=7)
+    log.append("tester", "test.event", {"n": 0}, ts=stale)
+    log.append("tester", "test.event", {"n": 1}, ts=stale)
+    append_n(log, 2, start=2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([200])
+    rep = Replicator(
+        log,
+        transport,
+        cursor,
+        max_events=2,
+        clock=clock,
+        budget=RetryBudget(max_attempts=9),
+    )
+
+    rep.drain()
+
+    assert transport.calls == 1  # batch 2 only: batch 1 cost no attempt at all
+    assert len(gaps_in(log)) == 1
+
+
+def test_a_batch_that_ages_out_mid_retry_is_abandoned(tmp_path):
+    """5xx, then the fake clock's backoff sleep pushes the batch past max_age: the next
+    pre-attempt check abandons it rather than retrying into staleness."""
+    log = make_log(tmp_path)
+    clock = FakeClock()
+    borderline = clock.now() - timedelta(seconds=5)
+    log.append("tester", "test.event", {"n": 0}, ts=borderline)
+    log.append("tester", "test.event", {"n": 1}, ts=borderline)
+    append_n(log, 2, start=2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([500, 500, 200])
+    rep = Replicator(
+        log,
+        transport,
+        cursor,
+        max_events=2,
+        clock=clock,
+        random_fn=lambda: 0.5,
+        budget=RetryBudget(max_age=timedelta(seconds=10)),
+    )
+
+    result = rep.drain()
+
+    # Two attempts (ages 5s and 7s), then the 6s backoff makes it 13s: too old to retry.
+    assert clock.sleeps == [2.0, 6.0]
+    assert transport.calls == 3
+    assert seqs_in(transport.bodies) == [1, 2, 1, 2, 3, 4]
+    assert len(gaps_in(log)) == 1
+    assert cursor.acked_seq == 4
+    assert result.abandoned_batches == 1
+    assert result.stopped_on is None
+
+
+def test_the_gap_span_is_the_batchs_own_event_ts(tmp_path):
+    """span_start/span_end are the batch's oldest and newest event_ts — the surrogate
+    knows exactly what it dropped, which is why a declared gap beats an inferred one."""
+    log = make_log(tmp_path)
+    clock = FakeClock()
+    base = clock.now()
+    log.append("tester", "test.event", {"n": 0}, ts=base - timedelta(hours=3))
+    log.append("tester", "test.event", {"n": 1}, ts=base - timedelta(hours=1))
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    rep = Replicator(
+        log,
+        ScriptedTransport(),
+        cursor,
+        max_events=2,
+        clock=clock,
+        budget=RetryBudget(max_age=timedelta(hours=2)),
+    )
+
+    rep.drain()
+
+    (gap,) = gaps_in(log)
+    from datetime import datetime as _dt
+
+    assert _dt.fromisoformat(gap["span_start"]) == base - timedelta(hours=3)
+    assert _dt.fromisoformat(gap["span_end"]) == base - timedelta(hours=1)
+
+
+def test_abandonment_does_not_lose_the_events_behind_it(tmp_path):
+    """Batch 1 abandoned, batches 2-3 fine: every seq behind the gap still reaches the
+    transport, and the cursor lands past all of them."""
+    log = make_log(tmp_path)
+    append_n(log, 6)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([500] * 5 + [200, 200])
+    rep = Replicator(
+        log, transport, cursor, max_events=2, clock=FakeClock(), random_fn=lambda: 0.5
+    )
+
+    result = rep.drain()
+
+    assert seqs_in(transport.bodies) == [1, 2] * 5 + [3, 4, 5, 6]
+    assert cursor.acked_seq == 6
+    assert result.abandoned_batches == 1
+    assert result.stopped_on is None

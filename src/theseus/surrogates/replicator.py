@@ -18,11 +18,11 @@ from theseus.replication_batch import (
     DEFAULT_MAX_BATCH_BYTES,
     DEFAULT_MAX_BATCH_EVENTS,
 )
-from theseus.replication_events import BATCH_REJECTED, batch_rejected
+from theseus.replication_events import BATCH_REJECTED, GAP, batch_rejected, declared_gap
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.surrogates.clock import Clock, SystemClock
 from theseus.surrogates.cursor import AckedCursor
-from theseus.surrogates.retry import RetryBudget, backoff_delay
+from theseus.surrogates.retry import RetryBudget, backoff_delay, is_too_old
 from theseus.surrogates.transport import StimulusTransport
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,7 @@ class DrainResult:
     skipped_unsequenced: int = 0  # own-origin lines with no seq (pre-envelope): unreplicable by design
     skipped_duplicate: int = 0    # repeat seqs dropped so the host's strict-ascending check cannot 400
     rejected_batches: int = 0     # 4xx: stepped over, batch_rejected recorded
+    abandoned_batches: int = 0    # retry budget exhausted: stepped over, retry_exhausted gap
     unreachable: bool = False     # the drain stopped because nothing answered
 
 
@@ -157,14 +158,46 @@ class Replicator:
             attempted_events = 0
             stopped_on: int | None = None
             rejected_batches = 0
+            abandoned_batches = 0
             unreachable = False
+
+            def abandon(batch: list[StimulusEvent]) -> None:
+                # Both exhaustion paths (age, attempts) converge here: declare the hole on
+                # our own log, step the cursor past it, and let the drain continue. The
+                # span is the batch's own oldest and newest event_ts — we know exactly
+                # what we dropped, which is why a declared gap beats the host's inferred
+                # one. The marker's seq sits above the range it describes, so on a large
+                # backlog the host mints its own inferred marker first and our declared
+                # one arrives later; both are on the tape, reason is authoritative.
+                nonlocal abandoned_batches
+                self._log.append(
+                    "replicator",
+                    GAP,
+                    declared_gap(
+                        origin=self._log.origin,
+                        from_seq=batch[0].seq,
+                        to_seq=batch[-1].seq,
+                        reason="retry_exhausted",
+                        span_start=min(e.ts for e in batch),
+                        span_end=max(e.ts for e in batch),
+                    ),
+                )
+                self._cursor.advance(batch[-1].seq)
+                abandoned_batches += 1
+
             for batch in batches:
-                # The wire body is exactly what the host's `parse_batch` measures: each
-                # event's line plus its newline.
+                # Oldest event first: ts need not ascend with seq when a producer's clock
+                # drifts, so `batch[0].ts` would flatter the age and over-retry.
+                oldest_ts = min(e.ts for e in batch)
                 body = "".join(e.to_json() + "\n" for e in batch)
                 attempted_batches += 1
                 attempted_events += len(batch)
                 for attempt in range(1, self._budget.max_attempts + 1):
+                    # Checked before the first attempt and before every retry: a batch that
+                    # ages out mid-backoff is abandoned, not retried into staleness.
+                    if is_too_old(oldest_ts, self._clock.now(), self._budget):
+                        abandon(batch)
+                        break
                     try:
                         result = self._transport.send(body)
                     except Exception:
@@ -199,11 +232,15 @@ class Replicator:
                         # cursor behind would re-send a poison batch every drain.
                         self._cursor.advance(batch[-1].seq)
                         break
-                    if not 500 <= result.status < 600 or attempt == self._budget.max_attempts:
+                    if not 500 <= result.status < 600:
                         # A 3xx is neither permanent rejection nor transient failure — guessing
-                        # is worse than stopping. 5xx exhaustion stops too; abandoning with a
-                        # `retry_exhausted` gap is Task 4.
+                        # is worse than stopping.
                         stopped_on = result.status
+                        break
+                    if attempt == self._budget.max_attempts:
+                        # The host answered but never accepted: budget spent, so abandon and
+                        # move on — one undeliverable batch must not hold the channel.
+                        abandon(batch)
                         break
                     self._clock.sleep(
                         backoff_delay(attempt, self._budget, random_fn=self._random_fn)
@@ -219,5 +256,6 @@ class Replicator:
                 skipped_unsequenced=skipped_unsequenced,
                 skipped_duplicate=skipped_duplicate,
                 rejected_batches=rejected_batches,
+                abandoned_batches=abandoned_batches,
                 unreachable=unreachable,
             )
