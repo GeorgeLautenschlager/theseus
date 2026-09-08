@@ -235,15 +235,21 @@ def _drive_one_eviction(log: BufferedStimulusLog, start: int) -> list[StimulusEv
     the whole growing file per append made the ceiling unreachable in any real time.
     Robust to being called on a log that already holds markers."""
     heard: list[StimulusEvent] = []
-    log.subscribe(lambda e: e.type == GAP and heard.append(e))
+    # Unsubscribed on the way out: the helper is called more than once against one log,
+    # and a listener left behind keeps firing into a list nobody reads again.
+    unsubscribe = log.subscribe(lambda e: e.type == GAP and heard.append(e))
     appended: list[StimulusEvent] = []
     i = start
-    while not heard:
-        appended.append(log.append("env", "observation", _event(i)))
-        i += 1
-        # ceiling is 2000 appends (~240 KB here); a mutation that kills marker emission must fail here, not hang.
-        if len(appended) > 2000:
-            raise AssertionError(f"no new gap marker after {len(appended)} appends")
+    try:
+        while not heard:
+            appended.append(log.append("env", "observation", _event(i)))
+            i += 1
+            # Ceiling is 2000 appends (~240 KB here). A mutation that kills marker
+            # emission must fail here, not hang.
+            if len(appended) > 2000:
+                raise AssertionError(f"no new gap marker after {len(appended)} appends")
+    finally:
+        unsubscribe()
     return appended
 
 
@@ -268,14 +274,16 @@ def test_marker_span_is_the_evicted_events_own_clock(tmp_path: Path):
     # Explicit ts values far from now, so a wall-clock implementation cannot pass.
     base = datetime(2020, 1, 1, tzinfo=timezone.utc)
     appended = []
-    i = 0
-    while not _gap_markers(log.read_all()):
+    for i in range(2000):  # bounded for the same reason _drive_one_eviction is
+        if _gap_markers(log.read_all()):
+            break
         appended.append(
             log.append(
                 "env", "observation", _event(i), ts=base + timedelta(minutes=i)
             )
         )
-        i += 1
+    else:
+        raise AssertionError("no gap marker after 2000 appends")
     survivors = log.read_all()
     marker = _gap_markers(survivors)[-1]
     kept_seqs = {e.seq for e in survivors if e.type != GAP}

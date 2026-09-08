@@ -60,20 +60,52 @@ class BufferedStimulusLog(StimulusLog):
     pauses for eviction: an append is never rejected, delayed or altered by pressure,
     it just may not be remembered forever.
 
-    Forgetting is never silent. Each eviction writes a `stimulus.gap` marker
-    (`reason="storage_pressure"`) naming the inclusive own-origin seq range it took,
-    into the same atomic rewrite as the survivors — the truncation and its declaration
-    land together or not at all.
+    What this buffer forgets of *its own* stream, it declares. Each eviction writes a
+    `stimulus.gap` marker (`reason="storage_pressure"`) naming the inclusive own-origin
+    seq range it took, into the same atomic rewrite as the survivors — the truncation
+    and its declaration land together or not at all.
 
     The marker is itself an ordinary event on this buffer, evictable like any other.
     A surrogate that evicts a gap marker before it replicates has forgotten that it
     forgot — but the eviction that removed it declares a range covering the marker's
     own seq, so the tape stays honest even then.
 
-    Known cost (deliberate, do not rediscover as a bug): eviction rewrites the whole
-    surviving buffer. At the defaults that is a ~205 MB copy roughly every 51 MB
-    appended (256 MB cap, cut back to the 0.8 low water). Correctness was chosen over
-    a segmented log; revisit only if a real deployment measures this.
+    Five limits, named so they are not rediscovered as bugs:
+
+    **Only own-origin events are declared.** `declared_gap` describes one origin's seq
+    space, and this log is the authority on exactly one: its own. Foreign-origin events
+    evicted in the same pass — the host's commands, once #34 lands — leave no marker,
+    because a surrogate is not the authority on the host's numbering and a marker
+    claiming a hole in it would be a diagnosis it cannot make. The consequence is real
+    and is *not* covered by the paragraph above: a surrogate can evict commands it never
+    executed and nothing on any tape records it. That is #46's problem, not this class's.
+
+    **Eviction needs free disk to free disk.** The policy counts *log bytes*, so a
+    256 MB cap wants roughly 461 MB available at the eviction moment — the old file plus
+    the ~205 MB temp copy. An operator sizing a partition from `max_bytes` alone will
+    land on an eviction that cannot run. When one cannot, the append still succeeds and
+    the buffer sits over its cap; that is the spec's priority, not an oversight.
+
+    **The rewrite is not durable until the directory is.** `os.replace` is atomic, but
+    the rename is not on disk until the parent directory is fsynced, which this does not
+    do — the same trade `AckedCursor` documents. A power loss can undo an eviction, so
+    the buffer can come back over its cap. It cannot come back *corrupt*, which is why
+    the trade is affordable.
+
+    **Survivors are re-serialised, not copied.** Each one round-trips through
+    `from_json`/`to_json`, so a JSON field `StimulusEvent` does not know about is
+    dropped, and a pre-envelope line with no `origin` is rewritten stamped with this
+    log's own. Nothing this code writes is affected; a hand-edited log would be.
+
+    **`append_many` can return events eviction has already taken.** Eviction runs after
+    the batch is committed, so a batch larger than the low-water floor has its own head
+    evicted immediately while the full minted list is handed back to the caller. `append`
+    is safe here — the never-empty rule always keeps the newest event.
+
+    Known cost (deliberate): eviction rewrites the whole surviving buffer. At the
+    defaults that is a ~205 MB copy roughly every 51 MB appended (256 MB cap, cut back
+    to the 0.8 low water). Correctness was chosen over a segmented log; revisit only if
+    a real deployment measures this.
     """
 
     def __init__(
