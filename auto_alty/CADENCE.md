@@ -8,4 +8,3 @@ Example (backtick-quoted so it stays inert):
 `- 22:00-08:00: lm_studio qwen/qwen3-32b, tick every 15 minutes`
 
 - default: ollama gemma4:e4b, tick every 15 minutes
-<!-- - default: openrouter meta/muse-spark-1.3-contributor, context 200k, tick every 60 minutes -->
