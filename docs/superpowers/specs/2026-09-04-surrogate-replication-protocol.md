@@ -268,8 +268,39 @@ negotiate with, which would defeat the purpose of presence.
 - Backpressure: what the host does when a surrogate floods it. Note this now interacts with the
   abandon rule — sustained `429`s should burn retry budget and produce declared gaps rather than
   an ever-growing surrogate buffer.
-- Concrete retry budget: max attempts and max age values.
 - Auth and pairing scheme for off-LAN surrogates (precondition, not deferred — see Non-goals).
 
 **Resolved:** buffer bounding. The surrogate buffers as much as it can, evicts oldest-first
 under pressure, declares what it dropped, and keeps observing throughout.
+
+**Resolved (2026-09-07):** the concrete retry budget (#39).
+
+| | |
+|---|---|
+| Max attempts | **5**, per batch |
+| Backoff | base 2s, x3, +/-25% jitter, 120s ceiling — 2, 6, 18, 54, 120, so five attempts span ~200s |
+| Max age | **6 hours**, measured from the batch's **oldest `event_ts`** |
+| Age is checked | **before** a delivery attempt, not after |
+
+Edge-leaning on purpose. A surrogate kilometres from a tower is the deployment the numbers have
+to survive; a LAN desktop is comfortably inside them. Six hours means a whole tunnel outage is
+worth replaying — the agent gets hours-old observation and must read `event_ts`, not arrival, to
+know how old (which the Assembler's read-time ordering already guarantees).
+
+**Why age runs from `event_ts` and not from first attempt.** Attempt-age bounds how long one
+batch can block the channel, which sounds like the right fix for head-of-line blocking. But
+during a sustained outage every batch exhausts in turn, so the whole buffer is abandoned one
+batch at a time, each emitting its own marker, while the link is still down and nothing was ever
+individually undeliverable. Age from `event_ts`, tested before the attempt, expires a stale front
+in one coalesced gap and ships the rest — which is what "recovery drains the backlog in seq order
+with no inter-batch delay" already promises.
+
+**A batch only burns budget against a host that answered.** The transport distinguishes the two
+failures: it returns a status when the host replied and raises when nothing was reachable.
+
+- Host answered `5xx` — it is up and erroring. Retry with backoff; abandon on exhaustion.
+- Nothing answered — the link is down. Stop the drain, abandon nothing, retry on the next one.
+
+Without this split, max attempts shreds the buffer exactly the way attempt-age would: the events
+are fresh so nothing expires by age, and each batch instead burns five attempts against a link
+that is simply absent. Only a host that talks back can cost a batch its budget.
