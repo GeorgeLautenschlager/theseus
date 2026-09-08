@@ -245,17 +245,18 @@ def test_a_5xx_then_success_delivers_exactly_once(tmp_path):
 
 def test_a_rejected_batchs_marker_reaches_the_host(tmp_path):
     """A 4xx is recorded locally, then the marker itself replicates like any event."""
-    marker_reaches_rig = 500  # between the marker's 337B line and the poison event's 703B
-    rig = _rig(tmp_path, host_max_bytes=marker_reaches_rig)
+    # A host limit between the marker's line (~337B) and the poison event's (~703B), so the
+    # host can reject the one and accept the other. The surrogate's own 100B limit keeps
+    # every event a lone batch, so the marker never rides along with what it describes.
+    rig = _rig(tmp_path, host_max_bytes=500)
     rig.surrogate.append("sensor", "test.blob", {"blob": "x" * 500}, ts=BASE + timedelta(seconds=1))
-    # Surrogate max_bytes=100 keeps the oversized event a lone batch
-    # never shares a batch with the poison event and the host can accept one while
-    # rejecting the other.
 
     cursor, first = _drain(rig, tmp_path, max_bytes=100)
     assert first.rejected_batches == 1
 
-    cursor, second = _drain(rig, tmp_path, cursor_name="second.json", max_bytes=100)
+    # The SAME cursor, continuing where the first drain stopped — the poison event is behind
+    # it and is not re-sent. A fresh cursor here would re-run the rejection and prove less.
+    cursor, second = _drain(rig, tmp_path, max_bytes=100)
 
     assert second.stopped_on is None
     host_events = [e for e in rig.host_log.read_all() if e.origin == SURROGATE]
