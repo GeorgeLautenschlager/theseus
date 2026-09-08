@@ -36,7 +36,7 @@ class FakeDownProvider:
         return False
 
 
-def make(tmp_path, cadence_text=None, schedule_text=None):
+def make(tmp_path, cadence_text=None, schedule_text=None, memory=None):
     home = tmp_path / "home"
     if cadence_text is not None:
         home.mkdir(parents=True, exist_ok=True)
@@ -44,7 +44,7 @@ def make(tmp_path, cadence_text=None, schedule_text=None):
     if schedule_text is not None:
         home.mkdir(parents=True, exist_ok=True)
         (home / "SCHEDULE.md").write_text(schedule_text, encoding="utf-8")
-    core = Autocore(name="testbot", home_directory=home, tools={})
+    core = Autocore(name="testbot", home_directory=home, tools={}, memory=memory)
     core.schedule = Schedule(home / "SCHEDULE.md")
     return core, home
 
@@ -373,11 +373,15 @@ def recording_provider(recorder: TurnRecorder):
     return _Provider
 
 
-def start_loop(tmp_path, monkeypatch, tick="30 minutes") -> tuple[Autocore, TurnRecorder]:
+def start_loop(
+    tmp_path, monkeypatch, tick="30 minutes", memory=None
+) -> tuple[Autocore, TurnRecorder]:
     recorder = TurnRecorder()
     monkeypatch.setitem(PROVIDER_REGISTRY, "fake_loop", recording_provider(recorder))
     core, _ = make(
-        tmp_path, cadence_text=f"- default: fake_loop m1, tick every {tick}\n"
+        tmp_path,
+        cadence_text=f"- default: fake_loop m1, tick every {tick}\n",
+        memory=memory,
     )
     threading.Thread(target=core.loop, daemon=True).start()
     return core, recorder
@@ -424,6 +428,22 @@ def test_loop_settles_back_to_sleep_rather_than_spinning_on_its_own_events(
 
     assert recorder.wait_for_turn(timeout=1.0) is False
     assert recorder.count() == 1
+
+
+def test_memory_slot_is_held_and_the_core_never_consolidates(tmp_path, monkeypatch):
+    """Issue #42: Autocore keeps the memory slot OODACore has, but never calls
+    form() itself — consolidation is scheduled at agent assembly time."""
+    forms = []
+
+    class FakeMemory:
+        def form(self):
+            forms.append(1)
+
+    memory = FakeMemory()
+    core, recorder = start_loop(tmp_path, monkeypatch, memory=memory)
+    assert core.memory is memory
+    assert recorder.wait_for_turn(), "the loop never took its first turn"
+    assert forms == [], "Autocore consolidated on its own; assembly schedules that"
 
 
 class TestContextBudgetFollowsTheModel:
