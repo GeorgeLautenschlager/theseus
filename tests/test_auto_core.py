@@ -431,19 +431,19 @@ def test_loop_settles_back_to_sleep_rather_than_spinning_on_its_own_events(
 
 
 def test_memory_slot_is_held_and_the_core_never_consolidates(tmp_path, monkeypatch):
-    """Issue #42: Autocore keeps the memory slot OODACore has, but never calls
-    form() itself — consolidation is scheduled at agent assembly time."""
-    forms = []
+    """Issue #42: Autocore holds a MemoryModule slot but never calls consolidate()
+    itself — consolidation is scheduled at agent assembly time."""
+    consolidations = []
 
-    class FakeMemory:
-        def form(self):
-            forms.append(1)
+    class FakeMemoryModule:
+        def consolidate(self, episode):
+            consolidations.append(1)
 
-    memory = FakeMemory()
+    memory = FakeMemoryModule()
     core, recorder = start_loop(tmp_path, monkeypatch, memory=memory)
     assert core.memory is memory
     assert recorder.wait_for_turn(), "the loop never took its first turn"
-    assert forms == [], "Autocore consolidated on its own; assembly schedules that"
+    assert consolidations == [], "Autocore consolidated on its own; assembly schedules that"
 
 
 class TestContextBudgetFollowsTheModel:
