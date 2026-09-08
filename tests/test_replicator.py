@@ -835,3 +835,27 @@ def test_abandonment_does_not_lose_the_events_behind_it(tmp_path):
     assert cursor.acked_seq == 6
     assert result.abandoned_batches == 1
     assert result.stopped_on is None
+
+
+def test_age_uses_the_batchs_oldest_ts_not_its_first(tmp_path):
+    """`min(e.ts ...)`, not `batch[0].ts`. Events are ordered by `seq`, and `ts` need not
+    ascend with `seq` — a producer whose clock stepped backwards, or two sensors with
+    skewed clocks, puts the oldest event anywhere in the batch.
+
+    Taking the first event's ts flatters the age of exactly that batch, so a batch holding
+    something genuinely stale is retried into staleness instead of being abandoned.
+    """
+    log = make_log(tmp_path)
+    clock = FakeClock()
+    # seq 1 is recent, seq 2 is ancient: the batch's oldest ts is NOT its first event's.
+    log.append("tester", "test.event", {"n": 0}, ts=clock.now() - timedelta(minutes=1))
+    log.append("tester", "test.event", {"n": 1}, ts=clock.now() - timedelta(hours=9))
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([200])
+
+    result = Replicator(log, transport, cursor, max_events=2, clock=clock).drain()
+
+    assert transport.calls == 0, "a batch holding a 9h-old event must not be sent"
+    assert result.abandoned_batches == 1
+    gaps = [e.content for e in log.read_all() if e.type == GAP]
+    assert gaps and gaps[0]["reason"] == "retry_exhausted"
