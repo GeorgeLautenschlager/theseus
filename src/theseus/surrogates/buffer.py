@@ -123,6 +123,12 @@ class BufferedStimulusLog(StimulusLog):
             directory = os.path.dirname(os.fspath(self.path)) or "."
             fd, tmp = tempfile.mkstemp(prefix=".buffer-evict-", dir=directory)
             try:
+                # mkstemp creates the temp file at 0600; os.replace would move that
+                # mode into place and silently narrow the log's permissions the first
+                # time eviction fires. Copy the existing file's mode so eviction
+                # preserves whatever the operator set (group-readable log shippers,
+                # debug UIs) instead of imposing the temp file's default.
+                os.chmod(tmp, os.stat(self.path).st_mode & 0o777)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.writelines(e.to_json() + "\n" for e in survivors)
                     f.flush()

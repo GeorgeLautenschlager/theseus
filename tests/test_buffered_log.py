@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -141,6 +142,25 @@ def test_appends_continue_during_pressure(tmp_path: Path):
     assert log.read_all()[-1].seq == last.seq
 
 
+def test_byte_budget_measured_in_bytes_not_characters(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    # CJK payloads: 3 UTF-8 bytes per character, so a character-counting
+    # implementation measures each line at roughly a third of its on-disk size.
+    # The payload must dominate the ASCII overhead or the two measurements don't
+    # separate: a 1000-char CJK fill is ~1150 chars but ~3150 bytes per line.
+    # With max_bytes=12000 and low_water=0.5, a char-counting impl never evicts
+    # at all (6 lines total only ~6900 chars, under the 6000-char floor) while
+    # the real file sits at ~18900 bytes — past the 12000-byte cap. Only byte
+    # counting keeps the file within budget. Assert on st_size because that is
+    # exactly what character counting gets wrong.
+    policy = BufferPolicy(max_bytes=12_000, low_water=0.5)
+    log = BufferedStimulusLog(path, policy=policy)
+    for i in range(6):
+        log.append("env", "observation", _event(i, fill="語" * 1000))
+    assert path.stat().st_size <= policy.max_bytes  # the thing character counting gets wrong
+    log.read_all()  # survivors parse
+
+
 def test_lone_oversized_event_is_kept(tmp_path: Path):
     path = tmp_path / "log.jsonl"
     log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=10, low_water=0.5))
@@ -170,6 +190,19 @@ def test_eviction_safe_under_concurrent_appends(tmp_path: Path):
     events = log.read_all()  # raises on any torn line
     own_seqs = [e.seq for e in events if e.origin == DEFAULT_ORIGIN]
     assert len(own_seqs) == len(set(own_seqs))  # no duplicate seqs
+
+
+def test_eviction_preserves_file_permissions(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    policy = BufferPolicy(max_bytes=1000, low_water=0.5)
+    log = BufferedStimulusLog(path, policy=policy)
+    log.append("env", "observation", _event(0))
+    # Distinctive mode, not the umask default — otherwise the test could pass by
+    # coincidence of the temp file happening to match.
+    os.chmod(path, 0o640)
+    for i in range(1, 12):  # crosses the threshold, forcing an eviction
+        log.append("env", "observation", _event(i))
+    assert path.stat().st_mode & 0o777 == 0o640
 
 
 def test_plain_stimulus_log_never_evicts(tmp_path: Path):
