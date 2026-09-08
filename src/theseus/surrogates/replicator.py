@@ -86,6 +86,27 @@ class Replicator:
     transient (retried with backoff on the injected clock). A raise is the link being down:
     the drain stops cleanly, abandons nothing, and spends no budget — the next drain retries
     the same range.
+
+    Three known limits, named so they are not rediscovered as bugs:
+
+    **A host that answers but never accepts grows the tape without bound.** Each abandoned
+    batch appends a marker; that marker is itself a batch on the next drain, is abandoned in
+    turn, and produces a marker about the marker — one new event per drain, each burning a
+    full retry budget to describe nothing. Measured against a permanently-500 host: four
+    drains, four markers, twenty sends. A link that is genuinely down raises instead and
+    abandons nothing, so this needs a host that is up and broken. Suppressing it belongs
+    with buffer retention (#33), not here.
+
+    **One stale event abandons its whole batch.** Age is `min(e.ts ...)` across a batch of
+    up to `DEFAULT_MAX_BATCH_EVENTS`, so a single backfilled or clock-skewed event drags
+    every fresh event beside it into the gap. That is #39's rule, and splitting a batch on
+    age would reopen the head-of-line problem this issue closes — but the rationale there
+    imagines a stale *front*, and a stale *middle* costs more than it reads like it should.
+
+    **Backoff sleeps hold this lock.** With a real clock, one 5xx batch stalls the caller
+    for its whole retry window, and a drain of N such batches serialises to N windows with
+    no overall deadline. Comfortable on a LAN; on the edge deployment the budget was chosen
+    for, a drain can run a long time holding the lock.
     """
 
     def __init__(
