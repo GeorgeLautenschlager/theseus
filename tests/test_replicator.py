@@ -12,11 +12,15 @@ import logging
 import queue
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from fastapi.responses import JSONResponse
 
+from theseus.surrogates.clock import SystemClock
 from theseus.surrogates.cursor import AckedCursor
+from theseus.surrogates.http_transport import HttpTransport
 from theseus.surrogates.replicator import DrainResult, Replicator
 from theseus.surrogates.transport import TransportResult
 from theseus.stimulus_log import StimulusLog
@@ -436,3 +440,78 @@ def test_the_batch_limits_are_the_hosts_own(tmp_path):
 
     assert replicator._max_events == DEFAULT_MAX_BATCH_EVENTS
     assert replicator._max_bytes == DEFAULT_MAX_BATCH_BYTES
+
+
+# --- Task 1: the clock seam and the host's reason ---------------------------
+
+
+def test_system_clock_is_timezone_aware_utc():
+    """A naive `now()` would compare wrongly against event timestamps, which are all
+    timezone-aware; the one clock the system ships must therefore be aware and UTC."""
+    now = SystemClock().now()
+    assert now.tzinfo is not None
+    assert now.utcoffset() == timedelta(0)
+
+
+def test_transport_result_carries_the_hosts_reason():
+    """The host's own words travel with the status; the default stays `""` so every
+    existing construction keeps type-checking."""
+    assert TransportResult(status=400, reason="batch too large").reason == "batch too large"
+    assert TransportResult(status=200).reason == ""
+
+
+def test_transport_reads_reason_from_a_rejection_body():
+    """The ingress answers a rejection with a JSON body carrying `reason`; the transport
+    surfaces it so the log can record why, not just that."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+
+    @app.post("/replicate")
+    def replicate():
+        return JSONResponse(
+            status_code=413, content={"reason": "batch is 9000 bytes, over the 8192 limit"}
+        )
+
+    transport = HttpTransport("http://testserver/replicate", client=TestClient(app))
+    result = transport.send("{}")
+    assert result.status == 413
+    assert result.reason == "batch is 9000 bytes, over the 8192 limit"
+
+
+def test_transport_survives_a_non_json_error_body():
+    """A transport that raises while parsing an error response turns a clean `4xx` into
+    what looks like an unreachable host — the distinction the whole seam preserves."""
+    from fastapi import FastAPI, Response
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+
+    @app.post("/replicate")
+    def replicate():
+        return Response(content="nope", status_code=400, media_type="text/plain")
+
+    transport = HttpTransport("http://testserver/replicate", client=TestClient(app))
+    result = transport.send("{}")
+    assert result.status == 400
+    assert result.reason == ""
+
+
+def test_transport_bounds_an_over_long_reason():
+    """A remote party's words are bounded in the transport too, not only at the tape."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from theseus.replication_events import MAX_REASON_CHARS
+
+    app = FastAPI()
+
+    @app.post("/replicate")
+    def replicate():
+        return JSONResponse(status_code=400, content={"reason": "x" * 10_000})
+
+    transport = HttpTransport("http://testserver/replicate", client=TestClient(app))
+    result = transport.send("{}")
+    assert result.status == 400
+    assert len(result.reason) == MAX_REASON_CHARS

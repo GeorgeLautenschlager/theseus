@@ -14,6 +14,10 @@ from typing import Protocol
 @dataclass(frozen=True, slots=True)
 class TransportResult:
     status: int
+    # The host's own words, when it gave any. Bounded here — this is a remote party's
+    # output and the transport should not carry an unbounded string around; the tape
+    # bounds it again on write (`replication_events.MAX_REASON_CHARS`).
+    reason: str = ""
 
 
 class StimulusTransport(Protocol):
