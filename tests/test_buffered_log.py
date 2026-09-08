@@ -244,6 +244,9 @@ def _drive_one_eviction(log: BufferedStimulusLog, start: int) -> list[StimulusEv
     while _newest_marker_seq(log) == seen:
         appended.append(log.append("env", "observation", _event(i)))
         i += 1
+        # ponytail: this exists — ceiling is 10000 appends; a mutation that kills marker emission must fail here, not hang.
+        if len(appended) > 10000:
+            raise AssertionError(f"no new gap marker after {len(appended)} appends")
     return appended
 
 
@@ -382,7 +385,10 @@ def test_listener_that_appends_does_not_deadlock(tmp_path: Path):
             acked.set()
 
     log.subscribe(react)
-    worker = threading.Thread(target=_drive_one_eviction, args=(log, 0))
+    # daemon=True is load-bearing: if a regression deadlocks the worker it will never be
+    # joinable, so the interpreter must be allowed to exit and surface the failed assertion
+    # instead of hanging at shutdown waiting for a wedged thread.
+    worker = threading.Thread(target=_drive_one_eviction, args=(log, 0), daemon=True)
     worker.start()
     worker.join(10)
     assert not worker.is_alive(), "listener append deadlocked the eviction"
