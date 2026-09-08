@@ -12,9 +12,11 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from theseus.stimulus_log import DEFAULT_ORIGIN, StimulusEvent, StimulusLog
+from theseus.replication_events import GAP, declared_gap
+from theseus.stimulus_log import DEFAULT_ORIGIN, StimulusEvent, StimulusLog, new_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +55,22 @@ class BufferedStimulusLog(StimulusLog):
     they return, `read_all` still parses the whole tape — except that under storage
     pressure the oldest events are dropped and the file rewritten. Observation never
     pauses for eviction: an append is never rejected, delayed or altered by pressure,
-    it just may not be remembered forever. Task 3 will declare each evicted range to
-    the host with a `storage_pressure` gap marker; until then an eviction is a silent
-    one, which is why nothing but a surrogate should ever hold this class.
+    it just may not be remembered forever.
+
+    Forgetting is never silent. Each eviction writes a `stimulus.gap` marker
+    (`reason="storage_pressure"`) naming the inclusive own-origin seq range it took,
+    into the same atomic rewrite as the survivors — the truncation and its declaration
+    land together or not at all.
+
+    The marker is itself an ordinary event on this buffer, evictable like any other.
+    A surrogate that evicts a gap marker before it replicates has forgotten that it
+    forgot — but the eviction that removed it declares a range covering the marker's
+    own seq, so the tape stays honest even then.
+
+    Known cost (deliberate, do not rediscover as a bug): eviction rewrites the whole
+    surviving buffer. At the defaults that is a ~205 MB copy roughly every 51 MB
+    appended (256 MB cap, cut back to the 0.8 low water). Correctness was chosen over
+    a segmented log; revisit only if a real deployment measures this.
     """
 
     def __init__(
@@ -112,7 +127,47 @@ class BufferedStimulusLog(StimulusLog):
                 keep_from += 1
             if keep_from == 0:
                 return None
-            survivors = events[keep_from:]
+            evicted = events[:keep_from]
+            # Only own-origin sequenced events are described: `declared_gap` names one
+            # origin's seq space, and that is what the host dedupes on. Foreign events
+            # were authored by the host and not lost; seq-less events predate the
+            # envelope and were already unreplicable.
+            described = [
+                e for e in evicted if e.origin == self.origin and e.seq is not None
+            ]
+            if not described:
+                survivors = events[keep_from:]
+                marker = None
+            else:
+                # Two-pass keep computation: the marker rides in the same rewrite, so
+                # its bytes come out of the same low-water budget. Pass one finds the
+                # eviction extent; the marker line for that extent gives the exact
+                # budget for pass two. Pass two only ever evicts *fewer* events, and
+                # if that shrinks the described set away, we fall back to pass one's
+                # larger eviction so nothing is dropped unmarked — the two-pass result
+                # is only taken when it can still be declared.
+                keep1 = keep_from
+                described1 = described
+                bounds = (min(e.seq for e in described1), max(e.seq for e in described1))
+                span = (min(e.ts for e in described1), max(e.ts for e in described1))
+                # Mint the marker the way `append` would: seq under the recovered
+                # counter, id from the appended timestamp. The seq is peeked, not
+                # consumed, until we know a rewrite will actually happen.
+                marker_seq = self._next_seq
+                marker_json = self._mint_gap(
+                    marker_seq, bounds, span
+                ).to_json() + "\n"
+                keep2 = self._keep_index(sizes, floor - len(marker_json.encode("utf-8")))
+                described2 = [
+                    e for e in events[:keep2] if e.origin == self.origin and e.seq is not None
+                ]
+                if described2:
+                    keep_from = keep2
+                    bounds = (min(e.seq for e in described2), max(e.seq for e in described2))
+                    span = (min(e.ts for e in described2), max(e.ts for e in described2))
+                marker = self._mint_gap(marker_seq, bounds, span)
+                self._next_seq = marker_seq + 1
+                survivors = events[keep_from:] + [marker]
 
             # Same atomic-replace dance as the cursor sidecar: write the survivors to a
             # temp file in this log's own directory (so os.replace is a rename on one
@@ -140,6 +195,50 @@ class BufferedStimulusLog(StimulusLog):
                 except OSError:
                     pass
                 raise
-            # Task 3 returns a `storage_pressure` gap marker covering [first evicted
-            # seq, last evicted seq] here.
-            return None
+            if marker is not None:
+                # Outside the lock, after the replace is durable — the same ordering
+                # `append` uses: a listener is free to append, and holding the lock
+                # across a callback would deadlock it.
+                self._notify(marker)
+            return marker
+
+    def _mint_gap(
+        self,
+        seq: int,
+        bounds: tuple[int, int],
+        span: tuple[Any, Any],
+    ) -> StimulusEvent:
+        """Build the `storage_pressure` marker in memory, exactly as `append` mints an
+        event: id from `appended_ts`, ts = appended_ts. Caller holds `_append_lock`
+        and has already recovered `_next_seq`; `seq` is peeked, not consumed."""
+        now = datetime.now(timezone.utc)
+        return StimulusEvent(
+            id=new_id(int(now.timestamp() * 1000)),
+            ts=now,
+            # Same actor convention as the Replicator's declared gaps: the declaring
+            # component's own name.
+            actor="buffer",
+            type=GAP,
+            content=declared_gap(
+                origin=self.origin,
+                from_seq=bounds[0],
+                to_seq=bounds[1],
+                reason="storage_pressure",
+                span_start=span[0],
+                span_end=span[1],
+            ),
+            origin=self.origin,
+            seq=seq,
+            appended_ts=now,
+        )
+
+    def _keep_index(self, sizes: list[int], floor: float) -> int:
+        """How many oldest events to drop so the rest fits under `floor`, never
+        emptying the buffer (a single oversized event is kept and the buffer sits
+        over its cap)."""
+        total = sum(sizes)
+        keep = 0
+        while total > floor and keep < len(sizes) - 1:
+            total -= sizes[keep]
+            keep += 1
+        return keep

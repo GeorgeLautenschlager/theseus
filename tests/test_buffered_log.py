@@ -5,11 +5,12 @@ from __future__ import annotations
 import dataclasses
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from theseus.replication_events import GAP
 from theseus.surrogates.buffer import BufferedStimulusLog, BufferPolicy
 from theseus.stimulus_log import DEFAULT_ORIGIN, StimulusEvent, StimulusLog
 
@@ -104,7 +105,8 @@ def test_log_readable_and_well_formed_after_eviction(tmp_path: Path):
     log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
     for i in range(12):
         log.append("env", "observation", _event(i))
-    survivors = log.read_all()  # raises on any torn or interior-corrupt line
+    survivors = [e for e in log.read_all() if e.type != GAP]
+    assert survivors  # raises on any torn or interior-corrupt line
     assert all(e.content["n"] >= survivors[0].content["n"] for e in survivors)
     assert [e.content["n"] for e in survivors] == sorted(
         e.content["n"] for e in survivors
@@ -125,9 +127,15 @@ def test_seq_counter_survives_eviction(tmp_path: Path):
         warm.append("env", "observation", _event(i))
     log = BufferedStimulusLog(path, policy=policy)
     log.append_many([_replicated(i, size=200) for i in range(1, 21)])
-    assert not any(e.origin == DEFAULT_ORIGIN for e in log.read_all())  # own seqs evicted
-    assert log._recover_next_seq() == 1  # what a post-eviction lazy recovery would give
-    assert log.append("env", "observation", _event(99)).seq == 6
+    # Own observations are evicted; the only own-origin event left is the gap marker
+    # declaring their range (seq 6, minted from the counter recovered pre-shrink).
+    assert not any(
+        e.origin == DEFAULT_ORIGIN and e.type != GAP for e in log.read_all()
+    )
+    marker = [e for e in log.read_all() if e.type == GAP][-1]
+    assert marker.seq == 6
+    assert log._recover_next_seq() == 7  # the marker's seq now sits on the tape
+    assert log.append("env", "observation", _event(99)).seq == 7
 
 
 def test_appends_continue_during_pressure(tmp_path: Path):
@@ -208,3 +216,167 @@ def test_plain_stimulus_log_never_evicts(tmp_path: Path):
     for i in range(50):
         log.append("env", "observation", _event(i, fill="y" * 100))
     assert path.stat().st_size > 2000  # grew without any cap
+
+
+# --- Task 3: eviction declares what storage pressure took -------------------
+
+
+def _gap_markers(events: list[StimulusEvent]) -> list[StimulusEvent]:
+    return [e for e in events if e.type == GAP]
+
+
+
+def _drive_one_eviction(log: BufferedStimulusLog, start: int) -> list[StimulusEvent]:
+    """Append small events until exactly one eviction (one gap marker) has landed,
+    returning the events appended since the log was empty of markers. Keeps the
+    scenario deterministic: eviction count depends on marker size, so a fixed
+    append count would race the threshold."""
+    appended: list[StimulusEvent] = []
+    i = start
+    while not _gap_markers(log.read_all()):
+        appended.append(log.append("env", "observation", _event(i)))
+        i += 1
+    return appended
+
+
+def test_eviction_declares_the_range_it_dropped(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    appended = _drive_one_eviction(log, 0)
+    survivors = log.read_all()
+    assert len(_gap_markers(survivors)) == 1
+    marker = _gap_markers(survivors)[-1]
+    kept_seqs = {e.seq for e in survivors if e.type != GAP}
+    evicted = [e.seq for e in appended if e.seq not in kept_seqs]
+    assert evicted, "the test must actually have evicted something"
+    assert marker.content["from_seq"] == min(evicted)
+    assert marker.content["to_seq"] == max(evicted)
+    assert marker.content["reason"] == "storage_pressure"
+
+
+def test_marker_span_is_the_evicted_events_own_clock(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    # Explicit ts values far from now, so a wall-clock implementation cannot pass.
+    base = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    appended = []
+    i = 0
+    while not _gap_markers(log.read_all()):
+        appended.append(
+            log.append(
+                "env", "observation", _event(i), ts=base + timedelta(minutes=i)
+            )
+        )
+        i += 1
+    survivors = log.read_all()
+    marker = _gap_markers(survivors)[-1]
+    kept_seqs = {e.seq for e in survivors if e.type != GAP}
+    evicted = [e for e in appended if e.seq not in kept_seqs]
+    assert datetime.fromisoformat(marker.content["span_start"]) == min(e.ts for e in evicted)
+    assert datetime.fromisoformat(marker.content["span_end"]) == max(e.ts for e in evicted)
+    assert datetime.fromisoformat(marker.content["span_start"]) < datetime.now(timezone.utc) - timedelta(days=1000)
+
+
+def test_marker_is_declared_not_inferred(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    _drive_one_eviction(log, 0)
+    marker = _gap_markers(log.read_all())[-1]
+    assert marker.content["declared"] is True
+    assert marker.content["origin"] == DEFAULT_ORIGIN
+
+
+def test_marker_seq_is_above_every_survivor(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    _drive_one_eviction(log, 0)
+    survivors = log.read_all()
+    marker = _gap_markers(survivors)[-1]
+    other = [e.seq for e in survivors if e.type != GAP]
+    assert all(marker.seq > s for s in other)
+
+
+def test_truncation_and_marker_are_one_act(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    replaces: list[object] = []
+    real = os.replace
+
+    def counting(src, dst):
+        replaces.append(dst)
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", counting)
+    _drive_one_eviction(log, 0)  # stops at the first eviction
+    assert len(replaces) == 1  # one eviction, one replace
+    events = log.read_all()  # one file read shows both survivors and marker
+    kept = [e for e in events if e.type != GAP]
+    assert kept and _gap_markers(events)
+    assert kept[-1].seq < _gap_markers(events)[-1].seq
+
+
+def test_eviction_of_only_foreign_events_emits_no_marker(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=2000, low_water=0.5))
+    log.append_many([_replicated(i, size=200) for i in range(1, 21)])
+    assert path.stat().st_size <= log._policy.max_bytes  # rewritten, i.e. evicted
+    assert not _gap_markers(log.read_all())
+
+
+def test_unsequenced_events_evicted_but_not_described(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    # Hand-write an own-origin event with seq null: it predates the envelope and has
+    # no range to name in a marker.
+    ghost = StimulusEvent(
+        id="GHOST000000000000000000000",
+        ts=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        actor="env",
+        type="observation",
+        content={"n": -1},
+        origin=DEFAULT_ORIGIN,
+        seq=None,
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(ghost.to_json() + "\n")
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=2000, low_water=0.5))
+    log.append_many([_replicated(i, size=200) for i in range(1, 21)])
+    events = log.read_all()
+    assert ghost.id not in {e.id for e in events}  # evicted
+    assert not _gap_markers(events)  # and never described
+
+
+def test_listener_hears_the_marker(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    for i in range(6):
+        log.append("env", "observation", _event(i))
+    heard: list[StimulusEvent] = []
+    log.subscribe(heard.append)
+    _drive_one_eviction(log, 0)
+    gaps = [e for e in heard if e.type == GAP]
+    assert len(gaps) == 1
+    assert any(e.type != GAP for e in heard)  # survivors also notified
+    assert gaps[0] in log.read_all()  # durable by the time it was announced
+
+
+def test_successive_evictions_declare_successive_ranges(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    next_i = 0
+    ranges: list[tuple[int, int]] = []
+    while len(ranges) < 2:
+        before = len(_gap_markers(log.read_all()))
+        appended = []
+        i = next_i
+        while len(_gap_markers(log.read_all())) == before:
+            appended.append(log.append("env", "observation", _event(i)))
+            i += 1
+        next_i = i
+        kept = {e.seq for e in log.read_all() if e.type != GAP}
+        evicted = [e.seq for e in appended if e.seq not in kept]
+        marker = _gap_markers(log.read_all())[-1]
+        assert marker.content["from_seq"] == min(evicted)
+        assert marker.content["to_seq"] == max(evicted)
+        ranges.append((marker.content["from_seq"], marker.content["to_seq"]))
+    (a, b) = ranges
+    assert a[1] < b[0]  # disjoint and ascending
