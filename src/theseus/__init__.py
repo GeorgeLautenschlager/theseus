@@ -11,6 +11,7 @@ from theseus.schedule import Schedule
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
 from theseus.surrogates.replicator import Replicator
+from theseus.surrogates.retry import RetryBudget
 from theseus.surrogates.transport import StimulusTransport
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.time_observer import TimeObserver
@@ -44,6 +45,7 @@ __all__ = [
     "AckedCursor",
     "HttpTransport",
     "Replicator",
+    "RetryBudget",
     "StimulusTransport",
     "RecallTool",
     "Tool",
