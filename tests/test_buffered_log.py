@@ -61,13 +61,21 @@ def _replicated(n: int, origin: str = "host", size: int = 0) -> StimulusEvent:
     )
 
 
-def test_under_budget_never_rewrites(tmp_path: Path):
+def test_under_budget_never_rewrites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Counting os.replace, not comparing inodes. An inode check cannot see a rewrite
+    # here: ext4 hands the freed number straight back to the next mkstemp, so a log
+    # alternates between two inodes and lands on its original after any even number of
+    # rewrites — measured at 18 rewrites returning the starting inode.
     path = tmp_path / "log.jsonl"
     log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=100_000))
-    inode = path.stat().st_ino  # captured before: comparing to a later stat of the same path is the only way a rewrite can show
+    replaces: list[tuple[str, str]] = []
+    real_replace = os.replace
+    monkeypatch.setattr(
+        os, "replace", lambda a, b, *r, **k: (replaces.append((a, b)), real_replace(a, b, *r, **k))[1]
+    )
     appended = [log.append("env", "observation", _event(i)) for i in range(10)]
     assert [e.seq for e in log.read_all()] == [e.seq for e in appended]
-    assert path.stat().st_ino == inode  # never rewritten
+    assert replaces == [], "an under-budget buffer must not be rewritten"
 
 
 def test_crossing_threshold_evicts_oldest_first(tmp_path: Path):
