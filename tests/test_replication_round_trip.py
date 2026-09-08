@@ -474,7 +474,10 @@ def test_eviction_under_an_active_drain_is_safe(tmp_path):
         _drain(rig, tmp_path, max_events=1)
         done.set()
 
-    thread = threading.Thread(target=run)
+    # daemon: if the drain ever wedges, `join(timeout)` below fails the assertion and
+    # the interpreter can still exit. A non-daemon worker would turn that failure into a
+    # hang at shutdown — the same trap `test_buffered_log.py` hit.
+    thread = threading.Thread(target=run, daemon=True)
     thread.start()
     appended = 0
     while not done.is_set() and appended < 8:
