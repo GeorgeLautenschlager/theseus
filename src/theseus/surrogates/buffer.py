@@ -9,6 +9,7 @@ would let it.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ from typing import Any, Iterable
 
 from theseus.replication_events import GAP, declared_gap
 from theseus.stimulus_log import DEFAULT_ORIGIN, StimulusEvent, StimulusLog, new_id
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,18 +83,53 @@ class BufferedStimulusLog(StimulusLog):
         *,
         policy: BufferPolicy = BufferPolicy(),
     ) -> None:
+        # A hard kill between mkstemp and os.replace in a past incarnation leaves an
+        # orphan temp file, and each one can be ~max_bytes * low_water — accumulating
+        # on exactly the device the buffer exists to protect. Sweep them at boot; a
+        # surrogate must not refuse to open over litter.
+        directory = os.path.dirname(os.fspath(path)) or "."
+        try:
+            leftovers = [n for n in os.listdir(directory) if n.startswith(".buffer-evict-")]
+        except OSError:
+            leftovers = []  # unreadable dir must not stop the log from opening
+        for name in leftovers:
+            try:
+                os.unlink(os.path.join(directory, name))
+            except OSError:
+                logger.debug("could not sweep orphan eviction temp file %s", name)
         super().__init__(path, origin)
         self._policy = policy
+        # Consecutive eviction failures downgrade to debug so a full disk costs one
+        # warning, not one per append; reset when an eviction succeeds again.
+        self._evict_fail_streak = 0
 
     def append(self, *args: Any, **kwargs: Any) -> StimulusEvent:
         event = super().append(*args, **kwargs)
-        self._evict_if_needed()
+        self._evict_safely()
         return event
 
     def append_many(self, events: Iterable[StimulusEvent]) -> list[StimulusEvent]:
         minted = super().append_many(events)
-        self._evict_if_needed()
+        self._evict_safely()
         return minted
+
+    def _evict_safely(self) -> None:
+        """An eviction that fails must never fail the append: the event is already
+        durable, and the surrogate's whole point is to keep observing on a full disk.
+        Only OSError is caught — a KeyboardInterrupt or a programming error is not
+        disk pressure and must propagate. The buffer simply sits over its cap, on the
+        record via the log, until pressure eases."""
+        try:
+            self._evict_if_needed()
+        except OSError:
+            self._evict_fail_streak += 1
+            message = "buffer eviction failed; buffer remains over cap: %s"
+            if self._evict_fail_streak == 1:
+                logger.warning(message, self.path)
+            else:
+                logger.debug(message, self.path)
+            return
+        self._evict_fail_streak = 0
 
     def _evict_if_needed(self) -> StimulusEvent | None:
         """Evict oldest-first if the file is over budget. Returns the gap marker, if one
@@ -175,7 +213,6 @@ class BufferedStimulusLog(StimulusLog):
                     bounds = (min(e.seq for e in described2), max(e.seq for e in described2))
                     span = (min(e.ts for e in described2), max(e.ts for e in described2))
                 marker = self._mint_gap(marker_seq, bounds, span)
-                self._next_seq = marker_seq + 1
                 survivors = events[keep_from:] + [marker]
 
             # Same atomic-replace dance as the cursor sidecar: write the survivors to a
@@ -198,6 +235,11 @@ class BufferedStimulusLog(StimulusLog):
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, self.path)
+                # Consume the marker's seq only once the rewrite is durable; if the
+                # replace failed, the seq is unused and the next append takes it —
+                # no hole in the own-origin seq sequence for the host to diagnose.
+                if marker is not None:
+                    self._next_seq = marker_seq + 1
             except BaseException:
                 try:
                     os.unlink(tmp)

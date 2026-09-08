@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -419,3 +420,114 @@ def test_successive_evictions_declare_successive_ranges(tmp_path: Path):
         ranges.append((marker.content["from_seq"], marker.content["to_seq"]))
     (a, b) = ranges
     assert a[1] < b[0]  # disjoint and ascending
+
+
+# --- review findings: eviction failure is disk pressure, not a crash ---------
+
+
+def test_failed_eviction_does_not_break_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    for i in range(12):  # well over the cap; appends have been evicting
+        log.append("env", "observation", _event(i))
+
+    def no_space(*args: object, **kwargs: object) -> object:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tempfile, "mkstemp", no_space)
+    second = log.append("env", "observation", _event(99))  # triggers a failing eviction
+    assert second.seq > 0  # the append itself succeeded
+    assert {e.content["n"] for e in log.read_all() if e.type != GAP} >= {11, 99}
+
+
+def test_appends_keep_landing_while_eviction_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+
+    def no_space(*args: object, **kwargs: object) -> object:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tempfile, "mkstemp", no_space)
+    appended = [log.append("env", "observation", _event(i)) for i in range(50)]
+    assert path.stat().st_size > 1000  # sits over its cap, as the failing eviction implies
+    on_disk = [e.seq for e in log.read_all() if e.type != GAP]
+    assert on_disk == [e.seq for e in appended]  # every event landed, none lost
+
+
+def test_non_oserror_from_eviction_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    for i in range(12):  # well over the cap; each append has been evicting
+        log.append("env", "observation", _event(i))
+
+    def bug(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("a real programming error, not disk pressure")
+
+    monkeypatch.setattr(tempfile, "mkstemp", bug)
+    with pytest.raises(RuntimeError):
+        log.append("env", "observation", _event(1))
+
+
+def test_failed_eviction_does_not_burn_a_seq(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=5000, low_water=0.5))
+    for i in range(5):
+        log.append("env", "observation", _event(i))
+    seqs_before = [e.seq for e in log.read_all() if e.origin == DEFAULT_ORIGIN]
+    assert seqs_before == [1, 2, 3, 4, 5]
+
+    def no_space(*args: object, **kwargs: object) -> object:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tempfile, "mkstemp", no_space)
+    for i in range(10, 30):  # crosses the threshold; eviction fails every time
+        log.append("env", "observation", _event(i))
+    monkeypatch.undo()
+    # The next successful append must take the seq the failed evictions peeked but
+    # never used — no hole in the own-origin sequence on the tape.
+    nxt = log.append("env", "observation", _event(99))
+    all_own = [e.seq for e in log.read_all() if e.origin == DEFAULT_ORIGIN]
+    # Appends 6..25 each took one seq, the successful eviction's marker took exactly
+    # the next one (26), and append(99) the one after — a failed eviction consumed
+    # nothing, so the own-origin sequence on the tape has no hole. The oldest end is
+    # itself evicted (by that successful eviction), so assert contiguity, not extent.
+    assert all_own == list(range(all_own[0], all_own[-1] + 1))
+    # append(99) itself took 26 (the first seq after the 25 appends — failed evictions
+    # consumed nothing); the successful eviction's marker then took the next one, 27.
+    assert nxt.seq == 26
+    assert all_own[-1] == 27
+    assert any(e.seq == 27 and e.type == GAP for e in log.read_all())  # marker took 27
+
+
+def test_orphan_temp_files_swept_on_open(tmp_path: Path):
+    path = tmp_path / "log.jsonl"
+    orphan = tmp_path / ".buffer-evict-ab12cd"
+    orphan.write_text("{\"orphan\": true}\n")
+    bystander = tmp_path / "unrelated.txt"
+    bystander.write_text("keep me")
+    BufferedStimulusLog(path)
+    assert not orphan.exists()
+    assert bystander.read_text() == "keep me"
+    assert path.exists()  # the log opened normally despite the litter
+
+
+def test_unsweepable_orphan_does_not_stop_boot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "log.jsonl"
+    orphan = tmp_path / ".buffer-evict-ab12cd"
+    orphan.write_text("{}\n")
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "unlink", refuse)
+    log = BufferedStimulusLog(path)  # must not raise
+    monkeypatch.undo()
+    assert log.append("env", "observation", _event(0))
