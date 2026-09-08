@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from theseus.replication_events import MAX_REASON_CHARS
 from theseus.surrogates.transport import TransportResult
 
 
@@ -52,4 +53,24 @@ class HttpTransport:
                 client.close()
         # httpx raises on a network-level failure (unreachable host, DNS, refused
         # connection) and we let it propagate: `5xx` is an answer, "never arrived" is not.
-        return TransportResult(status=response.status_code)
+        return TransportResult(status=response.status_code, reason=self._reason(response))
+
+    @staticmethod
+    def _reason(response: Any) -> str:
+        """The host's own words from a rejection body, read defensively.
+
+        A body that is not JSON — or carries no string `reason` — yields `""` rather than
+        raising: a transport that dies parsing an error response turns a clean `4xx` into
+        what looks like an unreachable host, the one distinction this seam preserves.
+        """
+        try:
+            reason = response.json().get("reason")
+        except Exception:
+            return ""
+        if not isinstance(reason, str):
+            return ""
+        # Stripped before it is bounded: a host answering `{"reason": " "}` is answering
+        # with nothing, and " " is truthy — it would sail past every `or`-fallback
+        # downstream and reach a constructor that rejects a blank reason. Sliced one over
+        # the limit so `_clean_reason` can still tell it was cut and say so on the tape.
+        return reason.strip()[: MAX_REASON_CHARS + 1]
