@@ -69,3 +69,16 @@ def test_naive_timestamp_is_treated_as_host_local() -> None:
     now = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
     naive = now.replace(tzinfo=None) - timedelta(seconds=1)
     assert isinstance(is_too_old(naive, now, budget), bool)
+
+
+def test_a_naive_timestamp_is_read_as_host_local_not_as_utc():
+    """`astimezone()`, matching `StimulusLog._aware` and `replication_events._utc_span`.
+
+    Stamping UTC on a naive value instead is a different claim, and west of Greenwich a
+    wrong one: it makes an event look hours older than it is. Against a six-hour budget
+    that abandons batches with hours of life left, so this is data loss, not a style point.
+    """
+    now = datetime(2026, 9, 7, 16, 0, tzinfo=timezone.utc)
+    three_hours_old = (now - timedelta(hours=3)).astimezone().replace(tzinfo=None)
+
+    assert is_too_old(three_hours_old, now, RetryBudget()) is False

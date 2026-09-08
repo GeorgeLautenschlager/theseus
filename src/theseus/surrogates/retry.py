@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Callable
 
 
@@ -32,8 +32,8 @@ def backoff_delay(
 ) -> float:
     """Seconds to wait before `attempt`, jittered, never above the ceiling."""
     raw = budget.base_seconds * budget.multiplier ** (attempt - 1)
-    # ponytail: clamp after jittering, not before — a delay already at the ceiling
-    # must not come out 25% above it.
+    # Clamp after jittering, not before: a delay already at the ceiling must not come
+    # out 25% above it.
     jittered = raw * (1 + budget.jitter * (2 * random_fn() - 1))
     return max(0.0, min(budget.ceiling_seconds, jittered))
 
@@ -42,11 +42,16 @@ def is_too_old(oldest_event_ts: datetime, now: datetime, budget: RetryBudget) ->
     """Whether a batch's oldest event has aged past the budget.
 
     Exactly at the boundary is not too old, matching the other limits in this
-    protocol. A naive `oldest_event_ts` is treated as host-local UTC, the way
-    `StimulusEvent.to_json` and `replication_events._utc_span` already treat
-    naive timestamps — comparing naive against aware raises a `TypeError`
-    naming neither value, and a surrogate must not die of that.
+    protocol.
+
+    A naive `oldest_event_ts` is read as **host-local**, via `astimezone()` — the same
+    reading `StimulusLog._aware` and `replication_events._utc_span` already give one.
+    Stamping UTC on it instead would be a different claim, and a wrong one: west of
+    Greenwich it makes an event look hours *older* than it is, which against a six-hour
+    budget abandons batches that had hours of life left. Comparing naive against aware
+    raises a `TypeError` naming neither value, and a surrogate must not die of that
+    either.
     """
     if oldest_event_ts.tzinfo is None:
-        oldest_event_ts = oldest_event_ts.replace(tzinfo=timezone.utc)
+        oldest_event_ts = oldest_event_ts.astimezone()
     return (now - oldest_event_ts) > budget.max_age
