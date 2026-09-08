@@ -8,16 +8,21 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Callable
 
 from theseus.replication_batch import (
     DEFAULT_MAX_BATCH_BYTES,
     DEFAULT_MAX_BATCH_EVENTS,
 )
+from theseus.replication_events import BATCH_REJECTED, batch_rejected
 from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.surrogates.clock import Clock, SystemClock
 from theseus.surrogates.cursor import AckedCursor
+from theseus.surrogates.retry import RetryBudget, backoff_delay
 from theseus.surrogates.transport import StimulusTransport
 
 logger = logging.getLogger(__name__)
@@ -67,15 +72,18 @@ class DrainResult:
     stopped_on: int | None     # the non-2xx status that ended it, or None if it drained fully
     skipped_unsequenced: int = 0  # own-origin lines with no seq (pre-envelope): unreplicable by design
     skipped_duplicate: int = 0    # repeat seqs dropped so the host's strict-ascending check cannot 400
+    rejected_batches: int = 0     # 4xx: stepped over, batch_rejected recorded
+    unreachable: bool = False     # the drain stopped because nothing answered
 
 
 class Replicator:
     """Drains a surrogate's backlog to its host, one batch at a time, in seq order.
 
-    The lock is not a courtesy — it is the protocol. Two interleaved drains would put two
-    requests in flight and reorder the stream; #30 shipped a deadlock for exactly this rule
-    living in a docstring instead of code. Transport failures propagate: deciding what they
-    mean (retry, backoff, abandonment) is #32's job, not this loop's.
+    Transport failures are not all the same failure. A status is the host speaking: `2xx`
+    acks, `4xx` is a permanent rejection (stepped over, marked `batch_rejected`), `5xx` is
+    transient (retried with backoff on the injected clock). A raise is the link being down:
+    the drain stops cleanly, abandons nothing, and spends no budget — the next drain retries
+    the same range.
     """
 
     def __init__(
@@ -86,12 +94,18 @@ class Replicator:
         *,
         max_events: int = DEFAULT_MAX_BATCH_EVENTS,
         max_bytes: int = DEFAULT_MAX_BATCH_BYTES,
+        budget: RetryBudget = RetryBudget(),
+        clock: Clock = SystemClock(),
+        random_fn: Callable[[], float] = random.random,
     ) -> None:
         self._log = log
         self._transport = transport
         self._cursor = cursor
         self._max_events = max_events
         self._max_bytes = max_bytes
+        self._budget = budget
+        self._clock = clock
+        self._random_fn = random_fn
         self._lock = threading.Lock()
 
     def drain(self) -> DrainResult:
@@ -142,19 +156,60 @@ class Replicator:
             attempted_batches = 0
             attempted_events = 0
             stopped_on: int | None = None
+            rejected_batches = 0
+            unreachable = False
             for batch in batches:
                 # The wire body is exactly what the host's `parse_batch` measures: each
                 # event's line plus its newline.
                 body = "".join(e.to_json() + "\n" for e in batch)
-                result = self._transport.send(body)
                 attempted_batches += 1
                 attempted_events += len(batch)
-                if not 200 <= result.status < 300:
-                    stopped_on = result.status
+                for attempt in range(1, self._budget.max_attempts + 1):
+                    try:
+                        result = self._transport.send(body)
+                    except Exception:
+                        # Nothing answered: the link is down, not the batch bad. Stop the
+                        # drain — abandon nothing, spend no budget — and retry next drain.
+                        unreachable = True
+                        stopped_on = None
+                        break
+                    if 200 <= result.status < 300:
+                        # Advance only after the ack, never before: behind is recoverable (the host
+                        # dedupes the re-send), ahead is not.
+                        self._cursor.advance(batch[-1].seq)
+                        break
+                    if 400 <= result.status < 500:
+                        # Permanent: retrying is how one poison batch wedges a channel. Record
+                        # the hole on our own log and step over it.
+                        self._log.append(
+                            "replicator",
+                            BATCH_REJECTED,
+                            batch_rejected(
+                                origin=self._log.origin,
+                                from_seq=batch[0].seq,
+                                to_seq=batch[-1].seq,
+                                status=result.status,
+                                # The constructor demands a non-empty reason; a host that
+                                # sends none still gets a truthful one.
+                                reason=result.reason or f"host returned {result.status} with no reason",
+                            ),
+                        )
+                        rejected_batches += 1
+                        # Advance past it too: a 4xx will never succeed, so leaving the
+                        # cursor behind would re-send a poison batch every drain.
+                        self._cursor.advance(batch[-1].seq)
+                        break
+                    if not 500 <= result.status < 600 or attempt == self._budget.max_attempts:
+                        # A 3xx is neither permanent rejection nor transient failure — guessing
+                        # is worse than stopping. 5xx exhaustion stops too; abandoning with a
+                        # `retry_exhausted` gap is Task 4.
+                        stopped_on = result.status
+                        break
+                    self._clock.sleep(
+                        backoff_delay(attempt, self._budget, random_fn=self._random_fn)
+                    )
+                if unreachable or stopped_on is not None:
                     break
-                # Advance only after the ack, never before: behind is recoverable (the host
-                # dedupes the re-send), ahead is not.
-                self._cursor.advance(batch[-1].seq)
 
             return DrainResult(
                 batches_attempted=attempted_batches,
@@ -163,4 +218,6 @@ class Replicator:
                 stopped_on=stopped_on,
                 skipped_unsequenced=skipped_unsequenced,
                 skipped_duplicate=skipped_duplicate,
+                rejected_batches=rejected_batches,
+                unreachable=unreachable,
             )

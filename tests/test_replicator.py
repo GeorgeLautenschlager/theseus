@@ -12,12 +12,13 @@ import logging
 import queue
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from fastapi.responses import JSONResponse
 
+from theseus.replication_events import BATCH_REJECTED
 from theseus.surrogates.clock import SystemClock
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
@@ -51,16 +52,18 @@ class ScriptedTransport:
     """First fake: plays a script of statuses or exceptions, records every body it was given."""
 
     def __init__(self, script: list[int | BaseException] | None = None) -> None:
-        self._script = list(script or [])
+        self.script = list(script or [])
         self.bodies: list[str] = []
         self.calls = 0
 
     def send(self, body: str) -> TransportResult:
         self.calls += 1
         self.bodies.append(body)
-        outcome = self._script.pop(0) if self._script else 200
+        outcome = self.script.pop(0) if self.script else 200
         if isinstance(outcome, BaseException):
             raise outcome
+        if isinstance(outcome, TransportResult):
+            return outcome
         return TransportResult(status=outcome)
 
 
@@ -119,30 +122,31 @@ def test_cursor_advances_only_on_2xx(tmp_path):
     log = make_log(tmp_path)
     append_n(log, 12)
     cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
-    transport = ScriptedTransport([200, 500])
+    transport = ScriptedTransport([200, 302])
     rep = Replicator(log, transport, cursor, max_events=5, max_bytes=1_000_000)
 
     result = rep.drain()
 
-    # Batches are 5+5+2; the 500 on the second must not move the cursor past the first.
+    # Batches are 5+5+2; the 302 on the second must not move the cursor past the first.
+    # A 5xx would retry now (#32), so the non-ack here is a 3xx.
     assert transport.calls == 2
     assert cursor.acked_seq == 5
     assert result.acked_seq == 5
-    assert result.stopped_on == 500
+    assert result.stopped_on == 302
 
 
 def test_non_2xx_stops_the_drain_immediately(tmp_path):
     log = make_log(tmp_path)
     append_n(log, 12)
     cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
-    transport = ScriptedTransport([200, 500])
+    transport = ScriptedTransport([200, 302])
     rep = Replicator(log, transport, cursor, max_events=4, max_bytes=1_000_000)
 
     result = rep.drain()
 
-    # Three batches pending (4+4+4); the failed second is never followed by a third send.
+    # Three batches pending (4+4+4); the non-2xx second is never followed by a third send.
     assert transport.calls == 2
-    assert result.stopped_on == 500
+    assert result.stopped_on == 302
 
 
 def test_never_more_than_one_request_in_flight(tmp_path):
@@ -239,17 +243,19 @@ def test_interrupted_drain_keeps_the_batches_it_did_ack(tmp_path):
     transport = ScriptedTransport([200, ConnectionError("network down")])
     rep = Replicator(log, transport, cursor, max_events=4, max_bytes=1_000_000)
 
-    with pytest.raises(ConnectionError):
-        rep.drain()
+    result = rep.drain()
 
-    # Batches are 4+4+2: the acked first batch survives, the rest is still owed.
+    # Batches are 4+4+2: the acked first batch survives, the rest is still owed. The raise
+    # no longer propagates (#32): an unreachable host stops the drain cleanly.
+    assert result.unreachable is True
+    assert result.stopped_on is None
     assert cursor.acked_seq == 4
     assert AckedCursor(cursor_path, origin=ORIGIN).acked_seq == 4
 
 
-def test_a_batch_the_host_will_always_reject_stalls_the_drain(tmp_path):
-    # Known stall #32 must close: a single event whose line exceeds max_bytes becomes a lone
-    # batch the host will always 413. With no abandon rule yet, stopping is the honest end.
+def test_a_batch_the_host_will_always_reject_is_stepped_over(tmp_path):
+    # The stall #32 closed: a single event whose line exceeds max_bytes becomes a lone batch
+    # the host will always 413 — a 4xx is permanent, so it is rejected and stepped over.
     log = make_log(tmp_path)
     log.append("tester", "test.event", {"blob": "x" * 500})
     cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
@@ -259,8 +265,9 @@ def test_a_batch_the_host_will_always_reject_stalls_the_drain(tmp_path):
     result = rep.drain()
 
     assert transport.calls == 1
-    assert result.stopped_on == 413
-    assert cursor.acked_seq is None
+    assert result.stopped_on is None
+    assert result.rejected_batches == 1
+    assert cursor.acked_seq == 1
 
 
 def test_a_second_fake_transport_drives_the_same_replicator(tmp_path):
@@ -515,3 +522,165 @@ def test_transport_bounds_an_over_long_reason():
     result = transport.send("{}")
     assert result.status == 400
     assert len(result.reason) == MAX_REASON_CHARS
+
+
+class FakeClock:
+    """Records sleeps and advances `now` by them: backoff without real time passing."""
+
+    def __init__(self) -> None:
+        self.sleeps: list[float] = []
+        self._now = datetime.now(tz=timezone.utc)
+
+    def now(self) -> datetime:
+        return self._now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self._now += timedelta(seconds=seconds)
+
+
+def test_a_5xx_then_a_2xx_retries_the_same_range(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 3)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([500, 200])
+    rep = Replicator(log, transport, cursor)
+
+    result = rep.drain()
+
+    assert transport.calls == 2
+    assert transport.bodies[0] == transport.bodies[1]
+    # Each delivery carries the full range; no event is duplicated within one delivery.
+    assert seqs_in(transport.bodies) == [1, 2, 3, 1, 2, 3]
+    assert cursor.acked_seq == 3
+    assert result.stopped_on is None
+
+
+def test_retry_sleeps_on_the_injected_clock(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([500] * 4 + [200])
+    clock = FakeClock()
+    # random 0.5 zeroes the jitter, so delays are the bare 2/6/18/54 ladder.
+    rep = Replicator(log, transport, cursor, clock=clock, random_fn=lambda: 0.5)
+
+    result = rep.drain()
+
+    assert clock.sleeps == [2.0, 6.0, 18.0, 54.0]
+    assert transport.calls == 5
+    assert result.stopped_on is None
+
+
+def test_a_4xx_is_never_retried(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([422])
+    rep = Replicator(log, transport, cursor)
+
+    rep.drain()
+
+    assert transport.calls == 1
+
+
+def test_a_4xx_records_a_batch_rejected_on_the_surrogates_own_log(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([TransportResult(status=413, reason="too big")])
+    rep = Replicator(log, transport, cursor)
+
+    rep.drain()
+
+    markers = [e for e in log.read_all() if e.type == BATCH_REJECTED]
+    assert len(markers) == 1
+    event = markers[0]
+    assert event.origin == log.origin
+    assert event.seq is not None
+    assert event.content == {
+        "origin": ORIGIN,
+        "from_seq": 1,
+        "to_seq": 2,
+        "status": 413,
+        "reason": "too big",
+    }
+
+
+def test_a_4xx_steps_over_and_keeps_draining(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 6)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([200, 409, 200])
+    rep = Replicator(log, transport, cursor, max_events=2, max_bytes=1_000_000)
+
+    result = rep.drain()
+
+    assert transport.calls == 3
+    assert seqs_in(transport.bodies) == [1, 2, 3, 4, 5, 6]
+    assert cursor.acked_seq == 6
+    assert result.rejected_batches == 1
+    assert result.stopped_on is None
+
+
+def test_an_unreachable_host_stops_the_drain_and_abandons_nothing(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([ConnectionError("link down")])
+    rep = Replicator(log, transport, cursor)
+
+    result = rep.drain()
+
+    assert result.unreachable is True
+    assert cursor.acked_seq is None
+    assert not [e for e in log.read_all() if e.type == BATCH_REJECTED]
+
+    # The next drain re-sends the same range: nothing was abandoned or acked.
+    transport.script = [200]
+    rep.drain()
+    assert seqs_in(transport.bodies) == [1, 2, 1, 2]
+
+
+def test_an_unreachable_host_spends_no_attempts(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([ConnectionError("down")] * 50)
+    rep = Replicator(log, transport, cursor)
+
+    rep.drain()
+
+    # One call, not max_attempts: only a host that answered can cost budget.
+    assert transport.calls == 1
+
+
+def test_a_3xx_stops_without_retrying_or_abandoning(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([302])
+    rep = Replicator(log, transport, cursor)
+
+    result = rep.drain()
+
+    assert transport.calls == 1
+    assert result.stopped_on == 302
+    assert cursor.acked_seq is None
+    assert not [e for e in log.read_all() if e.type == BATCH_REJECTED]
+
+
+def test_retry_exhaustion_stops_the_drain_for_now(tmp_path):
+    # Task 4 adds abandonment; for this task, exhausting attempts stops like any non-2xx.
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([500] * 5)
+    clock = FakeClock()
+    rep = Replicator(log, transport, cursor, clock=clock, random_fn=lambda: 0.5)
+
+    result = rep.drain()
+
+    assert transport.calls == 5
+    assert result.stopped_on == 500
+    assert cursor.acked_seq is None

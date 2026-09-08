@@ -127,15 +127,18 @@ def test_a_declared_gap_survives_the_round_trip(tmp_path):
 
 def test_an_oversized_batch_is_refused_end_to_end(tmp_path):
     """The surrogate's limits are its own view, not the host's. A batch that fits the
-    surrogate but not the host is refused, and the cursor does not advance on a 4xx."""
+    surrogate but not the host is refused: a 4xx is permanent, so it is recorded and
+    stepped over (#32) — the marker, not the oversized event, reaches the host."""
     rig = _rig(tmp_path, host_max_bytes=300)
     rig.surrogate.append("sensor", "test.blob", {"blob": "x" * 500}, ts=BASE + timedelta(seconds=1))
 
     cursor, result = _drain(rig, tmp_path, max_bytes=4096)
 
-    assert result.stopped_on == 413
-    assert cursor.acked_seq is None
-    assert [e for e in rig.host_log.read_all() if e.origin == SURROGATE] == []
+    assert result.stopped_on is None
+    assert result.rejected_batches == 1
+    assert cursor.acked_seq == 1
+    host_events = [e for e in rig.host_log.read_all() if e.origin == SURROGATE]
+    assert [e.type for e in host_events] == []  # the oversized event itself was never delivered
 
 
 def test_the_transport_does_not_follow_redirects():
