@@ -224,7 +224,8 @@ class Replicator:
                                 status=result.status,
                                 # The constructor demands a non-empty reason; a host that
                                 # sends none still gets a truthful one.
-                                reason=result.reason or f"host returned {result.status} with no reason",
+                                reason=result.reason.strip()
+                                or f"host returned {result.status} with no reason",
                             ),
                         )
                         rejected_batches += 1
@@ -242,8 +243,13 @@ class Replicator:
                         # move on — one undeliverable batch must not hold the channel.
                         abandon(batch)
                         break
+                    # `attempt + 1`: `attempt` is the try that just failed, and
+                    # `backoff_delay(n)` is the wait *before* try n. Passing `attempt` here
+                    # sleeps 2, 6, 18, 54 = 80s across five tries and never reaches the
+                    # 120s ceiling at all — 40% of the window #39 decided on for a link
+                    # that may be cellular.
                     self._clock.sleep(
-                        backoff_delay(attempt, self._budget, random_fn=self._random_fn)
+                        backoff_delay(attempt + 1, self._budget, random_fn=self._random_fn)
                     )
                 if unreachable or stopped_on is not None:
                     break

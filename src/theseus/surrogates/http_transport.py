@@ -69,4 +69,8 @@ class HttpTransport:
             return ""
         if not isinstance(reason, str):
             return ""
-        return reason[:MAX_REASON_CHARS]
+        # Stripped before it is bounded: a host answering `{"reason": " "}` is answering
+        # with nothing, and " " is truthy — it would sail past every `or`-fallback
+        # downstream and reach a constructor that rejects a blank reason. Sliced one over
+        # the limit so `_clean_reason` can still tell it was cut and say so on the tape.
+        return reason.strip()[: MAX_REASON_CHARS + 1]

@@ -524,7 +524,9 @@ def test_transport_bounds_an_over_long_reason():
     transport = HttpTransport("http://testserver/replicate", client=TestClient(app))
     result = transport.send("{}")
     assert result.status == 400
-    assert len(result.reason) == MAX_REASON_CHARS
+    # One over the limit, deliberately: `_clean_reason` marks a reason it had to cut,
+    # and slicing to exactly the limit here would hide from it that anything was cut.
+    assert len(result.reason) == MAX_REASON_CHARS + 1
 
 
 class FakeClock:
@@ -570,7 +572,10 @@ def test_retry_sleeps_on_the_injected_clock(tmp_path):
 
     result = rep.drain()
 
-    assert clock.sleeps == [2.0, 6.0, 18.0, 54.0]
+    # The four waits between five attempts, per #39: 6 + 18 + 54 + 120 = 198s, and the
+    # 120s ceiling actually fires on the last one.
+    assert clock.sleeps == [6.0, 18.0, 54.0, 120.0]
+    assert sum(clock.sleeps) == 198.0
     assert transport.calls == 5
     assert result.stopped_on is None
 
@@ -768,7 +773,9 @@ def test_a_batch_that_ages_out_mid_retry_is_abandoned(tmp_path):
     log.append("tester", "test.event", {"n": 1}, ts=borderline)
     append_n(log, 2, start=2)
     cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
-    transport = ScriptedTransport([500, 500, 200])
+    # One 500 for the batch that ages out, then a clean 200 for the next one — so the
+    # only retry in this test is the one under examination.
+    transport = ScriptedTransport([500, 200])
     rep = Replicator(
         log,
         transport,
@@ -781,10 +788,10 @@ def test_a_batch_that_ages_out_mid_retry_is_abandoned(tmp_path):
 
     result = rep.drain()
 
-    # Two attempts (ages 5s and 7s), then the 6s backoff makes it 13s: too old to retry.
-    assert clock.sleeps == [2.0, 6.0]
-    assert transport.calls == 3
-    assert seqs_in(transport.bodies) == [1, 2, 1, 2, 3, 4]
+    # One attempt at age 5s, then the 6s backoff puts it at 11s: too old to retry.
+    assert clock.sleeps == [6.0]
+    assert transport.calls == 2
+    assert seqs_in(transport.bodies) == [1, 2, 3, 4]
     assert len(gaps_in(log)) == 1
     assert cursor.acked_seq == 4
     assert result.abandoned_batches == 1
@@ -859,3 +866,57 @@ def test_age_uses_the_batchs_oldest_ts_not_its_first(tmp_path):
     assert result.abandoned_batches == 1
     gaps = [e.content for e in log.read_all() if e.type == GAP]
     assert gaps and gaps[0]["reason"] == "retry_exhausted"
+
+
+def test_abandoning_the_last_batch_still_advances_the_cursor(tmp_path):
+    """The advance inside `abandon()` is the whole point of abandoning.
+
+    Every other abandon test has a later batch that acks past the abandoned range, and
+    `AckedCursor` never moves backwards — so the cursor lands on the right number whether
+    or not `abandon()` advanced it. Deleting that advance passed the entire suite. What it
+    restores is the pre-#32 stall: the batch is re-sent and re-abandoned every drain, and
+    the tape grows a marker each time.
+    """
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([500] * 50)
+    rep = Replicator(
+        log, transport, cursor, max_events=2, clock=FakeClock(), random_fn=lambda: 0.5
+    )
+
+    first = rep.drain()
+
+    assert first.abandoned_batches == 1
+    assert cursor.acked_seq == 2, "abandoning must step the cursor past the batch"
+    sent_first = len(transport.bodies)
+    assert len(gaps_in(log)) == 1
+
+    # The abandoned range is behind the cursor now, so a second drain never re-sends seq
+    # 1 or 2. It does send the gap marker itself (seq 3) — that marker is an ordinary
+    # event on the surrogate's own tape and replicates like any other.
+    rep.drain()
+
+    resent = seqs_in(transport.bodies[sent_first:])
+    assert 1 not in resent and 2 not in resent, "the abandoned batch was re-sent"
+    assert len([g for g in gaps_in(log) if (g["from_seq"], g["to_seq"]) == (1, 2)]) == 1
+
+
+def test_a_blank_reason_from_the_host_does_not_crash_the_drain(tmp_path):
+    """`" "` is truthy, so it sails past an `or`-fallback and reaches a constructor that
+    rejects a blank reason. The marker build sits outside the transport's try, so the
+    ValueError escaped `drain()` entirely and the cursor never moved — every later drain
+    then crashed on the same batch. That is the head-of-line wedge this issue closes,
+    reachable from a remote party's response body.
+    """
+    log = make_log(tmp_path)
+    append_n(log, 1)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([TransportResult(status=400, reason="   ")])
+
+    result = Replicator(log, transport, cursor, clock=FakeClock()).drain()
+
+    assert result.rejected_batches == 1
+    assert cursor.acked_seq == 1
+    marker = [e.content for e in log.read_all() if e.type == BATCH_REJECTED][0]
+    assert marker["reason"].strip(), "a blank reason must fall back to a truthful one"
