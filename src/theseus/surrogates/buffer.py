@@ -96,8 +96,6 @@ class BufferedStimulusLog(StimulusLog):
     def _evict_if_needed(self) -> StimulusEvent | None:
         """Evict oldest-first if the file is over budget. Returns the gap marker, if one
         was emitted (Task 3); `None` when nothing was evicted."""
-        # Bare stat first: the common case is a buffer within budget, and it must not
-        # pay for a full read to learn that.
         marker = self._evict_locked()
         if marker is not None:
             # Outside the lock, after the replace is durable — the same ordering
@@ -108,6 +106,8 @@ class BufferedStimulusLog(StimulusLog):
 
     def _evict_locked(self) -> StimulusEvent | None:
         """Body of `_evict_if_needed`; takes `_append_lock` for the whole rewrite."""
+        # Bare stat first: the common case is a buffer within budget, and it must not
+        # pay for a full read to learn that.
         if self.path.stat().st_size <= self._policy.max_bytes:
             return None
         with self._append_lock:
@@ -149,17 +149,16 @@ class BufferedStimulusLog(StimulusLog):
                 survivors = events[keep_from:]
                 marker = None
             else:
-                # Two-pass keep computation: the marker rides in the same rewrite, so
-                # its bytes come out of the same low-water budget. Pass one finds the
-                # eviction extent; the marker line for that extent gives the exact
-                # budget for pass two. Pass two only ever evicts *fewer* events, and
-                # if that shrinks the described set away, we fall back to pass one's
-                # larger eviction so nothing is dropped unmarked — the two-pass result
-                # is only taken when it can still be declared.
-                keep1 = keep_from
-                described1 = described
-                bounds = (min(e.seq for e in described1), max(e.seq for e in described1))
-                span = (min(e.ts for e in described1), max(e.ts for e in described1))
+                # Two-pass keep computation: the marker rides in the same rewrite,
+                # so its own bytes come out of the same low-water budget. Evicting to
+                # exactly `floor` and then adding the marker puts the file back over it.
+                # Pass one finds the eviction extent, which is what the marker's range
+                # needs to be minted; the length of that marker's line is then the
+                # budget pass two works against. A lower floor evicts *more*, so pass
+                # two's described set can only grow — the `if described2` guard below
+                # is belt and braces for the case where it somehow does not.
+                bounds = (min(e.seq for e in described), max(e.seq for e in described))
+                span = (min(e.ts for e in described), max(e.ts for e in described))
                 # Mint the marker the way `append` would: seq under the recovered
                 # counter, id from the appended timestamp. The seq is peeked, not
                 # consumed, until we know a rewrite will actually happen.
