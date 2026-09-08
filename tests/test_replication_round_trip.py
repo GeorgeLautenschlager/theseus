@@ -490,5 +490,19 @@ def test_eviction_under_an_active_drain_is_safe(tmp_path):
     # Ship whatever the in-flight drain's snapshot missed, then inspect the tape.
     _drain(rig, tmp_path, cursor_name="second.json", max_events=1)
 
-    host_seqs = [e.seq for e in _host_events(rig) if e.type != GAP]
-    assert host_seqs == sorted(set(host_seqs)), "duplicate or out of order on the host"
+    host = _host_events(rig)
+    survivors = [e.seq for e in host if e.type != GAP]
+    pressure_gaps = [
+        e for e in host
+        if e.type == GAP and e.content["declared"] and e.content["reason"] == "storage_pressure"
+    ]
+    # The 8 pre-drain ticks alone push a 1600 B cap over budget, so a run with no
+    # storage_pressure marker on the host means eviction never happened and the test
+    # would pass vacuously.
+    assert pressure_gaps, "the scenario never evicted — nothing was tested"
+    assert survivors == sorted(set(survivors)), "duplicate or descending seq on the host"
+    for gap in pressure_gaps:
+        assert gap.content["from_seq"] <= gap.content["to_seq"]
+        # The declared range sits strictly below the surviving seqs the host also got:
+        # only true when eviction happened AND the drain coped with the hole.
+        assert gap.content["to_seq"] < survivors[-1]

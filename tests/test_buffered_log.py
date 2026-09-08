@@ -64,9 +64,10 @@ def _replicated(n: int, origin: str = "host", size: int = 0) -> StimulusEvent:
 def test_under_budget_never_rewrites(tmp_path: Path):
     path = tmp_path / "log.jsonl"
     log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=100_000))
+    inode = path.stat().st_ino  # captured before: comparing to a later stat of the same path is the only way a rewrite can show
     appended = [log.append("env", "observation", _event(i)) for i in range(10)]
     assert [e.seq for e in log.read_all()] == [e.seq for e in appended]
-    assert path.stat().st_ino == log.path.stat().st_ino  # same file — never rewritten
+    assert path.stat().st_ino == inode  # never rewritten
 
 
 def test_crossing_threshold_evicts_oldest_first(tmp_path: Path):
@@ -227,26 +228,21 @@ def _gap_markers(events: list[StimulusEvent]) -> list[StimulusEvent]:
 
 
 
-def _newest_marker_seq(log: BufferedStimulusLog) -> int | None:
-    markers = _gap_markers(log.read_all())
-    return markers[-1].seq if markers else None
-
-
 def _drive_one_eviction(log: BufferedStimulusLog, start: int) -> list[StimulusEvent]:
     """Append small events until exactly one eviction (one new gap marker) has
-    landed, returning the events appended since the call began. Detects the
-    eviction by the newest marker's seq, which strictly ascends — markers are
-    themselves evictable events, so their count on file can stay flat while
-    evictions keep happening. Robust to being called on a log that already holds
-    markers."""
+    landed, returning the events appended since the call began. Detects the eviction
+    via a marker listener rather than re-reading the file each iteration — a scan of
+    the whole growing file per append made the ceiling unreachable in any real time.
+    Robust to being called on a log that already holds markers."""
+    heard: list[StimulusEvent] = []
+    log.subscribe(lambda e: e.type == GAP and heard.append(e))
     appended: list[StimulusEvent] = []
-    seen = _newest_marker_seq(log)
     i = start
-    while _newest_marker_seq(log) == seen:
+    while not heard:
         appended.append(log.append("env", "observation", _event(i)))
         i += 1
-        # ponytail: this exists — ceiling is 10000 appends; a mutation that kills marker emission must fail here, not hang.
-        if len(appended) > 10000:
+        # ceiling is 2000 appends (~240 KB here); a mutation that kills marker emission must fail here, not hang.
+        if len(appended) > 2000:
             raise AssertionError(f"no new gap marker after {len(appended)} appends")
     return appended
 
