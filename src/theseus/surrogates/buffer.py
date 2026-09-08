@@ -98,6 +98,16 @@ class BufferedStimulusLog(StimulusLog):
         was emitted (Task 3); `None` when nothing was evicted."""
         # Bare stat first: the common case is a buffer within budget, and it must not
         # pay for a full read to learn that.
+        marker = self._evict_locked()
+        if marker is not None:
+            # Outside the lock, after the replace is durable — the same ordering
+            # `append` uses: a listener is free to append, and holding the lock
+            # across a callback would deadlock it.
+            self._notify(marker)
+        return marker
+
+    def _evict_locked(self) -> StimulusEvent | None:
+        """Body of `_evict_if_needed`; takes `_append_lock` for the whole rewrite."""
         if self.path.stat().st_size <= self._policy.max_bytes:
             return None
         with self._append_lock:
@@ -195,11 +205,6 @@ class BufferedStimulusLog(StimulusLog):
                 except OSError:
                     pass
                 raise
-            if marker is not None:
-                # Outside the lock, after the replace is durable — the same ordering
-                # `append` uses: a listener is free to append, and holding the lock
-                # across a callback would deadlock it.
-                self._notify(marker)
             return marker
 
     def _mint_gap(

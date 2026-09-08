@@ -226,14 +226,22 @@ def _gap_markers(events: list[StimulusEvent]) -> list[StimulusEvent]:
 
 
 
+def _newest_marker_seq(log: BufferedStimulusLog) -> int | None:
+    markers = _gap_markers(log.read_all())
+    return markers[-1].seq if markers else None
+
+
 def _drive_one_eviction(log: BufferedStimulusLog, start: int) -> list[StimulusEvent]:
-    """Append small events until exactly one eviction (one gap marker) has landed,
-    returning the events appended since the log was empty of markers. Keeps the
-    scenario deterministic: eviction count depends on marker size, so a fixed
-    append count would race the threshold."""
+    """Append small events until exactly one eviction (one new gap marker) has
+    landed, returning the events appended since the call began. Detects the
+    eviction by the newest marker's seq, which strictly ascends — markers are
+    themselves evictable events, so their count on file can stay flat while
+    evictions keep happening. Robust to being called on a log that already holds
+    markers."""
     appended: list[StimulusEvent] = []
+    seen = _newest_marker_seq(log)
     i = start
-    while not _gap_markers(log.read_all()):
+    while _newest_marker_seq(log) == seen:
         appended.append(log.append("env", "observation", _event(i)))
         i += 1
     return appended
@@ -348,33 +356,58 @@ def test_unsequenced_events_evicted_but_not_described(tmp_path: Path):
 def test_listener_hears_the_marker(tmp_path: Path):
     path = tmp_path / "log.jsonl"
     log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
-    for i in range(6):
-        log.append("env", "observation", _event(i))
     heard: list[StimulusEvent] = []
     log.subscribe(heard.append)
-    _drive_one_eviction(log, 0)
+    # Subscribed before any append: the eviction must not be able to land before the
+    # listener exists, or the test watches a window in which the behaviour cannot fire.
+    appended = _drive_one_eviction(log, 0)
     gaps = [e for e in heard if e.type == GAP]
     assert len(gaps) == 1
     assert any(e.type != GAP for e in heard)  # survivors also notified
     assert gaps[0] in log.read_all()  # durable by the time it was announced
 
 
+def test_listener_that_appends_does_not_deadlock(tmp_path: Path):
+    # The house pattern: a listener that appends on seeing an event. Holding
+    # `_append_lock` across the callback would self-deadlock the same thread on
+    # the plain Lock; run the drive on a worker thread so a regression fails
+    # with a join timeout instead of hanging the suite.
+    path = tmp_path / "log.jsonl"
+    log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
+    acked = threading.Event()
+
+    def react(event: StimulusEvent) -> None:
+        if event.type == GAP:
+            log.append("env", "observation", _event(10 ** 6))
+            acked.set()
+
+    log.subscribe(react)
+    worker = threading.Thread(target=_drive_one_eviction, args=(log, 0))
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "listener append deadlocked the eviction"
+    assert acked.is_set()
+    assert any(e.content.get("n") == 10 ** 6 for e in log.read_all())  # the listener's append landed
+
+
 def test_successive_evictions_declare_successive_ranges(tmp_path: Path):
     path = tmp_path / "log.jsonl"
     log = BufferedStimulusLog(path, policy=BufferPolicy(max_bytes=1000, low_water=0.5))
     next_i = 0
+    seen_seq: int | None = None
     ranges: list[tuple[int, int]] = []
     while len(ranges) < 2:
-        before = len(_gap_markers(log.read_all()))
-        appended = []
-        i = next_i
-        while len(_gap_markers(log.read_all())) == before:
-            appended.append(log.append("env", "observation", _event(i)))
-            i += 1
-        next_i = i
-        kept = {e.seq for e in log.read_all() if e.type != GAP}
-        evicted = [e.seq for e in appended if e.seq not in kept]
+        # An eviction can take events that were already on file before this round's
+        # appends, so the evicted set is everything seen before minus the survivors.
+        before = {e.seq for e in log.read_all() if e.type != GAP}
+        appended = _drive_one_eviction(log, next_i)
+        next_i += len(appended)
         marker = _gap_markers(log.read_all())[-1]
+        assert marker.seq != seen_seq  # a genuinely new eviction, not the old marker
+        seen_seq = marker.seq
+        kept = {e.seq for e in log.read_all() if e.type != GAP}
+        evicted = before | {e.seq for e in appended}
+        evicted -= kept
         assert marker.content["from_seq"] == min(evicted)
         assert marker.content["to_seq"] == max(evicted)
         ranges.append((marker.content["from_seq"], marker.content["to_seq"]))
