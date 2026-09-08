@@ -37,8 +37,6 @@ def test_legal_boundary_values_accepted(value):
     assert BufferPolicy(low_water=value).low_water == value
 
 
-
-
 def test_policy_is_frozen():
     policy = BufferPolicy()
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -86,7 +84,6 @@ def test_crossing_threshold_evicts_oldest_first(tmp_path: Path):
 
 def test_eviction_lands_under_low_water_not_just_cap(tmp_path: Path):
     path = tmp_path / "log.jsonl"
-    policy = BufferPolicy(max_bytes=1000, low_water=0.5)
     policy = BufferPolicy(max_bytes=4000, low_water=0.5)
     log = BufferedStimulusLog(path, policy=policy)
     sizes = []
