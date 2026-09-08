@@ -42,8 +42,9 @@ def chunk_events(
     host rejects at exactly the boundary.
 
     An event whose own line exceeds `max_bytes` becomes a lone batch: it cannot be
-    dropped or merged, and with no abandon rule yet (#32) the replicator will stall on
-    it — the honest behaviour for this issue, named here so #32 has something to change.
+    dropped or merged. The host answers such a batch with a `413`, which is a `4xx` and
+    therefore permanent, so the drain records a `replication.batch_rejected` and steps
+    over it rather than stalling.
     """
     batches: list[list[StimulusEvent]] = []
     current: list[StimulusEvent] = []
@@ -190,8 +191,7 @@ class Replicator:
                 # drifts, so `batch[0].ts` would flatter the age and over-retry.
                 oldest_ts = min(e.ts for e in batch)
                 body = "".join(e.to_json() + "\n" for e in batch)
-                attempted_batches += 1
-                attempted_events += len(batch)
+                sent_this_batch = False
                 for attempt in range(1, self._budget.max_attempts + 1):
                     # Checked before the first attempt and before every retry: a batch that
                     # ages out mid-backoff is abandoned, not retried into staleness.
@@ -199,6 +199,14 @@ class Replicator:
                         abandon(batch)
                         break
                     try:
+                        if not sent_this_batch:
+                            # Counted on the first real send, not before the loop: a batch
+                            # abandoned by age is never handed to the transport, and calling
+                            # that "attempted" would make the field disagree with its own
+                            # comment and with `transport.calls`.
+                            attempted_batches += 1
+                            attempted_events += len(batch)
+                            sent_this_batch = True
                         result = self._transport.send(body)
                     except Exception:
                         # Nothing answered: the link is down, not the batch bad. Stop the

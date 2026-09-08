@@ -23,6 +23,40 @@ class RetryBudget:
     ceiling_seconds: float = 120.0
     max_age: timedelta = timedelta(hours=6)
 
+    def __post_init__(self) -> None:
+        """Reject a budget that would silently do nothing.
+
+        `max_attempts=0` is the dangerous one: the drain's retry loop is a `range` over it,
+        so a zero body never executes — no send, no abandon, no cursor advance, no
+        `stopped_on`. The drain reports a clean pass having shipped nothing, forever, which
+        is the head-of-line stall arriving through configuration rather than through a
+        host. The rest are rejected because a negative delay or a jitter above 1 is a
+        misconfiguration, and clamping one silently to zero hides it.
+        """
+        if self.max_attempts < 1:
+            raise ValueError(
+                f"max_attempts must be 1 or greater (got {self.max_attempts!r}); a budget "
+                f"of zero attempts never sends, never abandons and never advances"
+            )
+        if self.base_seconds < 0:
+            raise ValueError(f"base_seconds must not be negative (got {self.base_seconds!r})")
+        if self.multiplier < 1:
+            raise ValueError(
+                f"multiplier must be 1 or greater (got {self.multiplier!r}); below 1 the "
+                f"backoff shrinks toward zero and stops being a backoff"
+            )
+        if not 0 <= self.jitter <= 1:
+            raise ValueError(f"jitter must be between 0 and 1 (got {self.jitter!r})")
+        if self.ceiling_seconds < 0:
+            raise ValueError(
+                f"ceiling_seconds must not be negative (got {self.ceiling_seconds!r})"
+            )
+        if self.max_age <= timedelta(0):
+            raise ValueError(
+                f"max_age must be positive (got {self.max_age!r}); a zero or negative "
+                f"budget abandons every batch before it is sent"
+            )
+
 
 def backoff_delay(
     attempt: int,

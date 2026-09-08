@@ -920,3 +920,25 @@ def test_a_blank_reason_from_the_host_does_not_crash_the_drain(tmp_path):
     assert cursor.acked_seq == 1
     marker = [e.content for e in log.read_all() if e.type == BATCH_REJECTED][0]
     assert marker["reason"].strip(), "a blank reason must fall back to a truthful one"
+
+
+def test_an_age_abandoned_batch_is_not_counted_as_attempted(tmp_path):
+    """`batches_attempted` says "sent to the transport, acked or not". A batch abandoned by
+    age is never handed to the transport at all, so counting it makes the field disagree
+    with its own comment and with `transport.calls` — and a caller reconciling the two has
+    no way to tell a silent send from a skipped one."""
+    log = make_log(tmp_path)
+    clock = FakeClock()
+    stale = clock.now() - timedelta(hours=9)
+    log.append("tester", "test.event", {"n": 0}, ts=stale)
+    log.append("tester", "test.event", {"n": 1}, ts=stale)
+    append_n(log, 2, start=2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    transport = ScriptedTransport([200])
+
+    result = Replicator(log, transport, cursor, max_events=2, clock=clock).drain()
+
+    assert result.abandoned_batches == 1
+    assert transport.calls == 1, "only the fresh batch was sent"
+    assert result.batches_attempted == 1
+    assert result.events_attempted == 2
