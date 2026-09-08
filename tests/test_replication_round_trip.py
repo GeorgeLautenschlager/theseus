@@ -8,6 +8,8 @@ differ or every test fails at the door.
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ from theseus.high_water import HighWaterMarks
 from theseus.replication_events import BATCH_REJECTED, GAP, declared_gap
 from theseus.replication_ingress import ReplicationIngress
 from theseus.stimulus_log import StimulusLog
+from theseus.surrogates.buffer import BufferPolicy, BufferedStimulusLog
 from theseus.surrogates.clock import Clock
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
@@ -31,8 +34,15 @@ URL = "http://testserver/replicate"
 BASE = datetime.now(tz=timezone.utc).replace(microsecond=0)
 
 
-def _rig(tmp_path, *, host_max_bytes: int | None = None):
-    """A host (log + marks + ingress mounted in an ASGI app) and a surrogate log."""
+def _rig(
+    tmp_path,
+    *,
+    host_max_bytes: int | None = None,
+    surrogate_policy: BufferPolicy | None = None,
+):
+    """A host (log + marks + ingress mounted in an ASGI app) and a surrogate log.
+    Pass `surrogate_policy` to make the surrogate an evicting `BufferedStimulusLog`
+    under that pressure line, instead of a plain `StimulusLog`."""
     host_log = StimulusLog(path=tmp_path / "host.jsonl", origin=HOST)
     marks = HighWaterMarks(host_log)
     kwargs = {} if host_max_bytes is None else {"max_bytes": host_max_bytes}
@@ -40,7 +50,12 @@ def _rig(tmp_path, *, host_max_bytes: int | None = None):
     # TestClient is an httpx.Client subclass that drives the ASGI app in-process — no
     # socket, no server process — which is exactly the seam `HttpTransport.client` takes.
     client = TestClient(app)
-    surrogate = StimulusLog(path=tmp_path / "surrogate.jsonl", origin=SURROGATE)
+    if surrogate_policy is None:
+        surrogate = StimulusLog(path=tmp_path / "surrogate.jsonl", origin=SURROGATE)
+    else:
+        surrogate = BufferedStimulusLog(
+            path=tmp_path / "surrogate.jsonl", origin=SURROGATE, policy=surrogate_policy
+        )
     return SimpleNamespace(host_log=host_log, marks=marks, client=client, surrogate=surrogate)
 
 
@@ -49,6 +64,36 @@ def _drain(rig, tmp_path, cursor_name: str = "cursor.json", **replicator_kwargs)
     transport = HttpTransport(URL, client=rig.client)
     result = Replicator(rig.surrogate, transport, cursor, **replicator_kwargs).drain()
     return cursor, result
+
+
+def _tick(rig, i: int, pad: int = 100):
+    """One pressure-sized observation on the surrogate (pad 100 → a ~315 B line)."""
+    return rig.surrogate.append(
+        "sensor", "test.tick", {"n": i, "pad": "x" * pad}, ts=BASE + timedelta(seconds=i)
+    )
+
+
+def _survivor_seqs(rig) -> list[int]:
+    """Sequenced own-origin, non-marker events the surrogate still holds."""
+    return [
+        e.seq
+        for e in rig.surrogate.read_all()
+        if e.origin == SURROGATE and e.seq is not None and e.type != GAP
+    ]
+
+
+def _host_events(rig):
+    return [e for e in rig.host_log.read_all() if e.origin == SURROGATE]
+
+
+def _pressure_rig(tmp_path):
+    """A buffer that evicts exactly once: six ~315 B lines total 1890 B over the 1600 B
+    cap; one eviction cuts back to the 800 B low water, which the survivors (630 B) plus
+    the ~384 B marker stay under, so no second rewrite muddies the expected range."""
+    rig = _rig(tmp_path, surrogate_policy=BufferPolicy(max_bytes=1600, low_water=0.5))
+    for i in range(1, 7):
+        _tick(rig, i)
+    return rig
 
 
 class FakeClock:
@@ -328,3 +373,119 @@ def test_the_host_may_also_infer_the_same_hole_and_that_is_understood(tmp_path):
     assert reasons == ["inferred", "retry_exhausted"]
     for g in gaps:
         assert (g.content["from_seq"], g.content["to_seq"]) == (1, 2)
+
+
+def test_unacked_events_are_evicted_and_the_host_learns_of_the_hole(tmp_path):
+    """The issue's core scenario: the buffer evicts events nobody has delivered, and the
+    marker — not silence — crosses the wire."""
+    rig = _pressure_rig(tmp_path)
+    survivor = _survivor_seqs(rig)
+    evicted = [s for s in range(1, 7) if s not in set(survivor)]
+    assert evicted, "the scenario never got under pressure"
+    assert evicted == list(range(1, survivor[0])), "eviction must take the oldest first"
+
+    cursor, result = _drain(rig, tmp_path)
+
+    assert result.stopped_on is None
+    assert result.rejected_batches == 0
+    host = _host_events(rig)
+    assert [e.seq for e in host if e.type != GAP] == survivor
+    gaps = [e for e in host if e.type == GAP and e.content["declared"]]
+    assert len(gaps) == 1, "exactly one eviction, exactly one marker"
+    got = gaps[0].content
+    assert got["origin"] == SURROGATE
+    assert (got["from_seq"], got["to_seq"]) == (evicted[0], evicted[-1])
+    assert got["reason"] == "storage_pressure"
+    assert rig.marks.high_water(SURROGATE) == max(e.seq for e in host)
+    assert cursor.acked_seq == rig.marks.high_water(SURROGATE)
+
+
+def test_the_cursor_is_never_moved_by_eviction(tmp_path):
+    """Eviction is not an ack: a real eviction that takes events ahead of the cursor
+    leaves `acked_seq` exactly where the host put it."""
+    rig = _rig(tmp_path, surrogate_policy=BufferPolicy(max_bytes=1600, low_water=0.5))
+    for i in range(1, 6):  # 5 lines ≈ 1575 B, under the cap: nothing evicted yet
+        _tick(rig, i)
+    cursor = AckedCursor(tmp_path / "cursor.json", SURROGATE)
+    transport = HttpTransport(URL, client=rig.client)
+    result = Replicator(rig.surrogate, transport, cursor).drain()
+    assert result.stopped_on is None
+    before = cursor.acked_seq
+    assert before == 5
+
+    # Append until seq 6 — never delivered, ahead of the cursor — has been evicted.
+    for i in range(6, 20):
+        _tick(rig, i)
+        if 6 not in _survivor_seqs(rig):
+            break
+    else:
+        raise AssertionError("never evicted past the acked cursor")
+
+    assert cursor.acked_seq == before
+
+
+def test_a_drain_after_eviction_does_not_re_send_or_stall(tmp_path):
+    """One drain ships the survivors and the marker; the next ships nothing, because the
+    cursor already sits at the highest seq the log still holds."""
+    rig = _pressure_rig(tmp_path)
+
+    cursor, first = _drain(rig, tmp_path)
+    assert first.stopped_on is None
+    assert first.batches_attempted > 0
+
+    cursor, second = _drain(rig, tmp_path)
+
+    assert second.stopped_on is None
+    assert second.batches_attempted == 0
+    assert second.events_attempted == 0
+    assert cursor.acked_seq == first.acked_seq
+
+
+def test_the_host_does_not_double_count_the_evicted_range(tmp_path):
+    """The declared marker rides in the same batch as the hole it explains, so the host
+    ascends across the range without a 400 and mints no inferred marker of its own."""
+    rig = _pressure_rig(tmp_path)
+    survivor = _survivor_seqs(rig)
+    evicted_low, evicted_high = 1, survivor[0] - 1
+
+    cursor, result = _drain(rig, tmp_path)
+
+    assert result.stopped_on is None
+    assert result.rejected_batches == 0
+    gaps = [e for e in _host_events(rig) if e.type == GAP]
+    assert len(gaps) == 1
+    assert gaps[0].content["declared"] is True
+    assert gaps[0].content["reason"] == "storage_pressure"
+    assert (gaps[0].content["from_seq"], gaps[0].content["to_seq"]) == (
+        evicted_low,
+        evicted_high,
+    )
+
+
+def test_eviction_under_an_active_drain_is_safe(tmp_path):
+    """Appends crossing the cap while a drain is in flight never produce a duplicate or
+    a descending seq on the host."""
+    rig = _rig(tmp_path, surrogate_policy=BufferPolicy(max_bytes=1600, low_water=0.5))
+    for i in range(1, 9):  # 8 lone batches give the drain room to still be running
+        _tick(rig, i)
+    done = threading.Event()
+
+    def run():
+        _drain(rig, tmp_path, max_events=1)
+        done.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    appended = 0
+    while not done.is_set() and appended < 8:
+        _tick(rig, 100 + appended)
+        appended += 1
+        time.sleep(0.002)
+    thread.join(timeout=10)
+    assert done.is_set()
+
+    # Ship whatever the in-flight drain's snapshot missed, then inspect the tape.
+    _drain(rig, tmp_path, cursor_name="second.json", max_events=1)
+
+    host_seqs = [e.seq for e in _host_events(rig) if e.type != GAP]
+    assert host_seqs == sorted(set(host_seqs)), "duplicate or out of order on the host"
