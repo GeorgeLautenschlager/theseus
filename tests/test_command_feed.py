@@ -13,6 +13,7 @@ suite, which this repo has been bitten by before.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -332,6 +333,49 @@ def test_stream_heartbeats_when_idle(tmp_path):
     assert [_event_of(f).seq for f in frames] == [cmd_seq]
 
 
+def test_heartbeats_survive_a_busy_log(tmp_path):
+    """The heartbeat clock measures silence **to the client**, not silence on the log.
+    A host with ongoing activity — the chat UI writes to this very log — dequeues
+    events continuously, none matching this target, and the stream must still carry
+    heartbeats. A dequeue-path idle clock resets on every non-matching event and sends
+    no bytes at all here; a quiet-log-only test cannot fail that."""
+    rig = _rig(tmp_path, feed_kwargs=FAST)
+    stop = threading.Event()
+
+    def chatter():
+        # A plain observation every 20 ms — not a command, not for this target,
+        # nothing this stream would ever send.
+        while not stop.is_set():
+            rig.log.append(ACTOR, "observation", {"note": "busy host"})
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=chatter, daemon=True)
+    thread.start()
+
+    async def main():
+        stream = _Stream(rig.feed, TARGET_A)
+        end = time.monotonic() + 3.0
+        heartbeats: list[str] = []
+        try:
+            while len(heartbeats) < 2 and time.monotonic() < end:
+                frame = await stream.next(deadline=end - time.monotonic())
+                if frame.startswith(":"):
+                    heartbeats.append(frame)
+        finally:
+            stop.set()
+            await stream.close()
+        return heartbeats
+
+    try:
+        heartbeats = asyncio.run(main())
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+    assert len(heartbeats) == 2
+    assert all("event:" not in c for c in heartbeats)
+
+
 def test_disconnect_ends_generator_and_unsubscribes(tmp_path):
     """After the client disconnects the log has no listener left — a listener left
     behind on every dropped connection grows with reconnects, the normal case on a
@@ -351,12 +395,18 @@ def test_disconnect_ends_generator_and_unsubscribes(tmp_path):
     assert rig.log._listeners == []
 
 
-def test_data_framing_survives_multi_line_payload(tmp_path):
-    """A payload containing a newline round-trips through the framing back to an equal
-    StimulusEvent — multiple `data:` lines joined by newline, never a raw newline
-    inside one `data:` line."""
+def test_payload_newline_never_reaches_the_wire_raw(tmp_path):
+    """The load-bearing invariant is on the serialisation, not the split: `to_json()` of
+    an event whose payload contains a newline **escapes** it, so the wire JSON carries
+    no raw newline and one `data:` line carries the whole content. The framing still
+    splits and reassembles — cheap insurance if the serialisation ever gains an indent —
+    and the frame parses back to an equal event."""
     rig = _rig(tmp_path)
     cmd = _command(rig.log, TARGET_A, payload={"text": "line1\nline2"})
+
+    wire = cmd.to_json()
+    assert "\n" not in wire  # the invariant a serialisation change would break
+    assert "line1\\nline2" in wire  # escaped, not lost
 
     async def main():
         stream = _Stream(rig.feed, TARGET_A)
@@ -365,6 +415,8 @@ def test_data_framing_survives_multi_line_payload(tmp_path):
         return frames
 
     frame = asyncio.run(main())[0]
+    data_lines = [line for line in frame.splitlines() if line.startswith("data: ")]
+    assert "\n".join(line[len("data: ") :] for line in data_lines) == wire
     assert _event_of(frame) == cmd
     # The frame carries an id: line and an event: line around the data.
     assert f"id: {cmd.seq}" in frame

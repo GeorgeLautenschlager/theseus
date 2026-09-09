@@ -121,28 +121,40 @@ class CommandFeed:
             for event in self.pending(target, after=after):
                 highest = _advance(highest, event.seq)
                 yield _format_sse(event)
+            # The clock measures time since **bytes were sent to the client**, not
+            # since an event was dequeued: a busy host — the chat UI writes to this
+            # very log — keeps the queue producing non-matching events forever, and a
+            # dequeue-path clock resets on each of them, so the stream sends no bytes
+            # at all on exactly the host whose proxy declares the silent connection
+            # dead.
             idle_since = time.monotonic()
             while True:
                 if await request.is_disconnected():
                     break
+                sent = False
                 try:
                     event = await run_in_threadpool(
                         queue.get, timeout=self._poll_seconds
                     )
                 except Empty:
-                    # Heartbeat after `heartbeat_seconds` of idleness, so proxies and
-                    # NAT tables never declare an otherwise-silent connection dead.
-                    if time.monotonic() - idle_since >= self._heartbeat_seconds:
-                        yield ": heartbeat\n\n"
-                        idle_since = time.monotonic()
-                    continue
-                idle_since = time.monotonic()
-                if not self._matches(event, target):
-                    continue
-                if event.seq is not None and highest is not None and event.seq <= highest:
-                    continue  # already replayed
-                highest = _advance(highest, event.seq)
-                yield _format_sse(event)
+                    pass
+                else:
+                    if self._matches(event, target) and not (
+                        event.seq is not None
+                        and highest is not None
+                        and event.seq <= highest
+                    ):
+                        highest = _advance(highest, event.seq)
+                        yield _format_sse(event)
+                        sent = True
+                # Reachable on every path, not just the queue-timeout one: after
+                # `heartbeat_seconds` of client silence, send bytes so proxies and NAT
+                # tables never declare an otherwise-silent connection dead.
+                if not sent and (
+                    time.monotonic() - idle_since >= self._heartbeat_seconds
+                ):
+                    yield ": heartbeat\n\n"
+                    idle_since = time.monotonic()
         finally:
             # A listener left behind on every dropped connection grows with reconnects —
             # the normal case on a flaky link — so unsubscribing runs on every exit.
