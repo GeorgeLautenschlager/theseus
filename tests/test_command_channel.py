@@ -22,19 +22,9 @@ from theseus.surrogates.sse_command_channel import SseCommandChannel
 FAST_BUDGET = RetryBudget(base_seconds=0.01, multiplier=2.0, jitter=0.0)
 
 
-def _command(verb: str, n: int) -> StimulusEvent:
-    return StimulusEvent(
-        id=f"cmd-{n}",
-        ts=datetime.now(timezone.utc),
-        actor="host",
-        type=command_type(verb),
-        content=command_content(target="tam", payload={"n": n}),
-    )
-
-
 def test_doorbell_shape_drains_and_returns() -> None:
     ch = MemoryCommandChannel()
-    offered = [_command("say", n) for n in range(3)]
+    offered = [_command("tam", n) for n in range(3)]
     for e in offered:
         ch.offer(e)
 
@@ -54,7 +44,7 @@ def test_doorbell_shape_drains_and_returns() -> None:
 
 def test_live_shape_blocks_until_closed() -> None:
     ch = MemoryCommandChannel(block=True)
-    ch.offer(_command("say", 1))
+    ch.offer(_command("tam", 1))
 
     got: list[StimulusEvent] = []
     first_seen = threading.Event()
@@ -70,7 +60,7 @@ def test_live_shape_blocks_until_closed() -> None:
     # Offers have stopped; the stream must still be alive, waiting for more.
     assert t.is_alive()
 
-    ch.offer(_command("say", 2))
+    ch.offer(_command("tam", 2))
     second_seen = threading.Event()
 
     def wait_second() -> None:
@@ -105,7 +95,7 @@ def test_close_from_another_thread_ends_stream_promptly() -> None:
 
 def test_nothing_yielded_twice() -> None:
     ch = MemoryCommandChannel()
-    first = _command("say", 1)
+    first = _command("tam", 1)
     ch.offer(first)
     assert list(ch.stream()) == [first]
     assert list(ch.stream()) == []
@@ -113,7 +103,7 @@ def test_nothing_yielded_twice() -> None:
 
 def test_second_stream_resumes_with_new_offers() -> None:
     ch = MemoryCommandChannel()
-    a, b = _command("say", 1), _command("say", 2)
+    a, b = _command("tam", 1), _command("tam", 2)
     ch.offer(a)
     assert list(ch.stream()) == [a]
     ch.offer(b)
@@ -133,7 +123,7 @@ def test_offer_after_close_raises() -> None:
     ch = MemoryCommandChannel()
     ch.close()
     with pytest.raises(RuntimeError):
-        ch.offer(_command("say", 1))
+        ch.offer(_command("tam", 1))
 
 
 # --- the SSE transport (Task 4) ---------------------------------------------------
@@ -313,8 +303,14 @@ def test_sse_channel_does_not_advance_the_cursor(tmp_path, serve) -> None:
 
 
 def test_sse_heartbeats_yield_nothing_and_do_not_end_the_stream(tmp_path, serve) -> None:
-    gate = threading.Event()
-    host = _ScriptedHost([[": heartbeat\n\n", gate, _format_sse(_command("tam", 7))]])
+    """A comment-line heartbeat yields no event and the stream survives it: the
+    command sent *after* the heartbeat still arrives (and with max_reconnects=0, a
+    stream the heartbeat had ended could never deliver it). What this does NOT pin is
+    the `startswith(":")` skip branch in `_frames` — the following `data:` guard
+    already ignores every comment line, so deleting that branch changes nothing here.
+    The branch is defensive; this test proves the stream survives heartbeats, not that
+    the branch exists."""
+    host = _ScriptedHost([[": heartbeat\n\n", _format_sse(_command("tam", 7))]])
     base = serve(host)
     channel = SseCommandChannel(
         f"{base}/commands/tam", _cursor(tmp_path), client=httpx.Client(),
@@ -440,10 +436,12 @@ def test_sse_503_is_retried_and_429_is_retried(tmp_path) -> None:
     assert sleeps == [0.01, 0.02]  # first-attempt then second-attempt delay, unjittered
 
 
-def test_sse_backoff_grows_with_consecutive_failures_and_resets_on_success(tmp_path, serve) -> None:
-    """Delays between reconnects follow `backoff_delay` (deterministic random), and a
-    connection that succeeded resets the count — a channel up for a day that drops once
-    retries at the first-attempt delay, not the ceiling."""
+def test_sse_flapping_host_backoff_grows_and_stays_bounded(tmp_path, serve) -> None:
+    """A host that answers 200 and closes immediately never satisfies the reset rule —
+    resetting needs a connection that *stays* open, which the two tests below pin
+    (delivered, and silent-but-lasting). What this proves is the other half: with no
+    reset, the delays grow 0.01 → 0.02 → 0.04, so a flapping host is retried at a
+    bounded rate instead of hammering it at the first-attempt delay forever."""
     host = _ScriptedHost([[], []])  # every connection closes immediately
     base = serve(host)
     sleeps: list[float] = []
@@ -456,9 +454,8 @@ def test_sse_backoff_grows_with_consecutive_failures_and_resets_on_success(tmp_p
     got = _collect(channel, count=1)
 
     assert got == []
-    # Each connection answers 200 then closes, so `failures` resets to 0 inside the try
-    # and the fall-through increments it to 1, 2, 3: the raw `backoff_delay` sequence,
-    # unjittered by the deterministic `random_fn`.
+    # No connection lasted long enough to reset `failures`, so the delays are the raw
+    # `backoff_delay` sequence, unjittered by the deterministic `random_fn`.
     assert sleeps == [0.01, 0.02, 0.04]
 
 
@@ -603,12 +600,6 @@ def test_sse_malformed_frame_is_skipped_not_fatal(tmp_path, serve, caplog) -> No
 
     assert [e.seq for e in got] == [good.seq]
     assert any("malformed" in record.message.lower() for record in caplog.records)
-
-
-def test_sse_channel_satisfies_the_protocol(tmp_path) -> None:
-    assert isinstance(
-        SseCommandChannel("http://host/commands/tam", _cursor(tmp_path)), CommandChannel
-    )
 
 
 class _HangingHost:

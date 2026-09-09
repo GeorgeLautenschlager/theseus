@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import httpx
 from starlette.requests import Request
 
 from theseus.command_feed import CommandFeed, _format_sse
@@ -423,15 +424,29 @@ def test_payload_newline_never_reaches_the_wire_raw(tmp_path):
     assert f"event: {cmd.type}" in frame
 
 
-def test_mounted_route_serves_the_stream(tmp_path):
+def test_mounted_route_serves_the_stream(tmp_path, serve):
     """`add_routes` / `build_app` mount the endpoint with the ingress's pattern — the
-    route exists and answers with an event-stream."""
+    route exists and answers with an event-stream. Bounded: read to the first event
+    frame, then stop; the httpx read timeout bounds a stream that stops producing."""
     rig = _rig(tmp_path)
     cmd = _command(rig.log, TARGET_A)
     app = rig.feed.build_app()
 
     routes = {route.path for route in app.routes if hasattr(route, "path")}
     assert f"/commands/{{target}}" in routes
+
+    base = serve(app)
+
+    with httpx.Client(timeout=5.0) as client:
+        with client.stream("GET", f"{base}/commands/{TARGET_A}") as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            lines: list[str] = []
+            for line in response.iter_lines():
+                lines.append(line)
+                if line.startswith("id:"):
+                    break
+            assert f"id: {cmd.seq}" in lines
 
 
 # --- the doorbell: ordering, bound, and worker thread -----------------------------
