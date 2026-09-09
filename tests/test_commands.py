@@ -59,7 +59,9 @@ def test_bare_prefix_is_not_a_command():
 
 
 def test_non_command_event_is_not_a_command():
-    event = _event("observation", {"note": "the cat is on the mat"})
+    # Carries a real "target" value: the assertion must fail if command_target stops
+    # gating on is_command, not merely because the key happens to be absent.
+    event = _event("observation", {"target": "desk-win", "note": "the cat is on the mat"})
     assert not is_command(event)
     assert command_target(event) is None
 
@@ -67,5 +69,7 @@ def test_non_command_event_is_not_a_command():
 def test_malformed_command_yields_none():
     missing = _event(command_type("say"), {"payload": {}})
     not_a_string = _event(command_type("say"), {"target": 7, "payload": {}})
+    empty = _event(command_type("say"), {"target": "", "payload": {}})
     assert command_target(missing) is None
     assert command_target(not_a_string) is None
+    assert command_target(empty) is None

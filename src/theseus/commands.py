@@ -77,7 +77,14 @@ def command_target(event: StimulusEvent) -> str | None:
     a well-typed command with a missing or non-string `target` is somebody else's bug, not
     a reason for a filtering feed to stop serving.
     """
+    # The type gate is load-bearing, not cosmetic: Task 3's feed filters the host log by
+    # command_target, and ordinary host events (observations of text the agent did not
+    # author) can carry a "target" key that must never read back as a command's.
+    if not is_command(event):
+        return None
     target = event.content.get("target")
-    if not isinstance(target, str):
+    # An empty string is not a surrogate name; a corrupted log line must read back as
+    # unaddressed, never as "for surrogate ''".
+    if not isinstance(target, str) or not target:
         return None
     return target
