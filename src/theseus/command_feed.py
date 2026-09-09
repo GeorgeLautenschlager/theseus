@@ -23,7 +23,7 @@ chat-UI concern.
 from __future__ import annotations
 
 import time
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -100,54 +100,63 @@ class CommandFeed:
     async def _stream(self, request: Request, target: str):
         """Replay above the cursor, then live, with a heartbeat when idle.
 
-        The ordering here is the sharpest trap in the task: **subscribe first, replay
-        second**. Reading first and subscribing second leaves a window where an appended
-        command lands in neither the read nor the subscription — and on a busy host that
-        is the *newest* command, the one most likely to matter. Subscribe-first puts
-        anything appended in between in *both* halves, and the discard at the replay
-        boundary serves it exactly once.
+        The live half treats the subscription as a **doorbell**, never as the delivery:
+        the log's own docstring warns that notification order is not file order (the
+        notify runs outside the append lock), so a queue-fed stream with a running-max
+        discard silently drops a command whose notification arrives after a later one —
+        permanently, because the caller's cursor then skips it on every reconnect. The
+        truth is the file, which *is* seq-ordered; the listener only rings, and every
+        ring triggers a fresh `pending(target, after=highest)` fetch. No discard is
+        needed: `pending` is defined as strictly above the cursor, so an event covered
+        by the previous fetch is never served twice.
 
-        The replay boundary is `max(cursor, highest seq replayed)`: a live event at or
-        below it was already in the replay read, never at-or-below the surrogate's
-        cursor itself, which the replay read is defined to be strictly above.
+        The ordering here is still the sharpest trap in the task: **subscribe first,
+        replay second**. Reading first and subscribing second leaves a window where an
+        appended command lands in neither the read nor the subscription — nothing rings
+        for it, ever. Subscribe-first puts anything appended in between in *both*
+        halves, and the cursor rule serves it exactly once.
+
+        The cost traded into: every ring re-reads the log above the cursor. That is the
+        price of ordering correctness, it happens on a worker thread (`run_in_threadpool`
+        — a big tape must never freeze the endpoints mounted beside this one), and it
+        only happens when something was actually appended.
         """
         after = _parse_last_event_id(request.headers.get("last-event-id"))
         yield "retry: 2000\n\n"
 
-        queue: Queue = Queue()
-        unsubscribe = self._log.subscribe(queue.put)
+        # maxsize=1 and best-effort put: a ring dropped because one is already pending
+        # is harmless — the fetch after it reads the whole log above `highest`. The
+        # ring runs on the appending thread, the critical path of every host append,
+        # so it must be near-free and must never grow.
+        bell: Queue = Queue(maxsize=1)
+        unsubscribe = self._log.subscribe(lambda _event: _ring(bell))
         try:
             highest = after
             for event in self.pending(target, after=after):
                 highest = _advance(highest, event.seq)
                 yield _format_sse(event)
             # The clock measures time since **bytes were sent to the client**, not
-            # since an event was dequeued: a busy host — the chat UI writes to this
-            # very log — keeps the queue producing non-matching events forever, and a
-            # dequeue-path clock resets on each of them, so the stream sends no bytes
-            # at all on exactly the host whose proxy declares the silent connection
-            # dead.
+            # since the doorbell rang: a busy host — the chat UI writes to this very
+            # log — rings the bell forever with non-matching events, and a ring-path
+            # clock resets on each of them, so the stream sends no bytes at all on
+            # exactly the host whose proxy declares the silent connection dead.
             idle_since = time.monotonic()
             while True:
                 if await request.is_disconnected():
                     break
                 sent = False
                 try:
-                    event = await run_in_threadpool(
-                        queue.get, timeout=self._poll_seconds
-                    )
+                    await run_in_threadpool(bell.get, timeout=self._poll_seconds)
                 except Empty:
                     pass
                 else:
-                    if self._matches(event, target) and not (
-                        event.seq is not None
-                        and highest is not None
-                        and event.seq <= highest
+                    for event in await run_in_threadpool(
+                        self.pending, target, after=highest
                     ):
                         highest = _advance(highest, event.seq)
                         yield _format_sse(event)
                         sent = True
-                # Reachable on every path, not just the queue-timeout one: after
+                # Reachable on every path, not just the doorbell-timeout one: after
                 # `heartbeat_seconds` of client silence, send bytes so proxies and NAT
                 # tables never declare an otherwise-silent connection dead.
                 if not sent and (
@@ -166,6 +175,15 @@ class CommandFeed:
             and command_target(event) == target
             and event.origin == self._log.origin
         )
+
+
+def _ring(bell: Queue) -> None:
+    """Best-effort doorbell ring: drop when already rung. A dropped signal is harmless —
+    the reader's next fetch sees everything the log holds above its cursor."""
+    try:
+        bell.put_nowait(None)
+    except Full:
+        pass
 
 
 def _advance(highest: int | None, seq: int | None) -> int | None:
