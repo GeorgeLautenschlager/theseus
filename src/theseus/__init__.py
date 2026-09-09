@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from theseus.assembly import AgentSpec, InterfaceSpec, MemorySpec, ModelSpec, build_agent
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_feed import CommandFeed
@@ -37,6 +40,11 @@ from theseus.tools import (
 )
 
 __all__ = [
+    "AgentSpec",
+    "InterfaceSpec",
+    "MemorySpec",
+    "ModelSpec",
+    "build_agent",
     "AgenticMemory",
     "Autocore",
     "BufferPolicy",

@@ -7,15 +7,18 @@ it remembered. That is the whole reason recall is a tool rather than something
 the context assembler does behind the agent's back — it makes remembering an
 event the agent experiences, on the same path as everything else.
 
-Depends only on the `Memory` protocol, so any memory module can back it.
+Supports the legacy Memory protocol and MemoryModule’s budgeted recall boundary.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from theseus.memory import Memory
 from theseus.tools.tool import ToolResult
+
+if TYPE_CHECKING:
+    from theseus.memory_module import MemoryModule
 
 # Formation filters recall's own output back out of the stimulus log by this name
 # (see `AgenticMemory.form`), so it lives here with the tool that produces it.
@@ -41,12 +44,21 @@ class RecallTool:
         "required": ["query"],
     }
 
-    def __init__(self, memory: Memory) -> None:
+    def __init__(self, memory: Memory | MemoryModule, *, budget_tokens: int = 2000) -> None:
+        if type(budget_tokens) is not int or budget_tokens <= 0:
+            raise ValueError("budget_tokens must be a positive integer")
         self.memory = memory
+        self.budget_tokens = budget_tokens
 
     def execute(self, query: str) -> ToolResult:
         try:
-            recollection = self.memory.retrieve(query)
+            details = {"query": query}
+            if hasattr(self.memory, "retrieve"):
+                recollection = self.memory.retrieve(query)
+            else:
+                result = self.memory.recall(query, budget_tokens=self.budget_tokens)
+                recollection = "\n\n".join(entry.text for entry in result.entries)
+                details.update(misses=list(result.misses), total_tokens=result.total_tokens)
         except Exception as exc:
             # Never raise into the loop: a memory outage should cost the agent its
             # recollection, not its turn.
@@ -59,6 +71,6 @@ class RecallTool:
         if not recollection:
             return ToolResult(
                 f"Nothing came to mind about: {query}",
-                details={"query": query, "found": False},
+                details={**details, "found": False},
             )
-        return ToolResult(recollection, details={"query": query, "found": True})
+        return ToolResult(recollection, details={**details, "found": True})
