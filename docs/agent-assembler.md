@@ -52,7 +52,10 @@ constitution = Path(__file__).with_name("CONSTITUTION.md").read_text(encoding="u
   tools. Their working directory is the runtime home. Omitted tools are unavailable;
   included tools execute with the substrate's existing behavior. This is not a
   sandbox or an `allow`/`ask`/`deny` policy system.
-- `interface` is one terminal or web interface. Its reply tool is wired automatically.
+- `interface` selects terminal, web, or `InterfaceSpec("none")` for a headless
+  Autocore. Terminal/web reply tools are wired automatically; headless agents
+  have no chat observer or reply tool. `agent.core.step()` runs one autonomous
+  turn without sleeping, for scheduled jobs; `agent.run()` runs continuously.
 - Memory defaults to none. Autocore accepts either `MemorySpec("amem", ...)`
   (AgenticMemory) or `MemorySpec("module", ...)` (MemoryModule). Both wire recall
   to the selected module and the core's stimulus log. For example:

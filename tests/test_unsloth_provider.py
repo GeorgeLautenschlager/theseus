@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from openai import OpenAIError
 
@@ -50,13 +52,18 @@ def test_is_available_false_when_unreachable(monkeypatch):
     assert provider.is_available() is False
 
 
-def test_is_available_true_when_reachable(monkeypatch):
+@pytest.mark.parametrize("models, available", [
+    (["gemma-4-e4b-it-qat-nvfp4"], True),
+    (["another-model"], False),
+    ([], False),
+])
+def test_is_available_only_when_requested_model_is_served(monkeypatch, models, available):
     monkeypatch.setenv("UNSLOTH_API_KEY", "unsloth-test-key")
     provider = UnslothProvider(model="gemma-4-e4b-it-qat-nvfp4")
 
     class WorkingModels:
         def list(self):
-            return []
+            return SimpleNamespace(data=[SimpleNamespace(id=model) for model in models])
 
     monkeypatch.setattr(provider._client, "models", WorkingModels())
-    assert provider.is_available() is True
+    assert provider.is_available() is available
