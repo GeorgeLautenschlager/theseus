@@ -15,7 +15,12 @@ from theseus.commands import command_content, command_type
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.surrogates.command_channel import CommandChannel, MemoryCommandChannel
 from theseus.surrogates.cursor import AckedCursor
+from theseus.surrogates.retry import RetryBudget, backoff_delay
 from theseus.surrogates.sse_command_channel import SseCommandChannel
+
+# Fast enough that a reconnect-path test's real sleep stays under a millisecond; the
+# backoff-shape tests below assert on recorded delays, never on timing.
+FAST_BUDGET = RetryBudget(base_seconds=0.01, multiplier=2.0, jitter=0.0)
 
 
 def _command(verb: str, n: int) -> StimulusEvent:
@@ -297,7 +302,7 @@ def test_sse_resumes_from_the_cursor(tmp_path, serve) -> None:
     base = serve(app)
     channel = SseCommandChannel(
         f"{base}/commands/tam", cursor, client=httpx.Client(),
-        max_reconnects=0, reconnect_seconds=0.05,
+        max_reconnects=0, budget=FAST_BUDGET,
     )
     got = _collect(channel, count=1)
 
@@ -315,7 +320,7 @@ def test_sse_never_advanced_cursor_sends_no_header(tmp_path, serve) -> None:
     base = serve(app)
     channel = SseCommandChannel(
         f"{base}/commands/tam", _cursor(tmp_path), client=httpx.Client(),
-        max_reconnects=0, reconnect_seconds=0.05,
+        max_reconnects=0, budget=FAST_BUDGET,
     )
     got = _collect(channel, count=1)
 
@@ -333,7 +338,7 @@ def test_sse_channel_does_not_advance_the_cursor(tmp_path, serve) -> None:
     cursor.advance(2)
     channel = SseCommandChannel(
         f"{base}/commands/tam", cursor, client=httpx.Client(),
-        max_reconnects=0, reconnect_seconds=0.05,
+        max_reconnects=0, budget=FAST_BUDGET,
     )
 
     got = _collect(channel, count=2)
@@ -348,7 +353,7 @@ def test_sse_heartbeats_yield_nothing_and_do_not_end_the_stream(tmp_path, serve)
     base = serve(host)
     channel = SseCommandChannel(
         f"{base}/commands/tam", _cursor(tmp_path), client=httpx.Client(),
-        max_reconnects=0, reconnect_seconds=0.05,
+        max_reconnects=0, budget=FAST_BUDGET,
     )
 
     got = _collect(channel, count=1)
@@ -374,7 +379,7 @@ def test_sse_dropped_connection_reconnects_from_current_cursor(tmp_path, serve) 
     cursor = _cursor(tmp_path)
     channel = SseCommandChannel(
         f"{base}/commands/tam", cursor, client=httpx.Client(),
-        max_reconnects=1, reconnect_seconds=0.05,
+        max_reconnects=1, budget=FAST_BUDGET,
     )
     got: list[StimulusEvent] = []
     done = threading.Event()
@@ -409,6 +414,160 @@ def test_sse_dropped_connection_reconnects_from_current_cursor(tmp_path, serve) 
     assert host.requests[1].get("last-event-id") == str(fifth.seq)
 
 
+def test_sse_404_ends_the_stream_instead_of_looping(tmp_path, serve) -> None:
+    """A permanent 4xx means the request will never work; retrying forever is 43k
+    requests a day against a URL that cannot succeed. Bounded by the request count the
+    host recorded."""
+
+    async def not_found(scope, receive, send) -> None:
+        await send({"type": "http.response.start", "status": 404})
+        await send({"type": "http.response.body", "body": b""})
+
+    base = serve(not_found)
+    sleeps: list[float] = []
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", _cursor(tmp_path),
+        budget=FAST_BUDGET, sleep_fn=sleeps.append,
+    )
+    got = _collect(channel, count=1)
+
+    assert got == []
+    assert sleeps == [], "a permanent 4xx must not spend reconnects"
+
+
+def test_sse_503_is_retried_and_429_is_retried(tmp_path) -> None:
+    """A 5xx and a 429 are the host saying *later*, not *never* — they spend retry
+    budget like a drop does, unlike a 404."""
+    cursor = _cursor(tmp_path)
+    statuses = iter([503, 429, 503])
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    class _StatusHost:
+        """Answers with the next scripted status, never a body."""
+
+        def stream(self, method, url, headers=None):
+            status = next(statuses)
+            calls.append(str(status))
+            request = httpx.Request(method, url)
+            response = httpx.Response(status, request=request)
+
+            class _Ctx:
+                def __enter__(self) -> httpx.Response:
+                    response.raise_for_status()
+                    return response
+
+                def __exit__(self, *args) -> None:
+                    return None
+
+            return _Ctx()
+
+    channel = SseCommandChannel(
+        "http://host/commands/tam", cursor,
+        client=_StatusHost(),  # type: ignore[arg-type]
+        budget=FAST_BUDGET, random_fn=lambda: 0.5, sleep_fn=sleeps.append,
+        max_reconnects=2,
+    )
+    got = _collect(channel, count=1)
+
+    assert got == []
+    assert len(calls) == 3  # two reconnects, then max_reconnects stops the loop
+    assert sleeps == [0.01, 0.02]  # first-attempt then second-attempt delay, unjittered
+
+
+def test_sse_backoff_grows_with_consecutive_failures_and_resets_on_success(tmp_path, serve) -> None:
+    """Delays between reconnects follow `backoff_delay` (deterministic random), and a
+    connection that succeeded resets the count — a channel up for a day that drops once
+    retries at the first-attempt delay, not the ceiling."""
+    host = _ScriptedHost([[], []])  # every connection closes immediately
+    base = serve(host)
+    sleeps: list[float] = []
+    rng = iter([0.5, 0.5, 0.5])  # jitter factor 0 → delays are exactly the raw sequence
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", _cursor(tmp_path), client=httpx.Client(),
+        budget=FAST_BUDGET, random_fn=lambda: next(rng), sleep_fn=sleeps.append,
+        max_reconnects=3,
+    )
+    got = _collect(channel, count=1)
+
+    assert got == []
+    # Each connection answers 200 then closes, so `failures` resets to 0 inside the try
+    # and the fall-through increments it to 1, 2, 3: the raw `backoff_delay` sequence,
+    # unjittered by the deterministic `random_fn`.
+    assert sleeps == [0.01, 0.02, 0.04]
+
+
+def test_backoff_resets_after_a_successful_connection(tmp_path) -> None:
+    """Two drops, then a connection that actually delivers, then a drop: the last delay
+    is the *first-attempt* delay again, not the grown one — a channel that has been up
+    does not owe the ceiling."""
+    request = httpx.Request("GET", "http://host/commands/tam")
+
+    class _FlakyHost:
+        def __init__(self) -> None:
+            # Two drops, then a connection that delivers a command, then drops until
+            # `max_reconnects` is spent.
+            self.script: list[str] = ["drop", "drop", "ok", "drop", "drop", "drop"]
+
+        def stream(self, method, url, headers=None):
+            what = self.script.pop(0) if self.script else "drop"
+
+            class _Ctx:
+                def __enter__(self):
+                    if what == "drop":
+                        raise httpx.ConnectError("no route", request=request)
+                    return self
+
+                def __exit__(self, *args) -> None:
+                    return None
+
+                def raise_for_status(self) -> None:
+                    pass
+
+                def iter_lines(self):
+                    # `httpx` yields lines, not whole frames.
+                    yield from _format_sse(_command("tam", 1)).splitlines()
+
+            return _Ctx()
+
+    sleeps: list[float] = []
+    channel = SseCommandChannel(
+        "http://host/commands/tam", _cursor(tmp_path),
+        client=_FlakyHost(),  # type: ignore[arg-type]
+        budget=FAST_BUDGET, random_fn=lambda: 0.5, sleep_fn=sleeps.append,
+        max_reconnects=3,
+    )
+    got: list[StimulusEvent] = []
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            # Consume everything, not just the first command: the delays this test
+            # exists to assert on come *after* the delivered one.
+            got.extend(channel.stream())
+        except Exception:  # noqa: BLE001 — teardown tearing the connection is not a test failure
+            pass
+        done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    assert done.wait(10.0), "stream did not end after reconnects were exhausted"
+    channel.close()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "stream thread did not end after close()"
+
+    assert [e.seq for e in got] == [1]
+    # Two drops at attempts 1–2, the delivering connection resets the count, then the
+    # post-drop retries start over at the first-attempt delay and grow to the stop.
+    assert sleeps == [0.01, 0.02, 0.01, 0.02, 0.04]
+
+
+def test_backoff_arithmetic_matches_retry_budget() -> None:
+    # pin the deterministic shape the stream test relies on: base * multiplier**(n-1)
+    assert backoff_delay(1, FAST_BUDGET, random_fn=lambda: 0.5) == 0.01
+    assert backoff_delay(3, FAST_BUDGET, random_fn=lambda: 0.5) == 0.04
+
+
 def test_sse_malformed_frame_is_skipped_not_fatal(tmp_path, serve, caplog) -> None:
     """One bad frame must not take the channel down — but a silently skipped command
     is the failure this protocol exists to prevent, so it is logged."""
@@ -417,7 +576,7 @@ def test_sse_malformed_frame_is_skipped_not_fatal(tmp_path, serve, caplog) -> No
     base = serve(host)
     channel = SseCommandChannel(
         f"{base}/commands/tam", _cursor(tmp_path), client=httpx.Client(),
-        max_reconnects=0, reconnect_seconds=0.05,
+        max_reconnects=0, budget=FAST_BUDGET,
     )
 
     with caplog.at_level("WARNING"):

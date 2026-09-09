@@ -19,13 +19,15 @@ A duplicate, by contrast, is visible on the tape. That is the side to fail on.
 from __future__ import annotations
 
 import logging
+import random
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import httpx
 
 from theseus.stimulus_log import StimulusEvent
 from theseus.surrogates.cursor import AckedCursor
+from theseus.surrogates.retry import RetryBudget, backoff_delay
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +49,16 @@ class SseCommandChannel:
         *,
         client: httpx.Client | None = None,
         max_reconnects: int | None = None,
-        reconnect_seconds: float = 2.0,
+        budget: RetryBudget = RetryBudget(),
+        random_fn: Callable[[], float] = random.random,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self._url = url
         self._cursor = cursor
         self._max_reconnects = max_reconnects
-        self._reconnect_seconds = reconnect_seconds
+        self._budget = budget
+        self._random_fn = random_fn
+        self._sleep_fn = sleep_fn
         # The read timeout must outlast the host's heartbeat gap (20s by default) or an
         # idle-but-healthy connection would be dropped and reopened on a loop. 60s of
         # silence still reconnects — recoverable, the cursor resumes — and a host that
@@ -78,7 +84,7 @@ class SseCommandChannel:
         connection last saw. The two differ whenever the caller advanced past only part
         of what a connection delivered, and only the first is correct.
         """
-        attempts = 0
+        failures = 0
         while True:
             headers: dict[str, str] = {}
             acked = self._cursor.acked_seq
@@ -86,19 +92,51 @@ class SseCommandChannel:
             # sending 0 would claim the surrogate has executed everything below 1.
             if acked is not None:
                 headers["last-event-id"] = str(acked)
+            delivered = False
             try:
                 with self._client.stream("GET", self._url, headers=headers) as response:
                     response.raise_for_status()
-                    yield from self._frames(response)
+                    for event in self._frames(response):
+                        delivered = True
+                        yield event
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if 400 <= status < 500 and status not in (408, 429):
+                    # A 4xx is the host saying this request will *never* work — a
+                    # mistyped target, a route not mounted. Retrying it forever is how
+                    # a broken URL becomes 43k requests a day; `Replicator.drain`
+                    # made the same call upstream (4xx stepped over, only 5xx spends
+                    # retry budget). 408 and 429 are the exceptions because retrying
+                    # is their own definition, not an assumption of ours.
+                    logger.error(
+                        "command stream from %s refused with HTTP %s; not retrying",
+                        self._url,
+                        status,
+                    )
+                    return
+                # The host is answering that it is broken (5xx, 408, 429) — transient,
+                # same as a drop.
+                logger.warning("command stream from %s answered HTTP %s", self._url, status)
             except httpx.HTTPError as exc:
-                # A drop — network, timeout, or a non-2xx from a host mid-restart — is
-                # retried, not fatal: a command issued during the gap is queued, not
-                # lost, and the cursor on reconnect skips what was already executed.
+                # A drop — network, timeout, or a host mid-restart — is transient:
+                # a command issued during the gap is queued, not lost, and the cursor
+                # on reconnect skips what was already executed.
                 logger.warning("command stream from %s dropped (%s)", self._url, exc)
-            attempts += 1
-            if self._max_reconnects is not None and attempts > self._max_reconnects:
+            # Reset only on a connection that actually delivered a command: a channel
+            # up for a day and then dropped once retries promptly, not at the ceiling.
+            # A 200 that closes before saying anything is not a success worth resetting
+            # on — otherwise a flapping host never accumulates failures and
+            # `max_reconnects` stops bounding anything.
+            if delivered:
+                failures = 0
+            failures += 1
+            if self._max_reconnects is not None and failures > self._max_reconnects:
                 return
-            time.sleep(self._reconnect_seconds)
+            # #39's backoff, not a fixed delay: growing with consecutive failures and
+            # jittered so a fleet reconnecting after a host restart does not arrive as
+            # one thundering herd. `max_attempts` is about a batch upstream and must
+            # not bound reconnects — a host down for a day is still worth reaching.
+            self._sleep_fn(backoff_delay(failures, self._budget, random_fn=self._random_fn))
 
     @staticmethod
     def _frames(response: httpx.Response) -> Iterator[StimulusEvent]:
