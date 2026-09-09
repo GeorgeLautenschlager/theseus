@@ -163,6 +163,16 @@ def test_interleaved_issue_and_consume_stays_in_order(tmp_path, serve) -> None:
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
+    # Barrier, and it is load-bearing: without it the writer usually finishes all
+    # five appends before the reader's TCP connect completes, so every command is
+    # served by the *replay* half and the test passes with the feed's live half
+    # deleted. Waiting for the replayed command proves the connection is open and
+    # replay is done, so the appends below genuinely land mid-stream.
+    for _ in range(500):
+        if executed:
+            break
+        time.sleep(0.01)
+    assert executed, "stream never delivered the replayed command"
     writer = threading.Thread(
         target=lambda: [_issue(log, n) for n in range(1, 6)], daemon=True
     )
