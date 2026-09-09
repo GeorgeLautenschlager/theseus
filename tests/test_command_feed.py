@@ -432,3 +432,139 @@ def test_mounted_route_serves_the_stream(tmp_path):
 
     routes = {route.path for route in app.routes if hasattr(route, "path")}
     assert f"/commands/{{target}}" in routes
+
+
+# --- the doorbell: ordering, bound, and worker thread -----------------------------
+
+
+def test_out_of_order_notification_still_delivered(tmp_path):
+    """The delivery is the file, not the notification. A second, ordinary listener
+    stalls inside its own callback on exactly one command — a deterministic stand-in
+    for a thread preempted between its append and its notify, which the log's docstring
+    disclaims ordering for. That stall also swallows the stream's own ring for that
+    command (listeners run in order on the appending thread), so a queue-fed,
+    running-max stream would discard it and every later reconnect would skip it. The
+    fixed stream re-reads the log on every ring and serves it anyway."""
+    rig = _rig(tmp_path, feed_kwargs={"heartbeat_seconds": 30.0, "poll_seconds": 0.02})
+    stall = threading.Event()
+
+    def stalling_listener(event):
+        # The marker lives under the command content's own payload dict.
+        if event.content.get("payload", {}).get("tag") == "A":
+            stall.wait(timeout=10.0)
+
+    # Registered *before* the stream starts, so the stream's listener sits behind it.
+    unsub_stall = rig.log.subscribe(stalling_listener)
+
+    def append_a():
+        _command(rig.log, TARGET_A, payload={"tag": "A"})
+
+    async def main():
+        stream = _Stream(rig.feed, TARGET_A)
+        frames: list[str] = []
+
+        async def pump():
+            # A background puller, never cancelled mid-frame: cancellation of
+            # __anext__ closes the generator, so the pump is stopped by the
+            # disconnect flag ending the stream (StopAsyncIteration) instead.
+            async for frame in stream.gen:
+                frames.append(frame)
+
+        task = asyncio.create_task(pump())
+        # Generators are lazy and the retry yield sits *before* subscribe, so wait
+        # until the stream's listener is actually registered before appending.
+        end = time.monotonic() + 5.0
+        while len(rig.log._listeners) < 2 and time.monotonic() < end:
+            await asyncio.sleep(0.01)
+        assert len(rig.log._listeners) == 2, "stream listener never registered"
+        blocked = threading.Thread(target=append_a, daemon=True)
+        blocked.start()
+        blocked.join(timeout=5.0)
+        # The thread is wedged in the stalling listener: A is on disk, its ring lost.
+        assert blocked.is_alive(), "stalling listener did not stall"
+        _command(rig.log, TARGET_A, payload={"tag": "B"})
+        end = time.monotonic() + 5.0
+        def served():
+            return [f for f in frames if f.startswith("id:")]
+        while len(served()) < 2 and time.monotonic() < end:
+            await asyncio.sleep(0.01)
+        assert len(served()) == 2, f"stream served {len(served())} of 2 commands"
+        stall.set()
+        blocked.join(timeout=5.0)
+        unsub_stall()
+        stream.receive.disconnected = True
+        await asyncio.wait_for(task, timeout=5.0)  # pump ends with the stream
+        return served()
+
+    try:
+        frames = asyncio.run(main())
+    finally:
+        stall.set()  # never leave a wedged append thread behind on an assert path
+    on_disk = sorted(
+        e.seq for e in rig.log.read_all() if e.type.startswith("command.")
+    )
+    b_seq = on_disk[-1]
+    assert on_disk == [b_seq - 1, b_seq]
+    assert sorted(_event_of(f).seq for f in frames) == on_disk
+
+
+def test_doorbell_backlog_is_bounded(tmp_path, monkeypatch):
+    """The doorbell is a Queue(maxsize=1) carrying no payload: a ring dropped because
+    one is already pending is harmless — the fetch after it reads the whole log above
+    the cursor. Assert on the bound, not on zero — a ring may legitimately be waiting —
+    and prove the bound was actually reached."""
+    import theseus.command_feed as cf
+
+    rig = _rig(tmp_path, feed_kwargs=FAST)
+    _command(rig.log, TARGET_A)
+    sizes: list[int] = []
+    real_ring = cf._ring
+
+    def spy(bell):
+        sizes.append(bell.qsize())  # observed before the put, so ≤ the bound's truth
+        real_ring(bell)
+
+    monkeypatch.setattr(cf, "_ring", spy)
+
+    async def main():
+        stream = _Stream(rig.feed, TARGET_A)
+        await stream.events(1)  # suspended at a yield; the bell is live beneath it
+        for _ in range(300):
+            # Non-matching events: the reader would never wake for them anyway.
+            rig.log.append(ACTOR, "observation", {"note": "noise"})
+        await stream.close()
+
+    asyncio.run(main())
+    assert sizes, "the doorbell never rang"
+    assert max(sizes) <= 1  # the bound, not zero
+    assert 1 in sizes  # and the bound was actually hit, not merely respected
+
+
+def test_connect_does_not_block_the_event_loop(tmp_path, serve):
+    """`pending` re-reads the log on every ring, so a big tape must run on a worker
+    thread (`run_in_threadpool`), never the loop — a feed mounted beside the chat UI
+    freezes every endpoint around it otherwise. A fast endpoint on the *same* app must
+    answer while a connect is replaying a few thousand events. Driven over a real
+    socket via the shared `serve` fixture; every wait is bounded by httpx timeouts."""
+    import httpx
+
+    log = StimulusLog(path=tmp_path / "host.jsonl", origin=HOST)
+    for _ in range(3000):
+        log.append(ACTOR, "observation", {"note": "bulk"})
+    feed = CommandFeed(log, **FAST)
+    app = feed.build_app()
+
+    @app.get("/ping")
+    async def ping():
+        return {"ok": True}
+
+    base = serve(app)
+    with httpx.Client(timeout=5.0) as client:
+        with client.stream("GET", f"{base}/commands/{TARGET_A}") as response:
+            assert response.status_code == 200
+            assert next(response.iter_lines()) == "retry: 2000"  # stream is live
+            start = time.monotonic()
+            pong = client.get(f"{base}/ping")
+            elapsed = time.monotonic() - start
+    assert pong.status_code == 200 and pong.json() == {"ok": True}
+    assert elapsed < 2.0, f"sibling endpoint blocked {elapsed:.2f}s during connect"
