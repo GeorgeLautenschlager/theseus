@@ -12,8 +12,7 @@ poetry run python build/test-agent/agent.py
 
 The last command starts a terminal agent and needs the configured model backend.
 Assembly and `--check` validate settings without contacting a model, constructing
-providers, starting threads, or creating runtime state. Definitions and custom
-modules are trusted Python: their top-level code executes when loaded.
+providers, starting threads, or creating runtime state. Definitions are trusted Python: their top-level code executes when loaded.
 
 ## Definitions and experiments
 
@@ -54,16 +53,37 @@ constitution = Path(__file__).with_name("CONSTITUTION.md").read_text(encoding="u
   included tools execute with the substrate's existing behavior. This is not a
   sandbox or an `allow`/`ask`/`deny` policy system.
 - `interface` is one terminal or web interface. Its reply tool is wired automatically.
-- Memory defaults to none. For OODA, `MemorySpec("amem", model=ModelSpec(...),
-  embedding=ModelSpec(...))` adds A-MEM and recall. OODA owns its existing `form()`
-  lifecycle. For auto, a custom memory factory owns its own consolidation lifecycle.
+- Memory defaults to none. Autocore accepts either `MemorySpec("amem", ...)`
+  (AgenticMemory) or `MemorySpec("module", ...)` (MemoryModule). Both wire recall
+  to the selected module and the core's stimulus log. For example:
+
+```python
+memory=MemorySpec(
+    "module",  # or "amem"
+    model=ModelSpec("ollama", "gemma4:e4b"),
+    embedding=ModelSpec("ollama", "nomic-embed-text"),
+    recall_budget_tokens=2000,
+)
+```
+
+A-MEM requires both providers. MemoryModule accepts optional providers: without
+an embedder it can still recall keyword facts and recent events. Its recall output
+respects `recall_budget_tokens`; A-MEM retains its existing retrieval settings.
+A-MEM stores notes in `a_mem.jsonl`; MemoryModule stores layers in `memory/`.
+Switching modules preserves both stores but does not migrate between them.
+
+Autocore holds the module without automatically forming or consolidating memories.
+The agent's episode/scheduling policy still calls `memory.form()` for A-MEM or
+`memory.consolidate(episode)` for MemoryModule. This assembler does not invent that
+policy. OODA supports A-MEM and retains its existing end-of-turn `form()` call;
+MemoryModule does not implement that lifecycle and is rejected with OODA.
 
 ## Reassembly and state
 
 Edit the definition and run the same assembly command. Restart the agent to use
 its new configuration. The generated `agent.py` snapshots all values, including
 identity text; the original definition and source identity files are not needed
-at runtime. Theseus and any custom Python modules still need to be installed.
+at runtime. Theseus still needs to be installed.
 
 Assembly replaces only an assembler-marked `agent.py`, using an atomic rename.
 Validation or a failed write leaves the previous launcher intact. An unrelated
@@ -85,32 +105,25 @@ against the same home. For experiments and tests, give each agent a fresh home.
 
 ## Tam
 
-`agents/tam.py` reads Tam's identity and cadence and references his existing
-`tam:TamCore` and `tam_memory:TamMemory`. Set `TAM_HOME` to those source files and
-make the modules importable (an installed package, or `PYTHONPATH` for his current
-flat repository):
+`agents/tam.py` reads Tam's identity and cadence and assembles plain Autocore.
+Set `TAM_HOME` to those source files. `TAM_MEMORY` selects `module` (the default)
+or `amem`; `TAM_MEMORY_MODEL` selects the Ollama memory model (default
+`gemma4:e4b`). Edit the definition to choose other providers or embedding models.
+No agent-specific Python modules are required.
 
 ```sh
-TAM_HOME=/path/to/tam PYTHONPATH=/path/to/tam poetry run python -m theseus.assemble \
+TAM_HOME=/path/to/tam TAM_MEMORY=module poetry run python -m theseus.assemble \
   agents/tam.py --output build/tam
-PYTHONPATH=/path/to/tam poetry run python build/tam/agent.py --check
-PYTHONPATH=/path/to/tam poetry run python build/tam/agent.py --home /path/to/test-home
+poetry run python build/tam/agent.py --check
+poetry run python build/tam/agent.py --home /path/to/test-home
 ```
 
 The first two commands do not start Tam or touch his live state. The third starts
-an isolated instance using the source configuration and web port 1337; stop any
-other listener on that port or change the definition for parallel experiments.
-To deploy, stop the existing agent and run the generated launcher against its
-existing home, with the same environment and dependencies as the existing service.
-Keep the service's PATH configured to find Tam's intended Claude executable.
-The tool does not edit or restart services.
-
-Custom auto core factories accept `name`, `home_directory`, and `tools` keyword
-arguments and behave like Autocore. Custom memory factories accept `stimulus_log`
-and `memory_dir`, provide `retrieve(query)` for recall, and may provide `start()`;
-`run()` calls it before starting the cognitive loop. Import references keep the
-snapshot portable without trying to serialize Python closures. Further custom
-configuration belongs in a small factory function in the agent's own package.
+an isolated instance using the source configuration and web port 1337; use another
+port for parallel experiments. To deploy, stop the existing agent and run the
+launcher against its existing home, with the configured providers available in
+the service environment. The tool does not edit or restart services. Memory
+consolidation is configured separately as described above.
 
 ## Tests without a service
 

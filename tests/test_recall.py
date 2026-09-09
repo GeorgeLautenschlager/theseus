@@ -110,3 +110,36 @@ def test_recall_against_a_real_memory_store(tmp_path):
     assert not result.is_error
     assert "George prefers tea." in result.content
     assert "[n1]" in result.content
+
+
+def test_layered_recall_reports_empty_and_budgeted_results(tmp_path):
+    from theseus.knowledge_layer import KnowledgeRecord
+    from theseus.memory_module import MemoryModule
+    from theseus.stimulus_log import StimulusLog
+
+    memory = MemoryModule(tmp_path / "memory", StimulusLog(tmp_path / "log.jsonl"))
+    tool = RecallTool(memory, budget_tokens=50)
+    empty = tool.execute("coffee")
+    assert not empty.is_error
+    assert empty.details["found"] is False
+    assert "embedding unavailable" in empty.details["misses"]
+    memory.knowledge.add(KnowledgeRecord(
+        id="coffee", ts=datetime.now(timezone.utc), subject="coffee",
+        predicate="preference", value="black",
+    ))
+    result = tool.execute("coffee")
+    assert result.details["found"] is True
+    assert "black" in result.content
+    assert result.details["total_tokens"] <= 50
+    too_small = RecallTool(memory, budget_tokens=1).execute("coffee")
+    assert too_small.details["found"] is False
+
+
+def test_layered_recall_failure_is_a_tool_error():
+    class UnavailableMemory:
+        def recall(self, query, budget_tokens):
+            raise RuntimeError("storage unavailable")
+
+    result = RecallTool(UnavailableMemory()).execute("anything")
+    assert result.is_error
+    assert "storage unavailable" in result.content

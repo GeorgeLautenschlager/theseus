@@ -9,6 +9,7 @@ from time import monotonic
 from typing import Any, Callable, Dict, List, Tuple
 from uuid import uuid4
 
+from theseus.memory import Memory
 from theseus.cadence import DEFAULT_TICK_SECONDS, Cadence
 from theseus.cognitive_prompts import render_tools_section
 from theseus.context_assembler import ContextAssembler
@@ -123,7 +124,7 @@ class Autocore:
         name: str,
         home_directory: Path,
         tools: Dict[str, Tool], #TODO: why not pull this from config as well?
-        memory: MemoryModule | None = None,
+        memory: Memory | MemoryModule | None = None,
         wake_on: Callable[[StimulusEvent], bool] | None = None,
     ):
         self.name: str = name
@@ -132,7 +133,7 @@ class Autocore:
             str(self.home_directory / "stimulus_log.jsonl")
         )
         self.tools: dict[str, Tool] = tools
-        self.memory: MemoryModule | None = memory
+        self.memory: Memory | MemoryModule | None = memory
         self.context_assembler: ContextAssembler = ContextAssembler(
             stimulus_log=self.stimulus_log
         )

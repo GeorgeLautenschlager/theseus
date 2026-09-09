@@ -1,6 +1,6 @@
-"""Assemble Tam using his separately installed local integration modules.
+"""Assemble Tam with Autocore and a built-in memory module.
 
-Set TAM_HOME for identity/cadence inputs and make tam + tam_memory importable.
+Set TAM_HOME for identity/cadence inputs; TAM_MEMORY selects module or amem.
 The generated agent snapshots identity/cadence; it never copies runtime state.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ SPEC = AgentSpec(
     name="Tam",
     constitution=(source_home / "CONSTITUTION.md").read_text(encoding="utf-8"),
     persona=(source_home / "PERSONA.md").read_text(encoding="utf-8"),
-    core_factory="tam:TamCore",
+    core="auto",
     models=tuple(
         ModelSpec(
             rule.provider_key, rule.model,
@@ -35,7 +35,9 @@ SPEC = AgentSpec(
     ),
     tools=tuple(all_tools()),
     memory=MemorySpec(
-        kind="custom", factory="tam_memory:TamMemory",
+        kind=os.environ.get("TAM_MEMORY", "module"),
+        model=ModelSpec("ollama", os.environ.get("TAM_MEMORY_MODEL", "gemma4:e4b")),
+        embedding=ModelSpec("ollama", "nomic-embed-text"),
         recall_description=RecallTool.description + (
             " Use a focused query about the specific agreement or event; "
             "if results are unrelated, retry with different terms."

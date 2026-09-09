@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
-import inspect
 import logging
 import os
 from pathlib import Path
@@ -12,13 +10,13 @@ import runpy
 import tempfile
 import threading
 from dataclasses import dataclass, field
-from typing import Callable
 
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.cadence import Cadence
 from theseus.chat_observer import TerminalChatObserver
 from theseus.context_assembler import ContextAssembler
+from theseus.memory_module import MemoryModule
 from theseus.memory_store import MemoryStore
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.ooda_core import OODACore
@@ -43,11 +41,11 @@ class ModelSpec:
 
 @dataclass(frozen=True)
 class MemorySpec:
-    # A-MEM is for OODA (which calls form); custom memory owns its own lifecycle.
+    # Autocore holds either module; consolidation remains an explicit agent policy.
     kind: str = "none"
     model: ModelSpec | None = None
     embedding: ModelSpec | None = None
-    factory: str | None = None  # importable module:callable, accepts log and directory
+    recall_budget_tokens: int = 2000
     recall_description: str | None = None
 
 
@@ -69,7 +67,6 @@ class AgentSpec:
     memory: MemorySpec = field(default_factory=MemorySpec)
     interface: InterfaceSpec = field(default_factory=InterfaceSpec)
     window_size: int = 200
-    core_factory: str | None = None  # custom Autocore-compatible class, module:class
 
     def validate(self) -> None:
         for label, value in (("name", self.name), ("constitution", self.constitution)):
@@ -110,36 +107,26 @@ class AgentSpec:
             raise ValueError("interface host must be nonempty text")
         if type(self.interface.port) is not int or not 1 <= self.interface.port <= 65535:
             raise ValueError("interface port must be between 1 and 65535")
-        if self.core_factory:
-            if self.core != "auto":
-                raise ValueError("core_factory is supported for auto only")
-            inspect.signature(_factory(self.core_factory)).bind(
-                name=self.name, home_directory=Path("."), tools={}
-            )
         if not isinstance(self.memory, MemorySpec):
             raise ValueError("memory must be a MemorySpec")
         memory = self.memory
-        if memory.kind not in ("none", "amem", "custom"):
-            raise ValueError("memory kind must be 'none', 'amem', or 'custom'")
+        if memory.kind not in ("none", "amem", "module"):
+            raise ValueError("memory kind must be 'none', 'amem', or 'module'")
+        if type(memory.recall_budget_tokens) is not int or memory.recall_budget_tokens <= 0:
+            raise ValueError("recall_budget_tokens must be a positive integer")
         if memory.recall_description is not None and not isinstance(memory.recall_description, str):
             raise ValueError("recall_description must be text")
         if memory.kind == "amem":
-            if self.core != "ooda":
-                raise ValueError("amem requires OODA's memory formation lifecycle")
             _validate_model(memory.model)
             _validate_model(memory.embedding)
-            if memory.factory is not None:
-                raise ValueError("amem does not accept a custom factory")
-        elif memory.kind == "custom":
+        elif memory.kind == "module":
             if self.core != "auto":
-                raise ValueError("custom memory is supported for auto only")
-            inspect.signature(_factory(memory.factory)).bind(
-                stimulus_log=None, memory_dir=Path("memory")
-            )
-            if memory.model is not None or memory.embedding is not None:
-                raise ValueError("custom memory configures its providers in its factory")
+                raise ValueError("MemoryModule requires auto; it does not implement OODA's form() lifecycle")
+            for model in (memory.model, memory.embedding):
+                if model is not None:
+                    _validate_model(model)
         elif any(value is not None for value in (
-            memory.factory, memory.model, memory.embedding, memory.recall_description
+            memory.model, memory.embedding, memory.recall_description
         )):
             raise ValueError("memory kind 'none' does not accept memory options")
 
@@ -165,16 +152,6 @@ def _validate_model(model: ModelSpec | None) -> None:
         raise ValueError("during must be a time window such as '08:00-22:00'")
 
 
-def _factory(reference: str | None) -> Callable:
-    if not isinstance(reference, str) or reference.count(":") != 1:
-        raise ValueError("Factory must be an importable 'module:callable' reference")
-    module, name = reference.split(":")
-    factory = getattr(importlib.import_module(module), name)
-    if not callable(factory):
-        raise ValueError(f"Factory {reference!r} is not callable")
-    return factory
-
-
 def _provider(spec: ModelSpec):
     return PROVIDER_REGISTRY[spec.provider](model=spec.model)
 
@@ -186,8 +163,6 @@ class AssembledAgent:
     spec: AgentSpec
 
     def run(self) -> None:
-        if self.core.memory is not None and hasattr(self.core.memory, "start"):
-            self.core.memory.start()
         if self.spec.core == "auto":
             threading.Thread(target=self.core.loop, name="agent-core", daemon=True).start()
         if self.spec.interface.kind == "web":
@@ -217,8 +192,7 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
         _atomic_write(home / name, content)
     tools = {name: tool for name, tool in all_tools(cwd=home).items() if name in spec.tools}
     if spec.core == "auto":
-        factory = _factory(spec.core_factory) if spec.core_factory else Autocore
-        core = factory(name=spec.name, home_directory=home, tools=tools)
+        core = Autocore(name=spec.name, home_directory=home, tools=tools)
         core.context_assembler.window_size = spec.window_size
     else:
         log = StimulusLog(home / "stimulus_log.jsonl")
@@ -235,12 +209,14 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
             embedding_providers=[_provider(spec.memory.embedding)],
             store=MemoryStore(home / "a_mem.jsonl"), stimulus_log=core.stimulus_log,
         )
-    elif spec.memory.kind == "custom":
-        core.memory = _factory(spec.memory.factory)(
+    elif spec.memory.kind == "module":
+        core.memory = MemoryModule(
             stimulus_log=core.stimulus_log, memory_dir=home / "memory",
+            model_providers=[_provider(spec.memory.model)] if spec.memory.model else [],
+            embedding_providers=[_provider(spec.memory.embedding)] if spec.memory.embedding else [],
         )
     if core.memory is not None:
-        recall = RecallTool(core.memory)
+        recall = RecallTool(core.memory, budget_tokens=spec.memory.recall_budget_tokens)
         if spec.memory.recall_description is not None:
             recall.description = spec.memory.recall_description
         core.tools[recall.name] = recall

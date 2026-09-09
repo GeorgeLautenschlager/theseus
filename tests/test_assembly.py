@@ -111,8 +111,8 @@ def test_isolated_agent_completes_real_cognitive_turn(tmp_path, monkeypatch, cap
     ({"core": "auto", "models": (ModelSpec("ollama", "x", during="99:00-00:00"), ModelSpec("ollama", "y"))}, "Invalid cadence"),
     ({"core": "auto", "models": (ModelSpec("ollama", "x"), ModelSpec("ollama", "y"))}, "exactly one default"),
     ({"memory": MemorySpec("amem")}, "ModelSpec"),
-    ({"core": "auto", "memory": MemorySpec("amem")}, "requires OODA"),
-    ({"core": "auto", "core_factory": "theseus.auto_core:Missing"}, "Missing"),
+    ({"memory": MemorySpec("module")}, "requires auto"),
+    ({"memory": MemorySpec(recall_budget_tokens=0)}, "recall_budget_tokens"),
 ])
 def test_invalid_reassembly_keeps_previous_output(tmp_path, changes, message):
     launcher = assemble(spec(), tmp_path)
@@ -162,10 +162,11 @@ def test_auto_web_wiring_and_cadence(tmp_path):
     assert (tmp_path / "SCHEDULE.md").exists()
 
 
-def test_amem_wires_recall_to_same_persistent_store(tmp_path):
+@pytest.mark.parametrize("core", ["auto", "ooda"])
+def test_amem_wires_recall_to_same_persistent_store(tmp_path, core):
     memory = MemorySpec("amem", model=ModelSpec("ollama", "test"),
                         embedding=ModelSpec("ollama", "nomic-embed-text"))
-    agent = build_agent(spec(memory=memory), tmp_path)
+    agent = build_agent(spec(core=core, memory=memory), tmp_path)
     assert agent.core.tools["recall"].memory is agent.core.memory
     assert agent.core.memory.store.path == tmp_path / "a_mem.jsonl"
 
@@ -178,41 +179,50 @@ def test_example_variant_reuses_defaults():
     assert variant.name != base.name
 
 
-def test_custom_tam_style_parts_receive_isolated_home_without_starting(tmp_path, monkeypatch):
-    import types
+def test_memory_module_recalls_persisted_fact_after_reassembly(tmp_path):
+    from datetime import datetime, timezone
     from theseus.auto_core import Autocore
+    from theseus.knowledge_layer import KnowledgeRecord
+    from theseus.memory_module import MemoryModule
 
-    module = types.ModuleType("assembly_test_parts")
-
-    class LocalCore(Autocore):
-        pass
-
-    class LocalMemory:
-        def __init__(self, stimulus_log, memory_dir):
-            self.log = stimulus_log
-            self.directory = memory_dir
-            self.started = False
-
-        def start(self):
-            self.started = True
-
-        def retrieve(self, query):
-            return "A remembered fact"
-
-    module.LocalCore = LocalCore
-    module.LocalMemory = LocalMemory
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    definition = spec(
-        core="auto", core_factory="assembly_test_parts:LocalCore",
-        memory=MemorySpec("custom", factory="assembly_test_parts:LocalMemory"),
-    )
+    definition = spec(core="auto", memory=MemorySpec("module", recall_budget_tokens=100))
     launcher = assemble(definition, tmp_path / "build")
-    agent = build_agent(runpy.run_path(str(launcher))["SPEC"], tmp_path / "state")
-    assert isinstance(agent.core, LocalCore)
-    assert agent.core.memory.log is agent.core.stimulus_log
-    assert agent.core.memory.directory == tmp_path / "state/memory"
-    assert not agent.core.memory.started
-    assert agent.core.tools["recall"].execute("a fact").content == "A remembered fact"
+    home = tmp_path / "state"
+    agent = build_agent(runpy.run_path(str(launcher))["SPEC"], home)
+    assert type(agent.core) is Autocore
+    assert isinstance(agent.core.memory, MemoryModule)
+    assert agent.core.tools["recall"].memory is agent.core.memory
+    agent.core.memory.knowledge.add(KnowledgeRecord(
+        id="fact-1", ts=datetime.now(timezone.utc),
+        subject="George", predicate="preferred drink", value="coffee",
+    ))
+    assemble(replace(definition, name="New name"), tmp_path / "build")
+    rebuilt = build_agent(runpy.run_path(str(launcher))["SPEC"], home)
+    result = rebuilt.core.tools["recall"].execute("George drink")
+    assert not result.is_error
+    assert result.details["found"]
+    assert "coffee" in result.content
+    assert result.details["total_tokens"] <= 100
+    assert rebuilt.core.memory._stimulus_log is rebuilt.core.stimulus_log
+
+
+@pytest.mark.parametrize("kind", ["amem", "module"])
+def test_tam_example_uses_plain_autocore_with_selected_memory(tmp_path, monkeypatch, kind):
+    from theseus.agentic_memory import AgenticMemory
+    from theseus.auto_core import Autocore
+    from theseus.memory_module import MemoryModule
+
+    for name, text in (("CONSTITUTION.md", "Tam identity"), ("PERSONA.md", "Tam persona"),
+                       ("CADENCE.md", "- default: ollama test, context 32k")):
+        (tmp_path / name).write_text(text)
+    monkeypatch.setenv("TAM_HOME", str(tmp_path))
+    monkeypatch.setenv("TAM_MEMORY", kind)
+    definition = runpy.run_path(str(ROOT / "agents/tam.py"))["SPEC"]
+    launcher = assemble(definition, tmp_path / "build")
+    agent = build_agent(runpy.run_path(str(launcher))["SPEC"], tmp_path / "isolated")
+    assert type(agent.core) is Autocore
+    assert isinstance(agent.core.memory, AgenticMemory if kind == "amem" else MemoryModule)
+    assert agent.core.tools["recall"].memory is agent.core.memory
 
 
 def test_generated_agent_boots_as_separate_process(tmp_path):
