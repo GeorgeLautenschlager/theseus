@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 from starlette.requests import Request
 
-from theseus.command_feed import CommandFeed
+from theseus.command_feed import CommandFeed, _format_sse
 from theseus.commands import command_content, command_type
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 
@@ -568,3 +568,23 @@ def test_connect_does_not_block_the_event_loop(tmp_path, serve):
             elapsed = time.monotonic() - start
     assert pong.status_code == 200 and pong.json() == {"ok": True}
     assert elapsed < 2.0, f"sibling endpoint blocked {elapsed:.2f}s during connect"
+
+
+def test_event_type_newline_cannot_inject_frames(tmp_path):
+    """The feed serves the log, and the log does not validate `type` — a crafted type
+    with newlines could forge extra `event:`/`data:` lines, i.e. commands the host
+    never issued. Framing is the last place that can guarantee the wire is
+    well-formed, so the `event:` field must carry no CR/LF."""
+    rig = _rig(tmp_path)
+    evil = rig.log.append(
+        ACTOR, "command.say\nevent: command.rm\ndata: {\"injected\": true}\n",
+        command_content(target=TARGET_A, payload={}),
+    )
+    frame = _format_sse(evil)
+    event_lines = [line for line in frame.splitlines() if line.startswith("event: ")]
+    # A clean frame carries exactly one event: line, on a single line.
+    assert event_lines == [f"event: {evil.type.replace(chr(10), '').replace(chr(13), '')}"]
+    # And the frame parses back to exactly one event — the injected rm never appears.
+    data_lines = [line for line in frame.splitlines() if line.startswith("data: ")]
+    parsed = StimulusEvent.from_json("\n".join(line[len("data: ") :] for line in data_lines))
+    assert parsed.type == evil.type

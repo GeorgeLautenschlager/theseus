@@ -213,4 +213,10 @@ def _format_sse(event: StimulusEvent) -> str:
     lines = event.to_json().splitlines() or [""]
     payload = "\n".join(f"data: {line}" for line in lines)
     id_line = "" if event.seq is None else f"id: {event.seq}\n"
-    return f"{id_line}event: {event.type}\n{payload}\n\n"
+    # Strip CR/LF from the type: the feed serves the log, not `command_type`'s output,
+    # and the log does not validate types — a crafted type with a newline could forge
+    # extra `event:`/`data:` lines, i.e. commands the surrogate never saw issued.
+    # `command_type` refusing whitespace is not sufficient here; this framing function
+    # is the last place that can guarantee the wire is well-formed.
+    event_type = event.type.replace("\r", "").replace("\n", "")
+    return f"{id_line}event: {event_type}\n{payload}\n\n"

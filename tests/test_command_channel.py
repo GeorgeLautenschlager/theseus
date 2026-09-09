@@ -609,3 +609,122 @@ def test_sse_channel_satisfies_the_protocol(tmp_path) -> None:
     assert isinstance(
         SseCommandChannel("http://host/commands/tam", _cursor(tmp_path)), CommandChannel
     )
+
+
+class _HangingHost:
+    """A fake host whose one connection blocks on `release` — the injected-client
+    shape: nothing the channel owns can break the read, so only the stop signal can
+    end the stream."""
+
+    def __init__(self) -> None:
+        self.connects = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def stream(self, *args, **kwargs):
+        self.connects += 1
+        return self
+
+    def __enter__(self):
+        self.entered.set()
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def iter_lines(self):
+        self.release.wait(timeout=5.0)
+        return iter([])
+
+
+def test_close_ends_injected_client_stream_by_returning(tmp_path) -> None:
+    """With a client the channel does not own, close() cannot work by closing
+    anything — the stop signal is the only thing that ends the stream, and it must
+    end it by returning, never by raising out of the generator."""
+    host = _HangingHost()
+    channel = SseCommandChannel(
+        "http://host/commands/tam", _cursor(tmp_path), client=host,  # type: ignore[arg-type]
+        budget=FAST_BUDGET,
+    )
+    outcome: list[BaseException | None] = [None]
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            for _ in channel.stream():
+                pass
+        except BaseException as exc:  # noqa: BLE001 — the test asserts on exactly this
+            outcome[0] = exc
+        done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    assert host.entered.wait(5.0), "stream never connected"
+    channel.close()
+    host.release.set()
+    assert done.wait(5.0), "stream did not end after close()"
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert outcome[0] is None, f"stream ended by raising: {outcome[0]!r}"
+    assert host.connects == 1, "stream reconnected after close()"
+
+
+def test_close_ends_owned_client_stream_by_returning(tmp_path, serve) -> None:
+    """With an owned client the old behaviour made the stream *raise* — the closed
+    client's read failed as an HTTPError, the loop treated it as transient and slept a
+    full backoff before reconnecting onto a closed client. The stop signal must end
+    it instead, promptly and by returning, on both sides of the backoff."""
+    sleeps: list[float] = []
+
+    async def dropping(scope, receive, send) -> None:
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b""})
+
+    base = serve(dropping)
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", _cursor(tmp_path),
+        budget=RetryBudget(base_seconds=30.0, multiplier=1.0, jitter=0.0),
+        # Record AND really sleep: the slices are the mechanism under test, and a
+        # recording-only sleep_fn would let the loop burn the whole backoff before
+        # close() could land between slices.
+        sleep_fn=lambda s: (sleeps.append(s), time.sleep(s))[1],
+    )
+    outcome: list[BaseException | None] = [None]
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            for _ in channel.stream():
+                pass
+        except BaseException as exc:  # noqa: BLE001 — the test asserts on exactly this
+            outcome[0] = exc
+        done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    # Wait until the connection has dropped and the (30s) backoff has begun, so the
+    # close() lands mid-backoff: the sleep must be interrupted, not slept through.
+    deadline = time.monotonic() + 5.0
+    while not sleeps and time.monotonic() < deadline:
+        time.sleep(0.01)
+    channel.close()
+    assert done.wait(5.0), "stream did not end promptly after close() mid-backoff"
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert outcome[0] is None, f"stream ended by raising: {outcome[0]!r}"
+    assert len(sleeps) == 1, "stream reconnected after close()"
+
+
+def test_sse_channel_satisfies_the_protocol(tmp_path) -> None:
+    """`close()` is on the protocol because every caller needs it to shut down; both
+    implementations must satisfy the runtime check without callers noticing."""
+    assert isinstance(
+        SseCommandChannel(
+            "http://host/commands/tam", _cursor(tmp_path),
+            client=_HangingHost(),  # type: ignore[arg-type]
+        ),
+        CommandChannel,
+    )

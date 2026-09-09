@@ -82,6 +82,11 @@ def command_target(event: StimulusEvent) -> str | None:
     # author) can carry a "target" key that must never read back as a command's.
     if not is_command(event):
         return None
+    # Non-dict content happens: `from_json` does not check the shape, so a log line
+    # whose content is a list reaches here as a command by prefix alone — and a feed
+    # that raises while filtering stops serving (see the module docstring).
+    if not isinstance(event.content, dict):
+        return None
     target = event.content.get("target")
     # An empty string is not a surrogate name; a corrupted log line must read back as
     # unaddressed, never as "for surrogate ''".

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 import time
 from collections.abc import Callable, Iterator
 
@@ -72,9 +73,22 @@ class SseCommandChannel:
             timeout=httpx.Timeout(60.0, connect=10.0), follow_redirects=False
         )
         self._own_client = client is None
+        # Set by close(), checked by stream(): the one stop signal that works no
+        # matter who owns the client.
+        self._stop = threading.Event()
 
     def close(self) -> None:
-        """End the channel; an in-progress `stream()` ends on the next read."""
+        """End the channel; an in-progress `stream()` returns promptly.
+
+        The stop signal is what ends the stream, on either client ownership — an
+        injected client belongs to its owner and must not be closed from here, so
+        closing the client alone could never stop a shared-client stream (and would
+        make an owned-client stream *raise* out of the generator rather than return,
+        since the next read fails on a closed client). The owned client, if any, is
+        closed only after the signal, so an in-flight read fails fast into an
+        already-stopping loop.
+        """
+        self._stop.set()
         if self._own_client:
             self._client.close()
 
@@ -87,7 +101,7 @@ class SseCommandChannel:
         of what a connection delivered, and only the first is correct.
         """
         failures = 0
-        while True:
+        while not self._stop.is_set():
             headers: dict[str, str] = {}
             acked = self._cursor.acked_seq
             # Absent header, not `0`: a never-advanced cursor is "no position", and
@@ -142,7 +156,13 @@ class SseCommandChannel:
             # jittered so a fleet reconnecting after a host restart does not arrive as
             # one thundering herd. `max_attempts` is about a batch upstream and must
             # not bound reconnects — a host down for a day is still worth reaching.
-            self._sleep_fn(backoff_delay(failures, self._budget, random_fn=self._random_fn))
+            # Slept in slices so close() interrupts the wait instead of sleeping
+            # through a backoff that only grows.
+            remaining = backoff_delay(failures, self._budget, random_fn=self._random_fn)
+            while remaining > 0 and not self._stop.is_set():
+                slice_ = min(remaining, 0.05)
+                self._sleep_fn(slice_)
+                remaining -= slice_
 
     @staticmethod
     def _frames(response: httpx.Response) -> Iterator[StimulusEvent]:

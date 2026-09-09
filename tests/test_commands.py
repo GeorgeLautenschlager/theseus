@@ -73,3 +73,8 @@ def test_malformed_command_yields_none():
     assert command_target(missing) is None
     assert command_target(not_a_string) is None
     assert command_target(empty) is None
+    # Non-dict content: `from_json` does not check the shape, so a log line like this
+    # reaches command_target by type prefix alone — a feed that raises on it stops
+    # serving (and dies mid-body, after `retry:` went out). It must read as malformed.
+    a_list = _event(command_type("say"), ["target", "tam"])
+    assert command_target(a_list) is None

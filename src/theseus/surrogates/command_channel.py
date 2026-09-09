@@ -47,6 +47,16 @@ class CommandChannel(Protocol):
         """
         ...
 
+    def close(self) -> None:
+        """End the channel: an in-progress `stream()` returns promptly.
+
+        Part of the protocol, not an implementation detail: shutting a live stream
+        down is something every caller needs (host Ctrl+C, surrogate shutdown), and a
+        transport that cannot stop its own stream leaves the caller holding a thread
+        that runs forever. Safe to call from another thread and more than once.
+        """
+        ...
+
 
 class MemoryCommandChannel:
     """An in-process channel: commands handed to `offer` are yielded by `stream`.
