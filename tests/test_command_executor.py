@@ -222,3 +222,33 @@ def test_run_over_empty_doorbell_returns_immediately(tmp_path):
 
     assert log.read_all() == []
     assert cursor.acked_seq is None
+
+
+# --- the composer surface (issue #35, Task 4) ------------------------------------
+
+
+def test_composer_surface_exported_from_root():
+    import theseus
+
+    from theseus.command_reports import (
+        BargedIn as R_BargedIn,
+        Executed as R_Executed,
+        Failed as R_Failed,
+        Partial as R_Partial,
+        is_report as R_is_report,
+        report_outcome as R_report_outcome,
+    )
+    from theseus.surrogates.command_executor import CommandExecutor as R_CommandExecutor
+
+    pairs = (
+        ("CommandExecutor", theseus.CommandExecutor, R_CommandExecutor),
+        ("Executed", theseus.Executed, R_Executed),
+        ("Partial", theseus.Partial, R_Partial),
+        ("BargedIn", theseus.BargedIn, R_BargedIn),
+        ("Failed", theseus.Failed, R_Failed),
+        ("is_report", theseus.is_report, R_is_report),
+        ("report_outcome", theseus.report_outcome, R_report_outcome),
+    )
+    for name, exported, defined in pairs:
+        assert exported is defined, f"theseus.{name} is not the object its module defines"
+        assert name in theseus.__all__, f"{name} missing from theseus.__all__"
