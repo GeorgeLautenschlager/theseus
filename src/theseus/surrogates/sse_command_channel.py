@@ -52,6 +52,7 @@ class SseCommandChannel:
         budget: RetryBudget = RetryBudget(),
         random_fn: Callable[[], float] = random.random,
         sleep_fn: Callable[[float], None] = time.sleep,
+        now_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         self._url = url
         self._cursor = cursor
@@ -59,6 +60,7 @@ class SseCommandChannel:
         self._budget = budget
         self._random_fn = random_fn
         self._sleep_fn = sleep_fn
+        self._now_fn = now_fn
         # The read timeout must outlast the host's heartbeat gap (20s by default) or an
         # idle-but-healthy connection would be dropped and reopened on a loop. 60s of
         # silence still reconnects — recoverable, the cursor resumes — and a host that
@@ -92,12 +94,12 @@ class SseCommandChannel:
             # sending 0 would claim the surrogate has executed everything below 1.
             if acked is not None:
                 headers["last-event-id"] = str(acked)
-            delivered = False
+            opened_at: float | None = None
             try:
                 with self._client.stream("GET", self._url, headers=headers) as response:
                     response.raise_for_status()
+                    opened_at = self._now_fn()
                     for event in self._frames(response):
-                        delivered = True
                         yield event
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
@@ -122,12 +124,16 @@ class SseCommandChannel:
                 # a command issued during the gap is queued, not lost, and the cursor
                 # on reconnect skips what was already executed.
                 logger.warning("command stream from %s dropped (%s)", self._url, exc)
-            # Reset only on a connection that actually delivered a command: a channel
-            # up for a day and then dropped once retries promptly, not at the ceiling.
-            # A 200 that closes before saying anything is not a success worth resetting
-            # on — otherwise a flapping host never accumulates failures and
-            # `max_reconnects` stops bounding anything.
-            if delivered:
+            # Reset on a connection that *lasted*, not one that delivered. "Reset
+            # when we got a command" is the intuitive wrong answer here: hours of
+            # silence is the normal case for a command channel, not a symptom — an
+            # idle connection is exactly what it is supposed to be, which is why the
+            # host heartbeats. What a flapping host does is close immediately, so the
+            # threshold is `budget.base_seconds`: a connection that survived longer
+            # than the shortest retry delay was a real connection, while a 200 that
+            # closes before saying anything does not clear it and `max_reconnects`
+            # still bounds the flapping.
+            if opened_at is not None and self._now_fn() - opened_at > self._budget.base_seconds:
                 failures = 0
             failures += 1
             if self._max_reconnects is not None and failures > self._max_reconnects:

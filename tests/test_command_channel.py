@@ -498,9 +498,9 @@ def test_sse_backoff_grows_with_consecutive_failures_and_resets_on_success(tmp_p
 
 
 def test_backoff_resets_after_a_successful_connection(tmp_path) -> None:
-    """Two drops, then a connection that actually delivers, then a drop: the last delay
-    is the *first-attempt* delay again, not the grown one — a channel that has been up
-    does not owe the ceiling."""
+    """Two drops, then a connection that delivers and stays open past the threshold
+    before dropping: the last delay is the *first-attempt* delay again, not the grown
+    one — a channel that has been up does not owe the ceiling."""
     request = httpx.Request("GET", "http://host/commands/tam")
 
     class _FlakyHost:
@@ -535,6 +535,10 @@ def test_backoff_resets_after_a_successful_connection(tmp_path) -> None:
         "http://host/commands/tam", _cursor(tmp_path),
         client=_FlakyHost(),  # type: ignore[arg-type]
         budget=FAST_BUDGET, random_fn=lambda: 0.5, sleep_fn=sleeps.append,
+        # Only the delivering connection is opened (drops fail at connect), so the
+        # fake clock only needs an open time and a later close time: 4s of contact,
+        # far past FAST_BUDGET's 0.01s threshold.
+        now_fn=iter([1.0, 5.0]).__next__,
         max_reconnects=3,
     )
     got: list[StimulusEvent] = []
@@ -557,8 +561,58 @@ def test_backoff_resets_after_a_successful_connection(tmp_path) -> None:
     assert not thread.is_alive(), "stream thread did not end after close()"
 
     assert [e.seq for e in got] == [1]
-    # Two drops at attempts 1–2, the delivering connection resets the count, then the
+    # Two drops at attempts 1–2, the lasting connection resets the count, then the
     # post-drop retries start over at the first-attempt delay and grow to the stop.
+    assert sleeps == [0.01, 0.02, 0.01, 0.02, 0.04]
+
+
+def test_backoff_resets_on_a_healthy_silent_connection(tmp_path) -> None:
+    """The finding: hours of silence is the *normal* case for a command channel, so a
+    connection that stayed open but delivered nothing must still reset the backoff.
+    Pins the lasted-not-spoke rule directly, so a delivery-based reset cannot return
+    without this failing."""
+    request = httpx.Request("GET", "http://host/commands/tam")
+
+    class _SilentThenFlaky:
+        def __init__(self) -> None:
+            # Two drops, then a connection that opens, says nothing, and is dropped by
+            # a proxy/NAT timeout, then drops until `max_reconnects` is spent.
+            self.script: list[str] = ["drop", "drop", "silent", "drop", "drop", "drop"]
+
+        def stream(self, method, url, headers=None):
+            what = self.script.pop(0) if self.script else "drop"
+
+            class _Ctx:
+                def __enter__(self):
+                    if what == "drop":
+                        raise httpx.ConnectError("no route", request=request)
+                    return self
+
+                def __exit__(self, *args) -> None:
+                    return None
+
+                def raise_for_status(self) -> None:
+                    pass
+
+                def iter_lines(self):
+                    return iter([])  # heartbeats consumed upstream; nothing to yield
+
+            return _Ctx()
+
+    sleeps: list[float] = []
+    channel = SseCommandChannel(
+        "http://host/commands/tam", _cursor(tmp_path),
+        client=_SilentThenFlaky(),  # type: ignore[arg-type]
+        budget=FAST_BUDGET, random_fn=lambda: 0.5, sleep_fn=sleeps.append,
+        # Same fake clock as above: only the silent connection opens.
+        now_fn=iter([1.0, 5.0]).__next__,
+        max_reconnects=3,
+    )
+    got = list(channel.stream())
+
+    assert got == []
+    # Without the reset on the silent connection, the delays would grow to the ceiling:
+    # [0.01, 0.02, 0.04]. With it, the post-drop retries restart at the first attempt.
     assert sleeps == [0.01, 0.02, 0.01, 0.02, 0.04]
 
 
