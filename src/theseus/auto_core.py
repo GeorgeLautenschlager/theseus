@@ -12,6 +12,7 @@ from uuid import uuid4
 from theseus.cadence import DEFAULT_TICK_SECONDS, Cadence
 from theseus.cognitive_prompts import render_tools_section
 from theseus.context_assembler import ContextAssembler
+from theseus.memory_module import MemoryModule
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.model_providers.model_provider import ModelProvider
 from theseus.schedule import Schedule
@@ -107,6 +108,10 @@ class Autocore:
         home_directory: where the log, config and identity files live. Created and
             seeded on construction.
         tools: the tools the model may call, keyed by name.
+        memory: Optional memory module, held as a slot for whoever composes this core.
+            Autocore never calls `consolidate()` itself: an autonomous core owns no
+            consolidation cadence of its own, so consolidation is scheduled at agent
+            assembly time (a SCHEDULE.md task, say), not built into the loop.
         wake_on: predicate deciding which appended events cut a sleep short. Defaults to
             "anything this core did not write itself". Pass something narrower (say
             `lambda event: event.type == "chat_message"`) to be woken only by
@@ -118,6 +123,7 @@ class Autocore:
         name: str,
         home_directory: Path,
         tools: Dict[str, Tool], #TODO: why not pull this from config as well?
+        memory: MemoryModule | None = None,
         wake_on: Callable[[StimulusEvent], bool] | None = None,
     ):
         self.name: str = name
@@ -126,6 +132,7 @@ class Autocore:
             str(self.home_directory / "stimulus_log.jsonl")
         )
         self.tools: dict[str, Tool] = tools
+        self.memory: MemoryModule | None = memory
         self.context_assembler: ContextAssembler = ContextAssembler(
             stimulus_log=self.stimulus_log
         )
