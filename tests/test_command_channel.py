@@ -1,15 +1,21 @@
-"""Tests for the CommandChannel seam (issue #34, Task 2)."""
+"""Tests for the CommandChannel seam (issue #34, Tasks 2 and 4)."""
 
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timezone
 
+import httpx
 import pytest
+import uvicorn
 
+from theseus.command_feed import CommandFeed, _format_sse
 from theseus.commands import command_content, command_type
-from theseus.stimulus_log import StimulusEvent
+from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.surrogates.command_channel import CommandChannel, MemoryCommandChannel
+from theseus.surrogates.cursor import AckedCursor
+from theseus.surrogates.sse_command_channel import SseCommandChannel
 
 
 def _command(verb: str, n: int) -> StimulusEvent:
@@ -124,3 +130,304 @@ def test_offer_after_close_raises() -> None:
     ch.close()
     with pytest.raises(RuntimeError):
         ch.offer(_command("say", 1))
+
+
+# --- the SSE transport (Task 4) ---------------------------------------------------
+
+HOST = "host"
+ACTOR = "george"
+
+# Fast enough that idle-path tests stay under a second; deadline asserts bound them
+# independently.
+FAST = {"heartbeat_seconds": 0.05, "poll_seconds": 0.01}
+
+
+def _command(target: str, n: int) -> StimulusEvent:
+    """A host-issued command carrying seq `n` — what the wire would carry."""
+    return StimulusEvent(
+        id=f"cmd-{n}",
+        ts=datetime.now(timezone.utc),
+        actor=ACTOR,
+        type=command_type("say"),
+        content=command_content(target=target, payload={"n": n}),
+        seq=n,
+    )
+
+
+def _log_command(log: StimulusLog, target: str, n: int) -> StimulusEvent:
+    """Append one command through the host's log, so it carries the log's seq."""
+    return log.append(
+        ACTOR,
+        command_type("say"),
+        command_content(target=target, payload={"n": n}),
+    )
+
+
+class _RecordingApp:
+    """Wraps an ASGI app and records the headers of every HTTP request it serves, so
+    tests assert on what the host **received** rather than on what the client sent."""
+
+    def __init__(self, app) -> None:
+        self._app = app
+        self.requests: list[dict[str, str]] = []
+        self._lock = threading.Lock()
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+            with self._lock:
+                self.requests.append(headers)
+        await self._app(scope, receive, send)
+
+
+class _ScriptedHost:
+    """A tiny ASGI app serving one scripted SSE body per connection, then closing.
+
+    A script is a list whose items are frame strings sent as body chunks, or
+    `threading.Event`s the connection blocks on until the test sets them (so the test
+    controls exactly when the next bytes move). Request headers are recorded per
+    connection — the reconnect test asserts on what the *second* connection received.
+    """
+
+    def __init__(self, scripts: list[list]) -> None:
+        self.requests: list[dict[str, str]] = []
+        self._scripts = list(scripts)
+        self._lock = threading.Lock()
+
+    async def __call__(self, scope, receive, send) -> None:
+        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+        with self._lock:
+            self.requests.append(headers)
+            script = self._scripts.pop(0) if self._scripts else []
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        for item in script:
+            if isinstance(item, threading.Event):
+                item.wait(timeout=5.0)
+            else:
+                await send({"type": "http.response.body", "body": item.encode(), "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+@pytest.fixture
+def serve():
+    """A threaded uvicorn on an ephemeral port. Starlette's TestClient cannot stream an
+    infinite SSE endpoint — `client.stream(...)` never even returns the status line —
+    but a real socket with a sync httpx.Client works."""
+    servers: list[tuple[uvicorn.Server, threading.Thread]] = []
+
+    def start(app) -> str:
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=0,
+            log_level="error",
+            timeout_graceful_shutdown=1,
+            lifespan="off",
+        )
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 5.0
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started, "test server did not start in time"
+        port = server.servers[0].sockets[0].getsockname()[1]
+        servers.append((server, thread))
+        return f"http://127.0.0.1:{port}"
+
+    yield start
+    for server, thread in servers:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "test server did not shut down in time"
+
+
+def _collect(channel, *, count: int, deadline: float = 10.0) -> list[StimulusEvent]:
+    """Drain `stream()` in a daemon thread until `count` events or the stream ends.
+
+    Bounded: a stream that never produces (or never ends) fails the wait instead of
+    hanging the suite. `max_reconnects` bounds the stream itself; this bounds the wait.
+    """
+    got: list[StimulusEvent] = []
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            for event in channel.stream():
+                got.append(event)
+                if len(got) >= count:
+                    break
+        except Exception:  # noqa: BLE001 — teardown tearing the connection is not a test failure
+            pass
+        done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    # Close the channel (its client) before joining: the stream may still be connected
+    # — on a failure, always is — and an open connection holds uvicorn's shutdown past
+    # this fixture's join.
+    produced = done.wait(deadline + 2.0)
+    channel.close()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "stream thread did not end after close()"
+    assert produced, f"stream did not yield {count} events in time"
+    return got
+
+
+def _cursor(tmp_path, origin: str = "tam-surrogate") -> AckedCursor:
+    return AckedCursor(tmp_path / "command-cursor.json", origin)
+
+
+def test_sse_resumes_from_the_cursor(tmp_path, serve) -> None:
+    """With a cursor at seq N the request carries `Last-Event-ID: N` — asserted on the
+    header the host actually received — and only later commands arrive."""
+    log = StimulusLog(path=tmp_path / "host.jsonl", origin=HOST)
+    first = _log_command(log, "tam", 1)
+    cursor = _cursor(tmp_path)
+    cursor.advance(first.seq)
+    second = _log_command(log, "tam", 2)
+
+    app = _RecordingApp(CommandFeed(log, **FAST).build_app())
+    base = serve(app)
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", cursor, client=httpx.Client(),
+        max_reconnects=0, reconnect_seconds=0.05,
+    )
+    got = _collect(channel, count=1)
+
+    assert [e.seq for e in got] == [second.seq]
+    assert app.requests[0].get("last-event-id") == str(first.seq)
+
+
+def test_sse_never_advanced_cursor_sends_no_header(tmp_path, serve) -> None:
+    """The header is absent, not `"0"` and not `""`: sending 0 would claim a position
+    the surrogate has never held."""
+    log = StimulusLog(path=tmp_path / "host.jsonl", origin=HOST)
+    _log_command(log, "tam", 1)
+
+    app = _RecordingApp(CommandFeed(log, **FAST).build_app())
+    base = serve(app)
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", _cursor(tmp_path), client=httpx.Client(),
+        max_reconnects=0, reconnect_seconds=0.05,
+    )
+    got = _collect(channel, count=1)
+
+    assert len(got) == 1  # a fresh cursor replays from the beginning
+    assert "last-event-id" not in app.requests[0]
+
+
+def test_sse_channel_does_not_advance_the_cursor(tmp_path, serve) -> None:
+    """Pins the at-least-once decision: the cursor means *executed*, not *received*,
+    and only the caller moves it. A later change that "helpfully" advances here would
+    convert delivery to at-most-once — a dropped command is invisible."""
+    host = _ScriptedHost([[_format_sse(_command("tam", n)) for n in (3, 4)]])
+    base = serve(host)
+    cursor = _cursor(tmp_path)
+    cursor.advance(2)
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", cursor, client=httpx.Client(),
+        max_reconnects=0, reconnect_seconds=0.05,
+    )
+
+    got = _collect(channel, count=2)
+
+    assert [e.seq for e in got] == [3, 4]
+    assert cursor.acked_seq == 2
+
+
+def test_sse_heartbeats_yield_nothing_and_do_not_end_the_stream(tmp_path, serve) -> None:
+    gate = threading.Event()
+    host = _ScriptedHost([[": heartbeat\n\n", gate, _format_sse(_command("tam", 7))]])
+    base = serve(host)
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", _cursor(tmp_path), client=httpx.Client(),
+        max_reconnects=0, reconnect_seconds=0.05,
+    )
+
+    got = _collect(channel, count=1)
+
+    assert [e.seq for e in got] == [7]
+
+
+def test_sse_dropped_connection_reconnects_from_current_cursor(tmp_path, serve) -> None:
+    """The second connection's `Last-Event-ID` reflects what the caller advanced to —
+    not what the first connection last delivered. Here they differ: the first
+    connection delivered seq 6, the caller executed only seq 5, so the reconnect must
+    resume at 5, replaying 6."""
+    advanced = threading.Event()
+    fifth = _command("tam", 5)
+    sixth = _command("tam", 6)
+    host = _ScriptedHost(
+        [
+            [_format_sse(fifth), advanced, _format_sse(sixth)],
+            [],  # second connection: headers recorded, then close
+        ]
+    )
+    base = serve(host)
+    cursor = _cursor(tmp_path)
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", cursor, client=httpx.Client(),
+        max_reconnects=1, reconnect_seconds=0.05,
+    )
+    got: list[StimulusEvent] = []
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            for event in channel.stream():
+                got.append(event)
+        except Exception:  # noqa: BLE001
+            pass
+        done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+    # Execute the first command, then let the connection drop. The server is blocked
+    # on `advanced` between the two frames, so the cursor is advanced before the
+    # reconnect ever happens — the ordering the test exists to pin.
+    deadline = time.monotonic() + 5.0
+    while len(got) < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(got) == 1, "first command never arrived"
+    cursor.advance(fifth.seq)
+    advanced.set()
+    assert done.wait(10.0), "stream did not end after reconnects were exhausted"
+    channel.close()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "stream thread did not end after close()"
+
+    assert [e.seq for e in got] == [fifth.seq, sixth.seq]  # executed 5, 6 replayed
+    assert len(host.requests) == 2
+    assert host.requests[1].get("last-event-id") == str(fifth.seq)
+
+
+def test_sse_malformed_frame_is_skipped_not_fatal(tmp_path, serve, caplog) -> None:
+    """One bad frame must not take the channel down — but a silently skipped command
+    is the failure this protocol exists to prevent, so it is logged."""
+    good = _command("tam", 9)
+    host = _ScriptedHost([["data: {not json\n\n", _format_sse(good)]])
+    base = serve(host)
+    channel = SseCommandChannel(
+        f"{base}/commands/tam", _cursor(tmp_path), client=httpx.Client(),
+        max_reconnects=0, reconnect_seconds=0.05,
+    )
+
+    with caplog.at_level("WARNING"):
+        got = _collect(channel, count=1)
+
+    assert [e.seq for e in got] == [good.seq]
+    assert any("malformed" in record.message.lower() for record in caplog.records)
+
+
+def test_sse_channel_satisfies_the_protocol(tmp_path) -> None:
+    assert isinstance(
+        SseCommandChannel("http://host/commands/tam", _cursor(tmp_path)), CommandChannel
+    )
