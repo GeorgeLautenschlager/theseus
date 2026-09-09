@@ -24,6 +24,7 @@ from typing import Callable
 import theseus.command_reports as reports
 from theseus.command_reports import BargedIn, Executed, Failed, Outcome, Partial
 from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.surrogates.command_channel import CommandChannel
 from theseus.surrogates.cursor import AckedCursor
 
 Renderer = Callable[[StimulusEvent], Outcome]
@@ -71,6 +72,18 @@ class CommandExecutor:
             )
             report_type = reports.FAILED
         return self._log.append(self._actor, report_type, content)
+
+    def run(self, channel: CommandChannel) -> None:
+        """Drain `channel`, reporting each command and then advancing the cursor.
+
+        Report-then-advance is at-least-once: a crash between the two leaves the
+        cursor behind, so a reconnect replays the command and produces a second
+        (visible) report rather than losing it. Returns when `stream()` ends;
+        shipping the reports upstream is `Replicator.drain()`'s job, unchanged.
+        """
+        for command in channel.stream():
+            self.execute_one(command)
+            self._cursor.advance(command.seq)
 
     def _report_for(self, outcome: Outcome, command: StimulusEvent) -> tuple[str, dict]:
         """Map a renderer outcome to (report type, report content)."""

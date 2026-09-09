@@ -14,6 +14,7 @@ import pytest
 from theseus.command_reports import BargedIn, Executed, Failed, Partial
 from theseus.commands import command_content, command_type
 from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.surrogates.command_channel import MemoryCommandChannel
 from theseus.surrogates.command_executor import CommandExecutor
 from theseus.surrogates.cursor import AckedCursor
 
@@ -170,3 +171,54 @@ def test_out_of_contract_command_raises_before_any_append(tmp_path):
     with pytest.raises(ValueError):
         ex.execute_one(bad)
     assert log.read_all() == []
+
+
+# --- run: report, then advance (issue #35, Task 3) ------------------------------
+
+
+def test_run_reports_each_command_then_advances_cursor(tmp_path):
+    log, cursor, host, ex = _executor(tmp_path, lambda cmd: Executed())
+    channel = MemoryCommandChannel(block=False)
+    commands = [_command(host) for _ in range(3)]
+    for cmd in commands:
+        channel.offer(cmd)
+
+    ex.run(channel)
+
+    events = log.read_all()
+    assert len(events) == 3
+    assert [e.content["command_seq"] for e in events] == [c.seq for c in commands]
+    assert cursor.acked_seq == commands[-1].seq
+
+
+def test_run_reports_before_advancing_cursor(tmp_path):
+    # A final-counts-only test would pass on the wrong order; this pins it: a log
+    # listener (fired inside append, before execute_one returns) records the
+    # cursor at report time — and it must still sit at the *previous* command's
+    # position, i.e. the advance for command n happens strictly after command
+    # n's report.
+    log, cursor, host, ex = _executor(tmp_path, lambda cmd: Executed())
+    observed: list[tuple[int, int | None]] = []
+    log.subscribe(
+        lambda e: observed.append((e.content["command_seq"], cursor.acked_seq))
+    )
+    channel = MemoryCommandChannel(block=False)
+    commands = [_command(host) for _ in range(3)]
+    for cmd in commands:
+        channel.offer(cmd)
+
+    ex.run(channel)
+
+    seqs = [c.seq for c in commands]
+    assert observed == [(seqs[0], None), (seqs[1], seqs[0]), (seqs[2], seqs[1])]
+    assert cursor.acked_seq == seqs[-1]
+
+
+def test_run_over_empty_doorbell_returns_immediately(tmp_path):
+    log, cursor, host, ex = _executor(tmp_path, lambda cmd: Executed())
+    channel = MemoryCommandChannel(block=False)
+
+    ex.run(channel)
+
+    assert log.read_all() == []
+    assert cursor.acked_seq is None
