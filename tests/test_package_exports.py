@@ -1,12 +1,24 @@
-"""The package root exports exactly the three names a composer needs."""
+"""The package root exports exactly the names a composer needs."""
 
 import theseus
 
 
 def test_composition_entry_points_import_from_root():
-    from theseus import HighWaterMarks, ReentrantIngest, ReplicationIngress  # noqa: F401
+    from theseus import (  # noqa: F401
+        BufferPolicy,
+        BufferedStimulusLog,
+        HighWaterMarks,
+        ReentrantIngest,
+        ReplicationIngress,
+    )
 
-    for name in ("HighWaterMarks", "ReentrantIngest", "ReplicationIngress"):
+    for name in (
+        "HighWaterMarks",
+        "ReentrantIngest",
+        "ReplicationIngress",
+        "BufferedStimulusLog",
+        "BufferPolicy",
+    ):
         assert name in theseus.__all__
         assert hasattr(theseus, name)
 

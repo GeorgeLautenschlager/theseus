@@ -8,6 +8,7 @@ from theseus.memory_note import MemoryNote
 from theseus.memory_store import MemoryStore
 from theseus.replication_ingress import ReentrantIngest, ReplicationIngress
 from theseus.schedule import Schedule
+from theseus.surrogates.buffer import BufferPolicy, BufferedStimulusLog
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
 from theseus.surrogates.replicator import Replicator
@@ -29,6 +30,8 @@ from theseus.tools import (
 __all__ = [
     "AgenticMemory",
     "Autocore",
+    "BufferPolicy",
+    "BufferedStimulusLog",
     "HighWaterMarks",
     "OODACore",
     "Episode",
