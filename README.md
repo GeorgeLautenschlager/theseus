@@ -49,3 +49,16 @@ Theseus is built on a simple foundation that I call the `StimulusLog`. If you've
 - **Orient**, where cognition really begins for a Theseus agent. The `StimulusLog` is read, along with the configured tools and of course the agent's constitution document. This is fed to a `ContextAssembler` which prepares it for the configured LLM's context window. Note what is *not* here: long-term memories. Nothing reaches into the memory module on the agent's behalf. Remembering is something the agent does — it calls the `recall` tool — and the recollection comes back as a `tool_result` on the `StimulusLog`, so it arrives through **Orient** on the next pass exactly like every other stimulus. The agent experiences its own recall.
 - **Decide**, where we translate context to action. Another invariant of a `CognitiveCore` is that they have a reasoning engine of some sort built in. I expect this will be an LLM in pretty much every case, but nevertheless I'm leaving the door open, at least for VLMs or even VLAMs. Decide makes a single native tool-calling turn: the reasoning engine chooses a tool and supplies its arguments in one shot. That tool call is then interpretted and executed by....
 - **Act**, where the agent actually does stuff. Even in the simplest case — when **Decide** calls a "respond in chat" tool — execution stays separate: **Act** takes the tool call **Decide** produced and runs it, delivering the message the model already composed (there's no second LLM call). **Act** is also crucially in charge of terminating the cognitive loop or triggering another one, but again it *does not* decide that for itself. If the decision requires another loop, **Act** triggers one, otherwise execution terminates.
+
+## Assemble and reassemble agents
+
+Keep settings in a small Python definition and generate a runnable agent:
+
+```sh
+poetry run python -m theseus.assemble agents/minimal.py --output build/test-agent
+poetry run python build/test-agent/agent.py
+```
+
+Edit the definition, assemble again, and restart. Runtime state stays in its own
+home directory. See [Agent Assembler](docs/agent-assembler.md) for variants, Tam,
+custom parts, memory, and isolated E2E agents.
