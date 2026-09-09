@@ -76,51 +76,22 @@ current branch.
 
 **Files:** create `src/theseus/command_reports.py`; test `tests/test_command_reports.py`
 
-**Contract:**
+**Interface** (all in `src/theseus/command_reports.py`; module opens with `from __future__ import
+annotations`, imports absolute):
 
-```python
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Union
-from theseus.stimulus_log import StimulusEvent
-
-REPORT_PREFIX = "command_report."
-EXECUTED = "command_report.executed"
-PARTIAL = "command_report.partial"
-FAILED = "command_report.failed"
-BARGED_IN = "command_report.barged_in"
-OUTCOMES = (EXECUTED, PARTIAL, FAILED, BARGED_IN)
-
-# --- Outcome value objects: what an injected renderer returns. Plain data; validation
-# --- of their payloads happens in the content constructors below, write-side.
-@dataclass(frozen=True, slots=True)
-class Executed: ...
-
-@dataclass(frozen=True, slots=True)
-class Partial:
-    progress: str
-
-@dataclass(frozen=True, slots=True)
-class BargedIn:
-    playback_position: str | int | float
-
-@dataclass(frozen=True, slots=True)
-class Failed:
-    reason: str
-
-Outcome = Union[Executed, Partial, BargedIn, Failed]
-
-# --- Content constructors: build one report's `content` dict, validating write-side.
-def executed(*, command_seq: int, command_origin: str, command_id: str) -> dict[str, Any]: ...
-def partial(*, command_seq: int, command_origin: str, command_id: str, progress: str) -> dict[str, Any]: ...
-def failed(*, command_seq: int, command_origin: str, command_id: str, reason: str) -> dict[str, Any]: ...
-def barged_in(*, command_seq: int, command_origin: str, command_id: str,
-              playback_position: str | int | float) -> dict[str, Any]: ...
-
-# --- Read side: never raises (a report comes off a log that may hold anything).
-def is_report(event: StimulusEvent) -> bool: ...
-def report_outcome(event: StimulusEvent) -> str | None: ...
-```
+- **Type constants** (module-level; values pinned in Behaviour item 1): `REPORT_PREFIX`, `EXECUTED`,
+  `PARTIAL`, `FAILED`, `BARGED_IN`, and `OUTCOMES` — a tuple of the four full type strings.
+- **`Outcome` value objects** — what an injected renderer returns. Frozen, slotted dataclasses;
+  their payloads are validated in the content constructors below, not on the dataclass itself:
+  `Executed` (no fields); `Partial` with `progress: str`; `BargedIn` with `playback_position:
+  str | int | float`; `Failed` with `reason: str`. `Outcome` is the union alias of those four.
+- **Content constructors** — build one report's `content` dict, validating write-side; keyword-only:
+  - `executed(*, command_seq: int, command_origin: str, command_id: str) -> dict[str, Any]`
+  - `partial(*, command_seq: int, command_origin: str, command_id: str, progress: str) -> dict[str, Any]`
+  - `failed(*, command_seq: int, command_origin: str, command_id: str, reason: str) -> dict[str, Any]`
+  - `barged_in(*, command_seq: int, command_origin: str, command_id: str, playback_position: str | int | float) -> dict[str, Any]`
+- **Read-side predicates** — never raise: `is_report(event: StimulusEvent) -> bool` and
+  `report_outcome(event: StimulusEvent) -> str | None`.
 
 **Behaviour to satisfy:**
 
@@ -170,31 +141,18 @@ def report_outcome(event: StimulusEvent) -> str | None: ...
 
 **Files:** create `src/theseus/surrogates/command_executor.py`; test `tests/test_command_executor.py`
 
-**Contract:**
+**Interface** (in `src/theseus/surrogates/command_executor.py`; `from __future__ import annotations`,
+absolute imports). Define a module-level type alias `Renderer = Callable[[StimulusEvent], Outcome]`
+(where `Outcome` is imported from `theseus.command_reports`; also import that module as `reports`
+for its constructors, and `StimulusLog`/`StimulusEvent` from `theseus.stimulus_log`, `AckedCursor`
+from `theseus.surrogates.cursor`).
 
-```python
-from __future__ import annotations
-from collections.abc import Callable
-from theseus import command_reports as reports
-from theseus.command_reports import Outcome
-from theseus.stimulus_log import StimulusEvent, StimulusLog
-from theseus.surrogates.cursor import AckedCursor
+A class `CommandExecutor` with:
 
-Renderer = Callable[[StimulusEvent], Outcome]
-
-class CommandExecutor:
-    def __init__(
-        self,
-        log: StimulusLog,
-        render: Renderer,
-        cursor: AckedCursor,
-        *,
-        actor: str = "surrogate",
-    ) -> None: ...
-
-    def execute_one(self, command: StimulusEvent) -> StimulusEvent:
-        """Render one command and append exactly one report to the local log; return it."""
-```
+- a constructor taking, positionally, `log: StimulusLog`, `render: Renderer`, `cursor: AckedCursor`,
+  and a keyword-only `actor: str = "surrogate"`.
+- `execute_one(self, command: StimulusEvent) -> StimulusEvent` — render one command and append
+  exactly one report to the local log; return the appended report event.
 
 **Behaviour to satisfy:**
 
@@ -247,20 +205,9 @@ class CommandExecutor:
 
 **Files:** modify `src/theseus/surrogates/command_executor.py`; test `tests/test_command_executor.py`
 
-**Contract:**
-
-```python
-    # added to CommandExecutor
-    def run(self, channel: "CommandChannel") -> None:
-        """Drain `channel`, reporting each command then advancing the cursor.
-
-        For every command the channel yields: execute_one(command), then
-        cursor.advance(command.seq) — report first, advance second (at-least-once).
-        Returns when the channel's stream() ends (doorbell drained, or close()).
-        """
-```
-
-(`CommandChannel` is `theseus.surrogates.command_channel.CommandChannel`; import it.)
+**Interface:** add one method to `CommandExecutor` — `run(self, channel: CommandChannel) -> None` —
+which drains `channel`, reporting each command and then advancing the cursor. `CommandChannel` is
+`theseus.surrogates.command_channel.CommandChannel`; import it.
 
 **Behaviour to satisfy:**
 
