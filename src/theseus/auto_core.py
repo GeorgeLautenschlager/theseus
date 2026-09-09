@@ -162,64 +162,67 @@ class Autocore:
 
     def loop(self) -> None:
         while True:
-            # Take the pending wake *before* reading any state. Everything this turn
-            # goes on to see was appended before this line, so anything landing after
-            # it re-arms the flag and is answered by the next turn instead of idling
-            # out a full tick. The race costs at worst one redundant turn; the other
-            # ordering costs a dropped message.
-            self.loop_memory["wake_trigger"] = self._consume_wake()
-
-            self.goals = self._read_goals()
-            self.tasks = self._read_tasks()
-            self.current_task = self._read_current_task()
-            self.schedule = Schedule(self.home_directory / "SCHEDULE.md")
-
-            # Pick the model *first*: the context budget is a property of whichever
-            # model this turn's cadence rule selected, so there is nothing to fit the
-            # window against until that is decided. _select_model_provider hands the
-            # rule's declared window to the assembler on the way through.
-            model = self._select_model_provider()
-
-            # assemble system prompt
-            system_prompt = self._assemble_system_prompt()
-
-            # load history from stimulus log, fitted around everything else in the
-            # prompt. Measuring the overhead beats inferring it from the previous turn:
-            # the inferred value is zero on the first turn, which is precisely when a
-            # mis-sized budget overruns.
-            goals_and_tasks = self._current_goals_and_tasks()
-            context = self.context_assembler.assemble_context(
-                overhead_chars=len(system_prompt) + len(goals_and_tasks)
-            )
-            self.loop_memory["window_chars"] = context.window_chars
-
-            # assemble autonomous prompt
-            autonomous_prompt = (
-                f"{goals_and_tasks}"
-                f"<stimulus_log>\n{context.recent_events}\n</stimulus_log>\n\n"
-            )
-
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": autonomous_prompt},
-            ]
-            turn = model.complete_with_tools(messages, list(self.tools.values()))
-
-            # log the decision and execute whatever it chose, rescuing a reply the
-            # model wrote as prose instead of as a call to its chat tool
-            self._take_action(turn)
-
-            # check schedule and append reminders
-            self._append_reminders()
-
-            # assess context length
-            self.context_assembler.observe(
-                prompt_tokens=turn.prompt_tokens,
-                prompt_chars=sum(len(message["content"]) for message in messages),
-                window_chars=self.loop_memory["window_chars"],
-            )
-
+            self.step()
             self._sleep()
+
+    def step(self) -> None:
+        """Run one autonomous turn without sleeping, for scheduled/embedded agents."""
+        # Take the pending wake *before* reading any state. Everything this turn
+        # goes on to see was appended before this line, so anything landing after
+        # it re-arms the flag and is answered by the next turn instead of idling
+        # out a full tick. The race costs at worst one redundant turn; the other
+        # ordering costs a dropped message.
+        self.loop_memory["wake_trigger"] = self._consume_wake()
+
+        self.goals = self._read_goals()
+        self.tasks = self._read_tasks()
+        self.current_task = self._read_current_task()
+        self.schedule = Schedule(self.home_directory / "SCHEDULE.md")
+
+        # Pick the model *first*: the context budget is a property of whichever
+        # model this turn's cadence rule selected, so there is nothing to fit the
+        # window against until that is decided. _select_model_provider hands the
+        # rule's declared window to the assembler on the way through.
+        model = self._select_model_provider()
+
+        # assemble system prompt
+        system_prompt = self._assemble_system_prompt()
+
+        # load history from stimulus log, fitted around everything else in the
+        # prompt. Measuring the overhead beats inferring it from the previous turn:
+        # the inferred value is zero on the first turn, which is precisely when a
+        # mis-sized budget overruns.
+        goals_and_tasks = self._current_goals_and_tasks()
+        context = self.context_assembler.assemble_context(
+            overhead_chars=len(system_prompt) + len(goals_and_tasks)
+        )
+        self.loop_memory["window_chars"] = context.window_chars
+
+        # assemble autonomous prompt
+        autonomous_prompt = (
+            f"{goals_and_tasks}"
+            f"<stimulus_log>\n{context.recent_events}\n</stimulus_log>\n\n"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": autonomous_prompt},
+        ]
+        turn = model.complete_with_tools(messages, list(self.tools.values()))
+
+        # log the decision and execute whatever it chose, rescuing a reply the
+        # model wrote as prose instead of as a call to its chat tool
+        self._take_action(turn)
+
+        # check schedule and append reminders
+        self._append_reminders()
+
+        # assess context length
+        self.context_assembler.observe(
+            prompt_tokens=turn.prompt_tokens,
+            prompt_chars=sum(len(message["content"]) for message in messages),
+            window_chars=self.loop_memory["window_chars"],
+        )
 
     def wake(self, trigger: StimulusEvent | str | None = None) -> None:
         """Cut short any sleep in progress so the next turn starts now.

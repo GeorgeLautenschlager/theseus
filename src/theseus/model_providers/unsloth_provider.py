@@ -36,7 +36,7 @@ class UnslothProvider(ModelProvider):
 
     def is_available(self) -> bool:
         try:
-            self._client.models.list()
-            return True
+            models = self._client.models.list()
+            return any(model.id == self.model for model in models.data)
         except OpenAIError:
             return False

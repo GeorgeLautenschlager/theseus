@@ -101,8 +101,10 @@ class AgentSpec:
             raise ValueError("Duplicate tool names")
         if not isinstance(self.interface, InterfaceSpec):
             raise ValueError("interface must be an InterfaceSpec")
-        if self.interface.kind not in ("terminal", "web"):
-            raise ValueError("interface must be 'terminal' or 'web'")
+        if self.interface.kind not in ("terminal", "web", "none"):
+            raise ValueError("interface must be 'terminal', 'web', or 'none'")
+        if self.interface.kind == "none" and self.core != "auto":
+            raise ValueError("The headless interface requires auto")
         if not isinstance(self.interface.host, str) or not self.interface.host.strip():
             raise ValueError("interface host must be nonempty text")
         if type(self.interface.port) is not int or not 1 <= self.interface.port <= 65535:
@@ -159,10 +161,13 @@ def _provider(spec: ModelSpec):
 @dataclass
 class AssembledAgent:
     core: Autocore | OODACore
-    observer: TerminalChatObserver | WebChatUIObserver
+    observer: TerminalChatObserver | WebChatUIObserver | None
     spec: AgentSpec
 
     def run(self) -> None:
+        if self.spec.interface.kind == "none":
+            self.core.loop()
+            return
         if self.spec.core == "auto":
             threading.Thread(target=self.core.loop, name="agent-core", daemon=True).start()
         if self.spec.interface.kind == "web":
@@ -220,6 +225,8 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
         if spec.memory.recall_description is not None:
             recall.description = spec.memory.recall_description
         core.tools[recall.name] = recall
+    if spec.interface.kind == "none":
+        return AssembledAgent(core, None, spec)
     callback = core.wake if spec.core == "auto" else core.orient_and_wait
     if spec.interface.kind == "web":
         observer = WebChatUIObserver(stimulus_log=core.stimulus_log, orient_chat_message_callback=callback)

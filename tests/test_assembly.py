@@ -235,3 +235,34 @@ def test_generated_agent_boots_as_separate_process(tmp_path):
     assert result.returncode == 0, result.stderr
     assert (home / "CONSTITUTION.md").read_text() == spec().constitution
     assert not (tmp_path / "build/state").exists()
+
+
+def test_headless_auto_runs_on_main_thread_without_chat_tools(tmp_path, monkeypatch):
+    agent = build_agent(spec(core="auto", interface=InterfaceSpec("none")), tmp_path)
+    assert agent.observer is None
+    assert not agent.core.tools
+    called = []
+    monkeypatch.setattr(agent.core, "loop", lambda: called.append("ran"))
+    agent.run()
+    assert called == ["ran"]
+
+
+def test_headless_ooda_rejected():
+    with pytest.raises(ValueError, match="requires auto"):
+        spec(interface=InterfaceSpec("none")).validate()
+
+
+def test_auto_step_completes_one_turn_without_sleep(tmp_path, monkeypatch):
+    agent = build_agent(spec(core="auto", interface=InterfaceSpec("none")), tmp_path)
+
+    class FakeModel:
+        def complete_with_tools(self, messages, tools):
+            return AssistantTurn(text="One scheduled turn", tool_calls=())
+
+    agent.core._construct_model_providers()
+    monkeypatch.setattr(agent.core, "_select_model_provider", lambda: FakeModel())
+    monkeypatch.setattr(agent.core, "_sleep", lambda: pytest.fail("step must not sleep"))
+    agent.core.step()
+    events = agent.core.stimulus_log.read_all()
+    assert [e.type for e in events] == ["decision"]
+    assert events[0].content["text"] == "One scheduled turn"
