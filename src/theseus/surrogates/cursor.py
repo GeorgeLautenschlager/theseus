@@ -16,6 +16,15 @@ deliberately `None`, not `0`. An unreadable, malformed, or foreign-origin file a
 loads as `None`: the surrogate re-sends from the start and the host dedupes it, which
 is redundant work; refusing to start would take a surrogate offline over state whose
 only failure mode is that same redundant work.
+
+This cursor has a second use on the downstream command channel (issue #34): there it
+is how far the surrogate has **executed** the host's commands, not how far the host
+has acked the surrogate's stream — the roles flip, but the mechanism is identical
+(durable, monotonic, never backwards, `None` until first advanced). The
+`SseCommandChannel` sends `acked_seq` as `Last-Event-ID` on every reconnect, and the
+caller advances after executing, not on receipt — at-least-once, because nothing
+dedupes a spoken sentence. A reader who has only seen the replicator will think the
+file is misplaced; it is the same position, read in the other direction.
 """
 
 from __future__ import annotations
