@@ -16,14 +16,18 @@ from theseus.auto_core import Autocore
 from theseus.cadence import Cadence
 from theseus.chat_observer import TerminalChatObserver
 from theseus.context_assembler import ContextAssembler
+from theseus.durable_delivery import DeliveryJournal, DurableInbox, DurableOutbox
 from theseus.memory_module import MemoryModule
 from theseus.memory_store import MemoryStore
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.ooda_core import OODACore
 from theseus.stimulus_log import StimulusLog
+from theseus.telegram_api import TelegramBotAPI, TelegramSender
+from theseus.telegram_observer import TELEGRAM_TRANSPORT, TelegramObserver
 from theseus.tools.recall import RecallTool
 from theseus.tools.registry import all_tools
 from theseus.tools.terminal_chat import TerminalChat
+from theseus.tools.telegram import TelegramTool
 from theseus.tools.web_chat import WebChat
 from theseus.web_chat_ui_observer import WebChatUIObserver
 
@@ -54,6 +58,10 @@ class InterfaceSpec:
     kind: str = "terminal"
     host: str = "127.0.0.1"
     port: int = 8000
+    bot_token_env: str = "TELEGRAM_BOT_TOKEN"
+    allowed_user_ids: tuple[int, ...] = ()
+    allowed_chat_ids: tuple[int, ...] = ()
+    poll_timeout_seconds: int = 25
 
 
 @dataclass(frozen=True)
@@ -101,14 +109,37 @@ class AgentSpec:
             raise ValueError("Duplicate tool names")
         if not isinstance(self.interface, InterfaceSpec):
             raise ValueError("interface must be an InterfaceSpec")
-        if self.interface.kind not in ("terminal", "web", "none"):
-            raise ValueError("interface must be 'terminal', 'web', or 'none'")
+        if self.interface.kind not in ("terminal", "web", "telegram", "none"):
+            raise ValueError("interface must be 'terminal', 'web', 'telegram', or 'none'")
         if self.interface.kind == "none" and self.core != "auto":
             raise ValueError("The headless interface requires auto")
         if not isinstance(self.interface.host, str) or not self.interface.host.strip():
             raise ValueError("interface host must be nonempty text")
         if type(self.interface.port) is not int or not 1 <= self.interface.port <= 65535:
             raise ValueError("interface port must be between 1 and 65535")
+        if not isinstance(self.interface.bot_token_env, str) or not self.interface.bot_token_env.strip():
+            raise ValueError("interface bot_token_env must be nonempty text")
+        for label, values in (
+            ("allowed_user_ids", self.interface.allowed_user_ids),
+            ("allowed_chat_ids", self.interface.allowed_chat_ids),
+        ):
+            if not isinstance(values, tuple) or any(
+                isinstance(value, bool) or not isinstance(value, int) for value in values
+            ):
+                raise ValueError(f"interface {label} must be a tuple of integer IDs")
+            if len(set(values)) != len(values):
+                raise ValueError(f"interface {label} contains duplicate IDs")
+        if (
+            self.interface.kind == "telegram"
+            and not self.interface.allowed_user_ids
+            and not self.interface.allowed_chat_ids
+        ):
+            raise ValueError("Telegram requires at least one allowed user or chat ID")
+        if (
+            type(self.interface.poll_timeout_seconds) is not int
+            or not 1 <= self.interface.poll_timeout_seconds <= 50
+        ):
+            raise ValueError("interface poll_timeout_seconds must be between 1 and 50")
         if not isinstance(self.memory, MemorySpec):
             raise ValueError("memory must be a MemorySpec")
         memory = self.memory
@@ -161,17 +192,26 @@ def _provider(spec: ModelSpec):
 @dataclass
 class AssembledAgent:
     core: Autocore | OODACore
-    observer: TerminalChatObserver | WebChatUIObserver | None
+    observer: TerminalChatObserver | WebChatUIObserver | TelegramObserver | None
     spec: AgentSpec
 
     def run(self) -> None:
         if self.spec.interface.kind == "none":
             self.core.loop()
             return
+        if self.spec.interface.kind == "telegram" and self.spec.core == "auto":
+            # Recover before Autocore's immediate first turn. Otherwise that turn can see
+            # the already-persisted stimulus and then inbox recovery wakes a redundant
+            # second turn for the same message.
+            if self.observer.outbox is not None:
+                self.observer.outbox.recover()
+            self.observer.recover_pending()
         if self.spec.core == "auto":
             threading.Thread(target=self.core.loop, name="agent-core", daemon=True).start()
         if self.spec.interface.kind == "web":
             self.observer.serve(host=self.spec.interface.host, port=self.spec.interface.port)
+        elif self.spec.interface.kind == "telegram":
+            self.observer.run()
         else:
             while True:
                 try:
@@ -231,6 +271,32 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
     if spec.interface.kind == "web":
         observer = WebChatUIObserver(stimulus_log=core.stimulus_log, orient_chat_message_callback=callback)
         mouth = WebChat(web_observer=observer)
+    elif spec.interface.kind == "telegram":
+        token = os.environ.get(spec.interface.bot_token_env)
+        if not token:
+            raise ValueError(
+                f"Set {spec.interface.bot_token_env} to the Telegram bot token before boot"
+            )
+        journal = DeliveryJournal(home / "delivery.sqlite3")
+        api = TelegramBotAPI(token)
+        outbox = DurableOutbox(
+            journal, TELEGRAM_TRANSPORT, TelegramSender(api, cwd=home)
+        )
+        observer = TelegramObserver(
+            stimulus_log=core.stimulus_log,
+            orient_chat_message_callback=callback,
+            api=api,
+            inbox=DurableInbox(journal, TELEGRAM_TRANSPORT),
+            outbox=outbox,
+            allowed_user_ids=spec.interface.allowed_user_ids,
+            allowed_chat_ids=spec.interface.allowed_chat_ids,
+            poll_timeout_seconds=spec.interface.poll_timeout_seconds,
+        )
+        mouth = TelegramTool(
+            outbox,
+            allowed_chat_ids=spec.interface.allowed_chat_ids,
+            allowed_user_ids=spec.interface.allowed_user_ids,
+        )
     else:
         observer = TerminalChatObserver(core.stimulus_log, callback)
         mouth = TerminalChat()

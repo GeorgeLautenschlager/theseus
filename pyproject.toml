@@ -14,6 +14,7 @@ dependencies = [
     "uvicorn (>=0.29,<1)",
     "jinja2 (>=3.1,<4)",
     "python-multipart (>=0.0.9)",
+    "httpx (>=0.28,<1)",
     "ipdb (>=0.13.13,<0.14.0)",
     "numpy (>=2,<3)",
 ]
@@ -27,8 +28,6 @@ packages = [{ include = "theseus", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8"
-# `fastapi.testclient` needs it; the replication ingress's route tests are the only callers.
-httpx = "^0.28.1"
 
 # Screen-capture deps for surrogates; install with `poetry install --with surrogates`.
 [tool.poetry.group.surrogates]

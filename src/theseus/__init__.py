@@ -4,6 +4,14 @@ from theseus.assembly import AgentSpec, InterfaceSpec, MemorySpec, ModelSpec, bu
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_feed import CommandFeed
+from theseus.durable_delivery import (
+    DeliveryJournal,
+    DeliveryOutcome,
+    DurableInbox,
+    DurableOutbox,
+    InboxItem,
+    OutboxItem,
+)
 from theseus.commands import (
     command_content,
     command_target,
@@ -28,12 +36,15 @@ from theseus.surrogates.sse_command_channel import SseCommandChannel
 from theseus.surrogates.transport import StimulusTransport
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.time_observer import TimeObserver
+from theseus.telegram_api import TelegramBotAPI, TelegramSender
+from theseus.telegram_observer import TelegramObserver
 from theseus.tools import (
     RecallTool,
     Tool,
     ToolCall,
     ToolResult,
     ToolRunner,
+    TelegramTool,
     all_tools,
     coding_tools,
     read_only_tools,
@@ -51,6 +62,10 @@ __all__ = [
     "BufferedStimulusLog",
     "CommandChannel",
     "CommandFeed",
+    "DeliveryJournal",
+    "DeliveryOutcome",
+    "DurableInbox",
+    "DurableOutbox",
     "HighWaterMarks",
     "OODACore",
     "Episode",
@@ -59,11 +74,16 @@ __all__ = [
     "MemoryNote",
     "MemoryStore",
     "MemoryCommandChannel",
+    "InboxItem",
+    "OutboxItem",
     "Schedule",
     "SseCommandChannel",
     "StimulusEvent",
     "StimulusLog",
     "TimeObserver",
+    "TelegramBotAPI",
+    "TelegramObserver",
+    "TelegramSender",
     "ReentrantIngest",
     "ReplicationIngress",
     "AckedCursor",
@@ -80,6 +100,7 @@ __all__ = [
     "ToolCall",
     "ToolResult",
     "ToolRunner",
+    "TelegramTool",
     "all_tools",
     "coding_tools",
     "read_only_tools",
