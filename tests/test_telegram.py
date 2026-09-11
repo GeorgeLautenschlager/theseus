@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import logging
 
 import pytest
 
@@ -9,7 +10,7 @@ from theseus.durable_delivery import (
     DeliveryJournal, DeliveryOutcome, DurableInbox, DurableOutbox,
 )
 from theseus.stimulus_log import StimulusLog
-from theseus.telegram_api import TelegramAPIError, TelegramSender
+from theseus.telegram_api import TelegramAPIError, TelegramBotAPI, TelegramSender
 from theseus.telegram_observer import TELEGRAM_TRANSPORT, TelegramObserver
 from theseus.tools.telegram import TelegramTool, _utf16_units, split_telegram_message
 
@@ -199,6 +200,17 @@ def test_telegram_sender_classifies_rate_limit_for_durable_retry(tmp_path):
     outcome = sender.send(item)
     assert outcome.status == "retry"
     assert outcome.retry_after == 17
+
+
+def test_bot_token_is_redacted_from_http_client_logs(caplog):
+    token = "123456:secret-token-value"
+    TelegramBotAPI(token, client=object())
+    with caplog.at_level(logging.DEBUG, logger="httpx"):
+        logging.getLogger("httpx").info(
+            "HTTP Request: POST %s", f"https://api.telegram.org/bot{token}/getUpdates"
+        )
+    assert token not in caplog.text
+    assert "<telegram-token>" in caplog.text
 
 
 def telegram_spec():

@@ -3,12 +3,36 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from theseus.durable_delivery import DeliveryOutcome, OutboxItem
+
+
+class _BotTokenRedaction(logging.Filter):
+    """Remove the bot token from HTTP client log records before handlers see them."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = record.msg.replace(self._token, "<telegram-token>")
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._redact(value) for value in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {
+                key: self._redact(value) for key, value in record.args.items()
+            }
+        return True
+
+    def _redact(self, value: Any) -> Any:
+        rendered = str(value)
+        return rendered.replace(self._token, "<telegram-token>") if self._token in rendered else value
 
 
 class TelegramAPIError(RuntimeError):
@@ -43,7 +67,14 @@ class TelegramBotAPI:
     ) -> None:
         if not isinstance(bot_token, str) or not bot_token.strip():
             raise ValueError("Telegram bot token must be nonempty")
-        self.__base_url = f"https://api.telegram.org/bot{bot_token.strip()}"
+        bot_token = bot_token.strip()
+        self.__base_url = f"https://api.telegram.org/bot{bot_token}"
+        self._log_redaction = _BotTokenRedaction(bot_token)
+        # httpx logs complete request URLs at INFO, and httpcore does so at DEBUG. Bot API
+        # authentication lives in the URL path, so ordinary application logging would
+        # otherwise write the secret to disk on every poll and send.
+        logging.getLogger("httpx").addFilter(self._log_redaction)
+        logging.getLogger("httpcore").addFilter(self._log_redaction)
         self._client = client
         self._request_timeout = request_timeout
 
