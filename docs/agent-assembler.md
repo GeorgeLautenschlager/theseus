@@ -56,6 +56,28 @@ constitution = Path(__file__).with_name("CONSTITUTION.md").read_text(encoding="u
   Autocore. Terminal/web reply tools are wired automatically; headless agents
   have no chat observer or reply tool. `agent.core.step()` runs one autonomous
   turn without sleeping, for scheduled jobs; `agent.run()` runs continuously.
+- `InterfaceSpec("telegram", ...)` wires a durable Telegram observer and reply
+  tool. The bot token is read at boot from `bot_token_env` (default
+  `TELEGRAM_BOT_TOKEN`) and is never placed in the definition snapshot or delivery
+  database. Configure at least one `allowed_user_ids` or `allowed_chat_ids` tuple;
+  when both are present, incoming messages must match both. In private chats the
+  user ID is also a permitted reply destination; group destinations must be listed
+  in `allowed_chat_ids`. For example:
+
+```python
+interface=InterfaceSpec(
+    "telegram",
+    bot_token_env="TAM_TELEGRAM_TOKEN",
+    allowed_user_ids=(123456789,),
+    allowed_chat_ids=(-1001234567890,),
+)
+```
+
+  Telegram uses long polling, so it does not expose a public HTTP port. Incoming
+  updates and outgoing message parts are stored in `delivery.sqlite3` under the
+  runtime home. Text beyond Telegram's limit is split losslessly and each chunk or
+  attachment retains its own status and Telegram message ID. Set the named token
+  variable in the service environment on DigitalOcean, not in the generated agent.
 - Memory defaults to none. Autocore accepts either `MemorySpec("amem", ...)`
   (AgenticMemory) or `MemorySpec("module", ...)` (MemoryModule). Both wire recall
   to the selected module and the core's stimulus log. For example:
@@ -103,8 +125,9 @@ poetry run python build/test-agent/agent.py --home /path/to/agent-home
 `CADENCE.md` in that home. Runtime edits to those three files last until the next
 boot; copy intentional changes back into the definition or its source files.
 Assembly itself never touches the runtime home. Logs, memory, goals, tasks,
-current task, schedule, and credentials are preserved. Do not run two agents
-against the same home. For experiments and tests, give each agent a fresh home.
+current task, schedule, credentials, and durable delivery queues are preserved.
+Do not run two agents against the same home. For experiments and tests, give each
+agent a fresh home.
 
 ## Tam
 

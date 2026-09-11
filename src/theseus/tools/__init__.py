@@ -9,6 +9,7 @@ from theseus.tools.read import ReadTool
 from theseus.tools.recall import RecallTool
 from theseus.tools.registry import all_tools, coding_tools, read_only_tools
 from theseus.tools.terminal_chat import TerminalChat
+from theseus.tools.telegram import TelegramTool, split_telegram_message
 from theseus.tools.tool import AssistantTurn, Tool, ToolCall, ToolResult, to_openai_tool
 from theseus.tools.tool_runner import ToolRunner
 from theseus.tools.web_chat import WebChat
@@ -24,6 +25,7 @@ __all__ = [
     "ReadTool",
     "RecallTool",
     "TerminalChat",
+    "TelegramTool",
     "Tool",
     "ToolCall",
     "ToolResult",
@@ -34,4 +36,5 @@ __all__ = [
     "coding_tools",
     "read_only_tools",
     "to_openai_tool",
+    "split_telegram_message",
 ]
