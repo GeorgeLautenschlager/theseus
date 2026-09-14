@@ -263,8 +263,6 @@ negotiate with, which would defeat the purpose of presence.
 
 ## Open questions
 
-- Command timeout: how long is a queued command still worth executing? A "say hello" from six
-  hours ago probably shouldn't fire on reconnect.
 - Backpressure: what the host does when a surrogate floods it. Note this now interacts with the
   abandon rule — sustained `429`s should burn retry budget and produce declared gaps rather than
   an ever-growing surrogate buffer.
@@ -300,6 +298,27 @@ failures: it returns a status when the host replied and raises when nothing was 
 
 - Host answered `5xx` — it is up and erroring. Retry with backoff; abandon on exhaustion.
 - Nothing answered — the link is down. Stop the drain, abandon nothing, retry on the next one.
+
+**Resolved (2026-09-14): command timeout (#37).** A queued command carries its own staleness
+bound and the surrogate only compares numbers — the command-channel twin of the retry budget
+above. The host has policy and sets the bound; the surrogate, which alone knows how long it was
+gone, enforces it.
+
+| | |
+|---|---|
+| TTL | **Per-command**: an optional `ttl_seconds` on the command's content, written by the host when it issues the command. Absent ⇒ a **6-hour default**, mirroring the upstream max age — a queued command is worth firing as long as the oldest observation is worth replaying. "Never expires" (a config push) is a large/sentinel TTL; "say hello" a short one. The surrogate never classifies a command; it reads the number the host wrote. |
+| Check | Expired iff `now − command.event_ts ≥ ttl`, evaluated **before** the command is rendered — the downstream twin of `is_too_old`. `event_ts` is the host's issue time, already carried on the command as a host-origin event. |
+| Clock | The **surrogate's own** clock. A sub-second skew is nothing against a minute-to-hour TTL, and no host-time exchange is added to the channel. |
+| Guard | A **negative age** — the command sits in the surrogate's future beyond a small skew tolerance — means the clock is unreliable (the RTC that reset to 1970). Such a command is treated as **expired**, not fired: the naive check would read a hugely-negative age as "fresh" and reproduce the uncanny late fire this rule exists to prevent. Expiring fails safe, and because it is reported (below) a genuinely-fresh command a bad clock discarded can be re-issued. |
+| Expired outcome | **`command_report.expired`** — the fifth execution outcome (#35) — carrying the command's `seq`/`origin`/`id`, the age, and the TTL it exceeded. Like every outcome it advances the command cursor, so an expired command is handled once, not replayed. |
+
+**Why report rather than drop.** Silence is the "I said X" false memory #35 exists to prevent:
+the host could not tell an expired command from one that fired. An `expired` report makes the
+drop visible and, with the clock guard, re-issuable.
+
+**Seams (follow-up implementation, not this decision).** The `ttl_seconds` field and the
+before-render expiry check extend the command channel (#34); the `expired` outcome extends the
+execution-report vocabulary (#35).
 
 Without this split, max attempts shreds the buffer exactly the way attempt-age would: the events
 are fresh so nothing expires by age, and each batch instead burns five attempts against a link
