@@ -12,6 +12,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from theseus.replication_events import BATCH_REJECTED, GAP
 from theseus.surrogates.clock import SystemClock
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
-from theseus.surrogates.replicator import DrainResult, Replicator
+from theseus.surrogates.replicator import DrainResult, Replicator, is_marker
 from theseus.surrogates.retry import RetryBudget
 from theseus.surrogates.transport import TransportResult
 from theseus.stimulus_log import StimulusLog
@@ -66,6 +67,16 @@ class ScriptedTransport:
         if isinstance(outcome, TransportResult):
             return outcome
         return TransportResult(status=outcome)
+
+
+class PermanentTransport:
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.calls = 0
+
+    def send(self, body: str) -> TransportResult:
+        self.calls += 1
+        return TransportResult(status=self.status)
 
 
 class ConcurrencyProbeTransport:
@@ -580,6 +591,15 @@ def test_retry_sleeps_on_the_injected_clock(tmp_path):
     assert result.stopped_on is None
 
 
+def test_is_marker_identifies_surrogate_markers(tmp_path):
+    log = make_log(tmp_path)
+    append_n(log, 1)
+    event = log.read_all()[0]
+    assert not is_marker(event)
+    assert is_marker(replace(event, type=GAP))
+    assert is_marker(replace(event, type=BATCH_REJECTED))
+
+
 def test_a_4xx_is_never_retried(tmp_path):
     log = make_log(tmp_path)
     append_n(log, 2)
@@ -629,6 +649,33 @@ def test_a_4xx_steps_over_and_keeps_draining(tmp_path):
     assert cursor.acked_seq == 6
     assert result.rejected_batches == 1
     assert result.stopped_on is None
+
+
+@pytest.mark.parametrize(("status", "marker_type"), [(500, GAP), (400, BATCH_REJECTED)])
+def test_marker_batches_do_not_grow_the_log_forever(tmp_path, status, marker_type):
+    log = make_log(tmp_path)
+    append_n(log, 2)
+    cursor = AckedCursor(tmp_path / "cursor.json", origin=log.origin)
+    rep = Replicator(
+        log,
+        PermanentTransport(status),
+        cursor,
+        max_events=2,
+        budget=RetryBudget(max_attempts=1),
+        clock=FakeClock(),
+    )
+
+    rep.drain()
+    assert len([e for e in log.read_all() if e.type == marker_type]) == 1
+    assert cursor.acked_seq == 2
+    lengths = []
+    for _ in range(4):
+        rep.drain()
+        lengths.append(len(log.read_all()))
+
+    assert lengths == [3, 3, 3, 3]
+    assert len([e for e in log.read_all() if e.type == marker_type]) == 1
+    assert cursor.acked_seq == 3
 
 
 def test_an_unreachable_host_stops_the_drain_and_abandons_nothing(tmp_path):

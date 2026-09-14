@@ -28,6 +28,10 @@ from theseus.surrogates.transport import StimulusTransport
 logger = logging.getLogger(__name__)
 
 
+def is_marker(event: StimulusEvent) -> bool:
+    return event.type in (GAP, BATCH_REJECTED)
+
+
 def chunk_events(
     events: Sequence[StimulusEvent],
     *,
@@ -89,13 +93,10 @@ class Replicator:
 
     Three known limits, named so they are not rediscovered as bugs:
 
-    **A host that answers but never accepts grows the tape without bound.** Each abandoned
-    batch appends a marker; that marker is itself a batch on the next drain, is abandoned in
-    turn, and produces a marker about the marker — one new event per drain, each burning a
-    full retry budget to describe nothing. Measured against a permanently-500 host: four
-    drains, four markers, twenty sends. A link that is genuinely down raises instead and
-    abandons nothing, so this needs a host that is up and broken. Suppressing it belongs
-    with buffer retention (#33), not here.
+    **A host that answers but never accepts used to grow the tape without bound.** A batch
+    containing only surrogate-minted markers is stepped over without minting a marker about
+    it, so the loop terminates. A batch containing any real event still gets its marker;
+    a link that is genuinely down raises instead and abandons nothing.
 
     **One stale event abandons its whole batch.** Age is `min(e.ts ...)` across a batch of
     up to `DEFAULT_MAX_BATCH_EVENTS`, so a single backfilled or clock-skewed event drags
@@ -192,18 +193,19 @@ class Replicator:
                 # backlog the host mints its own inferred marker first and our declared
                 # one arrives later; both are on the tape, reason is authoritative.
                 nonlocal abandoned_batches
-                self._log.append(
-                    "replicator",
-                    GAP,
-                    declared_gap(
-                        origin=self._log.origin,
-                        from_seq=batch[0].seq,
-                        to_seq=batch[-1].seq,
-                        reason="retry_exhausted",
-                        span_start=min(e.ts for e in batch),
-                        span_end=max(e.ts for e in batch),
-                    ),
-                )
+                if not all(is_marker(event) for event in batch):
+                    self._log.append(
+                        "replicator",
+                        GAP,
+                        declared_gap(
+                            origin=self._log.origin,
+                            from_seq=batch[0].seq,
+                            to_seq=batch[-1].seq,
+                            reason="retry_exhausted",
+                            span_start=min(e.ts for e in batch),
+                            span_end=max(e.ts for e in batch),
+                        ),
+                    )
                 self._cursor.advance(batch[-1].seq)
                 abandoned_batches += 1
 
@@ -243,20 +245,21 @@ class Replicator:
                     if 400 <= result.status < 500:
                         # Permanent: retrying is how one poison batch wedges a channel. Record
                         # the hole on our own log and step over it.
-                        self._log.append(
-                            "replicator",
-                            BATCH_REJECTED,
-                            batch_rejected(
-                                origin=self._log.origin,
-                                from_seq=batch[0].seq,
-                                to_seq=batch[-1].seq,
-                                status=result.status,
-                                # The constructor demands a non-empty reason; a host that
-                                # sends none still gets a truthful one.
-                                reason=result.reason.strip()
-                                or f"host returned {result.status} with no reason",
-                            ),
-                        )
+                        if not all(is_marker(event) for event in batch):
+                            self._log.append(
+                                "replicator",
+                                BATCH_REJECTED,
+                                batch_rejected(
+                                    origin=self._log.origin,
+                                    from_seq=batch[0].seq,
+                                    to_seq=batch[-1].seq,
+                                    status=result.status,
+                                    # The constructor demands a non-empty reason; a host that
+                                    # sends none still gets a truthful one.
+                                    reason=result.reason.strip()
+                                    or f"host returned {result.status} with no reason",
+                                ),
+                            )
                         rejected_batches += 1
                         # Advance past it too: a 4xx will never succeed, so leaving the
                         # cursor behind would re-send a poison batch every drain.
