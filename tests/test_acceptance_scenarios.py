@@ -290,3 +290,20 @@ def test_scenario_08_storage_pressure_evicts_declares_and_keeps_observing(tmp_pa
     host = _host_events(rig)
     assert any(e.type == GAP and e.content["reason"] == "storage_pressure" for e in host)
     assert [e.seq for e in host if e.type != GAP] == survivors
+
+
+def test_scenario_12_clock_skew_is_derivable_from_both_timestamps(tmp_path):
+    """Spec acceptance scenario 12: host arrival time exposes surrogate clock skew."""
+    rig = _rig(tmp_path)
+    surrogate_ts = datetime.now(tz=timezone.utc) - timedelta(milliseconds=900)
+    rig.surrogate.append("sensor", "test.tick", {"n": 1}, ts=surrogate_ts)
+
+    _drain(rig, tmp_path)
+    events = _host_events(rig)
+
+    assert events
+    for event in events:
+        assert event.ts is not None
+        assert event.appended_ts is not None
+        skew = event.appended_ts - event.ts
+        assert timedelta(milliseconds=900) <= skew < timedelta(milliseconds=900, seconds=5)
