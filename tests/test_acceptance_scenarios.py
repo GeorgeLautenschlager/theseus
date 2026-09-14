@@ -97,34 +97,40 @@ def test_scenario_02_duplicate_batch_appends_nothing(tmp_path):
 
 
 def test_scenario_04_declared_gap_advances_high_water_past_the_hole(tmp_path):
-    """Spec acceptance scenario 04: a declared hole and later events drain normally."""
+    """Spec acceptance scenario 04: a declared marker lets high-water pass a hole."""
     rig = _rig(tmp_path)
-    rig.surrogate.append("sensor", "test.tick", {"n": 1}, ts=BASE)
-    rig.surrogate.append(
+    first = rig.surrogate.append("sensor", "test.tick", {"n": 1}, ts=BASE)
+    marker = rig.surrogate.append(
         "sensor",
         GAP,
         declared_gap(
             origin=SURROGATE,
             from_seq=2,
-            to_seq=2,
+            to_seq=4,
             reason="link_down",
             span_start=BASE + timedelta(seconds=1),
-            span_end=BASE + timedelta(seconds=2),
+            span_end=BASE + timedelta(seconds=4),
         ),
-        ts=BASE + timedelta(seconds=2),
+        ts=BASE + timedelta(seconds=5),
     )
-    rig.surrogate.append("sensor", "test.tick", {"n": 3}, ts=BASE + timedelta(seconds=3))
+    later = rig.surrogate.append("sensor", "test.tick", {"n": 6}, ts=BASE + timedelta(seconds=6))
 
-    cursor, result = _drain(rig, tmp_path)
+    lines = []
+    for event, seq in ((first, 1), (marker, 5), (later, 6)):
+        payload = json.loads(event.to_json())
+        payload["seq"] = seq
+        lines.append(json.dumps(payload))
+    response = rig.client.post(URL, content="\n".join(lines) + "\n")
+
     events = _host_events(rig)
     gap = next(event for event in events if event.type == GAP)
-
+    assert 200 <= response.status_code < 300
+    assert (gap.content["from_seq"], gap.content["to_seq"]) == (2, 4)
     assert gap.content["declared"] is True
-    assert gap.content["from_seq"] == 2 and gap.content["to_seq"] == 2
     assert gap.content["reason"] == "link_down"
-    assert [event.content["n"] for event in events if event.type == "test.tick"] == [1, 3]
-    assert result.stopped_on is None
-    assert cursor.acked_seq == rig.marks.high_water(SURROGATE) == 3
+    assert [event.content["n"] for event in events if event.type == "test.tick"] == [1, 6]
+    assert rig.marks.high_water(SURROGATE) == 6
+    assert "inferred_gaps" not in response.json()
 
 
 def test_scenario_05_inferred_gap_is_recorded_by_the_host(tmp_path):
