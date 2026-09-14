@@ -143,6 +143,15 @@ def expired(
     ttl_seconds: float,
     reason: str,
 ) -> dict[str, Any]:
+    """Content for a `command_report.expired` — a command the surrogate dropped as stale
+    rather than executed, so the host does not log "I said X" over silence.
+
+    `age_seconds` is how far past the TTL the command was, and **may be negative**: a
+    `clock_unreliable` expiry reports a command that sat in the surrogate's future.
+    `ttl_seconds` is the bound it was measured against (positive). `reason` is a short
+    machine token (`"ttl_exceeded"` / `"clock_unreliable"`) but still passes through
+    `clean_reason` for the same bounding every report reason gets.
+    """
     _check_reference(command_seq, command_origin, command_id)
     _check_number("ttl_seconds", ttl_seconds, positive=True)
     _check_number("age_seconds", age_seconds)

@@ -84,6 +84,13 @@ def is_command(event: StimulusEvent) -> bool:
 
 
 def command_ttl(event: StimulusEvent) -> float | None:
+    """The command's staleness bound in seconds, or `None` for "no explicit TTL".
+
+    The read side of `command_content`'s `ttl_seconds`, and like `command_target` it never
+    raises: an event off a log that may hold anything — a non-command, a list content, a
+    malformed or non-positive `ttl_seconds` — all read back as `None`, meaning the surrogate
+    applies its own default rather than a feed that throws while filtering.
+    """
     if not is_command(event) or not isinstance(event.content, dict):
         return None
     ttl = event.content.get("ttl_seconds")

@@ -42,6 +42,24 @@ def command_expiry(
     default_ttl: timedelta,
     skew_tolerance: timedelta,
 ) -> tuple[str, float, float] | None:
+    """Whether a queued command has gone stale — `None` if still worth executing, else
+    `(reason, age_seconds, ttl_seconds)` for the report.
+
+    The surrogate compares numbers, it does not reason: the host writes a per-command
+    `ttl_seconds` (or none, for the `default_ttl`) and the surrogate only measures age.
+    `command.ts` is the host's issue time; a naive one is read host-local via
+    `astimezone()`, exactly as `retry.is_too_old` does — stamping UTC instead would make
+    a west-of-Greenwich command look hours older than it is.
+
+    Two ways to be stale. **`clock_unreliable`**: the command sits more than
+    `skew_tolerance` in the surrogate's own future, which a correct clock cannot produce —
+    the RTC has reset (to 1970, say). Firing it as if fresh is the uncanny late speech this
+    check exists to prevent, so an un-ageable command is expired, not executed (and the
+    report makes the drop visible and re-issuable). This is tested before the TTL check
+    because a future-dated command cannot also be TTL-expired. **`ttl_exceeded`**: age has
+    reached the TTL. The boundary counts as expired (`>=`, per the decision's "≥ ttl") —
+    deliberately unlike `is_too_old`'s `>`, though microsecond-exact equality never bites.
+    """
     ttl_seconds = command_ttl(command)
     if ttl_seconds is None:
         ttl_seconds = default_ttl.total_seconds()

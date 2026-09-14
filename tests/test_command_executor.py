@@ -75,6 +75,16 @@ def test_command_expiry_uses_default_ttl_and_clock_guard():
     assert command_expiry(_event_for_expiry(now + timedelta(seconds=2)), now, **kwargs) is None
 
 
+def test_command_expiry_reads_a_naive_timestamp_without_raising():
+    # A naive command.ts must not raise comparing against the aware clock: command_expiry
+    # reads it host-local via astimezone(), exactly as retry.is_too_old does. Days-old so
+    # the verdict is ttl_exceeded regardless of the machine's timezone offset.
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    kwargs = {"default_ttl": DEFAULT_COMMAND_TTL, "skew_tolerance": CLOCK_SKEW_TOLERANCE}
+    result = command_expiry(_event_for_expiry(datetime(2025, 12, 28)), now, **kwargs)
+    assert result is not None and result[0] == "ttl_exceeded"
+
+
 def _event_for_expiry(ts, ttl=None):
     return StimulusEvent("id", ts, "host", "command.say", command_content(target="tam", payload={}, ttl_seconds=ttl))
 
