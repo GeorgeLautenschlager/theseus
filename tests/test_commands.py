@@ -9,6 +9,7 @@ from theseus.commands import (
     command_content,
     command_target,
     command_type,
+    command_ttl,
     is_command,
 )
 from theseus.stimulus_log import StimulusEvent
@@ -46,6 +47,28 @@ def test_content_carries_target_and_payload():
     assert content["payload"] == {"text": "hello"}
     assert set(content) == {"target", "payload"}
     assert command_content(target="tam", payload={})["payload"] == {}
+
+
+def test_command_ttl_is_optional_and_validated():
+    assert command_content(target="tam", payload={}, ttl_seconds=30)["ttl_seconds"] == 30
+    assert "ttl_seconds" not in command_content(target="tam", payload={})
+    for bad in (0, -1, True, float("inf"), float("nan"), "30"):
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            command_content(target="tam", payload={}, ttl_seconds=bad)
+
+
+def test_command_ttl_is_safe_on_malformed_events():
+    typ = command_type("say")
+    cases = [
+        _event(typ, command_content(target="tam", payload={})),
+        _event("observation", {}),
+        _event(typ, []),
+        *[_event(typ, {"ttl_seconds": value}) for value in (0, -1, True, "x")],
+    ]
+    assert all(command_ttl(event) is None for event in cases)
+    good = _event(typ, command_content(target="tam", payload={}, ttl_seconds=30))
+    assert command_ttl(good) == 30
+    assert is_command(good) and command_target(good) == "tam"
 
 
 def test_unaddressed_command_refused():

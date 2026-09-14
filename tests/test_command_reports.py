@@ -14,6 +14,7 @@ import pytest
 
 from theseus.command_reports import (
     BARGED_IN,
+    EXPIRED,
     EXECUTED,
     FAILED,
     PARTIAL,
@@ -24,6 +25,7 @@ from theseus.command_reports import (
     Failed,
     Partial,
     barged_in,
+    expired,
     executed,
     failed,
     is_report,
@@ -58,7 +60,10 @@ def test_outcome_type_strings_are_pinned_wire_protocol():
     assert PARTIAL == "command_report.partial"
     assert FAILED == "command_report.failed"
     assert BARGED_IN == "command_report.barged_in"
-    assert OUTCOMES == (EXECUTED, PARTIAL, FAILED, BARGED_IN)
+    assert EXPIRED == "command_report.expired"
+    assert EXPIRED in OUTCOMES
+    assert len(OUTCOMES) == 5
+    assert OUTCOMES == (EXECUTED, PARTIAL, FAILED, BARGED_IN, EXPIRED)
 
 
 # --- Items 2–5: the constructors validate write-side ------------------------------
@@ -109,6 +114,22 @@ def test_failed_truncates_an_over_long_reason_and_marks_the_cut():
     content = failed(reason="x" * (MAX_REASON_CHARS + 50), **_ref())
     assert len(content["reason"]) == MAX_REASON_CHARS
     assert content["reason"].endswith("…")
+
+
+def test_expired_validates_and_bounds_fields():
+    content = expired(age_seconds=-2.5, ttl_seconds=30, reason="  stale  ", **_ref())
+    assert content == {**_ref(), "age_seconds": -2.5, "ttl_seconds": 30, "reason": "stale"}
+    for bad in (0, -1, True, float("inf"), float("nan"), "30"):
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            expired(age_seconds=1, ttl_seconds=bad, reason="stale", **_ref())
+    for bad in (True, "1", float("nan")):
+        with pytest.raises(ValueError, match="age_seconds"):
+            expired(age_seconds=bad, ttl_seconds=30, reason="stale", **_ref())
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="reason"):
+            expired(age_seconds=1, ttl_seconds=30, reason=bad, **_ref())
+    bounded = expired(age_seconds=1, ttl_seconds=30, reason="x" * (MAX_REASON_CHARS + 10), **_ref())
+    assert len(bounded["reason"]) == MAX_REASON_CHARS and bounded["reason"].endswith("…")
 
 
 def test_barged_in_accepts_any_usable_playback_marker():
@@ -178,7 +199,9 @@ def test_a_command_is_not_a_report_and_vice_versa():
     command = _event(command_type("say"), command_content(target="tam", payload={}))
     assert not is_report(command)
     assert report_outcome(command) is None
-    report = _event(FAILED, failed(reason="muted", **_ref()))
+    report = _event(EXPIRED, expired(age_seconds=-1, ttl_seconds=30, reason="stale", **_ref()))
+    assert is_report(report)
+    assert report_outcome(report) == EXPIRED
     assert not is_command(report)
 
 
