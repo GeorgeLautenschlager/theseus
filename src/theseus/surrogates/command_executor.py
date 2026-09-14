@@ -19,15 +19,39 @@ swallowing that would be the false memory this issue exists to prevent.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Callable
 
 import theseus.command_reports as reports
 from theseus.command_reports import BargedIn, Executed, Failed, Outcome, Partial
+from theseus.commands import command_ttl
 from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.surrogates.clock import Clock, SystemClock
 from theseus.surrogates.command_channel import CommandChannel
 from theseus.surrogates.cursor import AckedCursor
 
 Renderer = Callable[[StimulusEvent], Outcome]
+DEFAULT_COMMAND_TTL = timedelta(hours=6)
+CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
+
+
+def command_expiry(
+    command: StimulusEvent,
+    now: datetime,
+    *,
+    default_ttl: timedelta,
+    skew_tolerance: timedelta,
+) -> tuple[str, float, float] | None:
+    ttl_seconds = command_ttl(command)
+    if ttl_seconds is None:
+        ttl_seconds = default_ttl.total_seconds()
+    event_ts = command.ts.astimezone() if command.ts.tzinfo is None else command.ts
+    age = now - event_ts
+    if age < -skew_tolerance:
+        return "clock_unreliable", age.total_seconds(), ttl_seconds
+    if age >= timedelta(seconds=ttl_seconds):
+        return "ttl_exceeded", age.total_seconds(), ttl_seconds
+    return None
 
 
 class CommandExecutor:
@@ -46,11 +70,15 @@ class CommandExecutor:
         cursor: AckedCursor,
         *,
         actor: str = "surrogate",
+        clock: Clock | None = None,
+        default_ttl: timedelta = DEFAULT_COMMAND_TTL,
     ) -> None:
         self._log = log
         self._render = render
         self._cursor = cursor
         self._actor = actor
+        self._clock = clock or SystemClock()
+        self._default_ttl = default_ttl
 
     def execute_one(self, command: StimulusEvent) -> StimulusEvent:
         """Render one command and append exactly one report to the local log.
@@ -61,6 +89,23 @@ class CommandExecutor:
         append itself raising: the report never became durable.
         """
         _check_command(command)
+        expiry = command_expiry(
+            command,
+            self._clock.now(),
+            default_ttl=self._default_ttl,
+            skew_tolerance=CLOCK_SKEW_TOLERANCE,
+        )
+        if expiry is not None:
+            reason, age_seconds, ttl_seconds = expiry
+            content = reports.expired(
+                command_seq=command.seq,
+                command_origin=command.origin,
+                command_id=command.id,
+                age_seconds=age_seconds,
+                ttl_seconds=ttl_seconds,
+                reason=reason,
+            )
+            return self._log.append(self._actor, reports.EXPIRED, content)
         try:
             report_type, content = self._report_for(self._render(command), command)
         except Exception as exc:  # a failed report, not an escape

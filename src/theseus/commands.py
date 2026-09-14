@@ -21,6 +21,7 @@ second definition of a well-formed command.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from theseus.stimulus_log import StimulusEvent
@@ -49,7 +50,9 @@ def command_type(verb: str) -> str:
     return COMMAND_PREFIX + verb
 
 
-def command_content(*, target: str, payload: dict[str, Any]) -> dict[str, Any]:
+def command_content(
+    *, target: str, payload: dict[str, Any], ttl_seconds: float | None = None
+) -> dict[str, Any]:
     """Content for a command addressed to one surrogate.
 
     An unaddressed command is ambiguous in the worst way: either every surrogate executes
@@ -59,7 +62,17 @@ def command_content(*, target: str, payload: dict[str, Any]) -> dict[str, Any]:
     """
     if not isinstance(target, str) or not target:
         raise ValueError(f"target must be a non-empty surrogate name (got {target!r})")
-    return {"target": target, "payload": payload}
+    content = {"target": target, "payload": payload}
+    if ttl_seconds is not None:
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or not math.isfinite(ttl_seconds)
+            or ttl_seconds <= 0
+        ):
+            raise ValueError(f"ttl_seconds must be a positive real number (got {ttl_seconds!r})")
+        content["ttl_seconds"] = ttl_seconds
+    return content
 
 
 def is_command(event: StimulusEvent) -> bool:
@@ -68,6 +81,20 @@ def is_command(event: StimulusEvent) -> bool:
     it, and treating it as one would hand the executor an unnamed verb.
     """
     return event.type.startswith(COMMAND_PREFIX) and len(event.type) > len(COMMAND_PREFIX)
+
+
+def command_ttl(event: StimulusEvent) -> float | None:
+    if not is_command(event) or not isinstance(event.content, dict):
+        return None
+    ttl = event.content.get("ttl_seconds")
+    if (
+        isinstance(ttl, bool)
+        or not isinstance(ttl, (int, float))
+        or not math.isfinite(ttl)
+        or ttl <= 0
+    ):
+        return None
+    return ttl
 
 
 def command_target(event: StimulusEvent) -> str | None:

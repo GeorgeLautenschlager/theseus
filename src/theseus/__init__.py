@@ -23,6 +23,7 @@ from theseus.durable_delivery import (
 from theseus.commands import (
     command_content,
     command_target,
+    command_ttl,
     command_type,
     is_command,
 )
@@ -109,6 +110,7 @@ __all__ = [
     "report_outcome",
     "command_content",
     "command_target",
+    "command_ttl",
     "command_type",
     "is_command",
     "RecallTool",

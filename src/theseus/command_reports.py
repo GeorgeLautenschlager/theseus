@@ -32,6 +32,7 @@ Nothing here emits, appends or transports anything.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 from theseus.replication_events import clean_reason
@@ -45,8 +46,9 @@ EXECUTED = "command_report.executed"
 PARTIAL = "command_report.partial"
 FAILED = "command_report.failed"
 BARGED_IN = "command_report.barged_in"
+EXPIRED = "command_report.expired"
 
-OUTCOMES = (EXECUTED, PARTIAL, FAILED, BARGED_IN)
+OUTCOMES = (EXECUTED, PARTIAL, FAILED, BARGED_IN, EXPIRED)
 
 
 # --- Outcome value objects --------------------------------------------------------
@@ -132,6 +134,28 @@ def failed(
     }
 
 
+def expired(
+    *,
+    command_seq: int,
+    command_origin: str,
+    command_id: str,
+    age_seconds: float,
+    ttl_seconds: float,
+    reason: str,
+) -> dict[str, Any]:
+    _check_reference(command_seq, command_origin, command_id)
+    _check_number("ttl_seconds", ttl_seconds, positive=True)
+    _check_number("age_seconds", age_seconds)
+    return {
+        "command_seq": command_seq,
+        "command_origin": command_origin,
+        "command_id": command_id,
+        "age_seconds": age_seconds,
+        "ttl_seconds": ttl_seconds,
+        "reason": clean_reason(reason),
+    }
+
+
 def barged_in(
     *,
     command_seq: int,
@@ -173,6 +197,13 @@ def _check_reference(command_seq: int, command_origin: str, command_id: str) -> 
 def _check_name(name: str, value: str) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty string (got {value!r})")
+
+
+def _check_number(name: str, value: object, *, positive: bool = False) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a real number (got {value!r})")
+    if positive and value <= 0:
+        raise ValueError(f"{name} must be greater than 0 (got {value!r})")
 
 
 def _check_playback_position(playback_position: str | int | float) -> None:
