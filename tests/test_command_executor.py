@@ -6,7 +6,7 @@ here."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -15,7 +15,9 @@ from theseus.command_reports import BargedIn, Executed, Failed, Partial
 from theseus.commands import command_content, command_type
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.surrogates.command_channel import MemoryCommandChannel
-from theseus.surrogates.command_executor import CommandExecutor
+from theseus.surrogates.command_executor import (
+    CLOCK_SKEW_TOLERANCE, DEFAULT_COMMAND_TTL, CommandExecutor, command_expiry,
+)
 from theseus.surrogates.cursor import AckedCursor
 
 HOST = "host"
@@ -30,12 +32,19 @@ def _parts(tmp_path: Path):
     return log, cursor, host
 
 
-def _command(host: StimulusLog) -> StimulusEvent:
+class _Clock:
+    def __init__(self, now): self._now = now
+    def now(self): return self._now
+    def sleep(self, seconds): pass
+
+
+def _command(host: StimulusLog, *, ts=None, ttl_seconds=None) -> StimulusEvent:
     """A host-issued command off the host's own log: real seq, origin, id."""
     return host.append(
         "george",
         command_type("say"),
-        command_content(target=SURROGATE, payload={"text": "hi"}),
+        command_content(target=SURROGATE, payload={"text": "hi"}, ttl_seconds=ttl_seconds),
+        ts=ts,
     )
 
 
@@ -52,6 +61,22 @@ class _ScriptedRenderer:
 def _executor(tmp_path: Path, render):
     log, cursor, host = _parts(tmp_path)
     return log, cursor, host, CommandExecutor(log, render, cursor)
+
+
+def test_command_expiry_uses_default_ttl_and_clock_guard():
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    fresh = _event_for_expiry(now)
+    kwargs = {"default_ttl": DEFAULT_COMMAND_TTL, "skew_tolerance": CLOCK_SKEW_TOLERANCE}
+    assert command_expiry(fresh, now, **kwargs) is None
+    assert command_expiry(_event_for_expiry(now - timedelta(hours=6)), now, **kwargs)[0] == "ttl_exceeded"
+    assert command_expiry(_event_for_expiry(now - timedelta(seconds=61), 60), now, **kwargs)[0] == "ttl_exceeded"
+    assert command_expiry(_event_for_expiry(now + timedelta(hours=1)), now, **kwargs)[0] == "clock_unreliable"
+    assert command_expiry(_event_for_expiry(now - timedelta(hours=10), 10**12), now, **kwargs) is None
+    assert command_expiry(_event_for_expiry(now + timedelta(seconds=2)), now, **kwargs) is None
+
+
+def _event_for_expiry(ts, ttl=None):
+    return StimulusEvent("id", ts, "host", "command.say", command_content(target="tam", payload={}, ttl_seconds=ttl))
 
 
 # --- execute_one: one report per command ---------------------------------------
