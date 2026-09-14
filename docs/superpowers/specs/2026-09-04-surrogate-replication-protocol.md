@@ -263,9 +263,6 @@ negotiate with, which would defeat the purpose of presence.
 
 ## Open questions
 
-- Backpressure: what the host does when a surrogate floods it. Note this now interacts with the
-  abandon rule — sustained `429`s should burn retry budget and produce declared gaps rather than
-  an ever-growing surrogate buffer.
 - Auth and pairing scheme for off-LAN surrogates (precondition, not deferred — see Non-goals).
 
 **Resolved:** buffer bounding. The surrogate buffers as much as it can, evicts oldest-first
@@ -323,3 +320,28 @@ execution-report vocabulary (#35).
 Without this split, max attempts shreds the buffer exactly the way attempt-age would: the events
 are fresh so nothing expires by age, and each batch instead burns five attempts against a link
 that is simply absent. Only a host that talks back can cost a batch its budget.
+
+**Resolved (2026-09-14): backpressure (#38).** A surrogate's stream is **value-added, never
+load-bearing** — the host agent is complete without it. So when the host cannot keep up, the
+surrogate's excess is **dropped**, never allowed to make the surrogate hoard: sustained pushback
+burns the retry budget until the front is abandoned as a declared gap. That is *recent beats
+complete* holding under load rather than inverting into an ever-growing buffer.
+
+A `429` is the host's pushback, and it is a **third** answer beside the two above — the host is
+**up and deliberately shedding load**, neither `4xx`-permanent (retrying later is right) nor
+`5xx`-erroring:
+
+- Host answered `429` — retry with the **normal backoff** and **burn an attempt**, exactly as a
+  `5xx` does; abandon on exhaustion as a `retry_exhausted` gap (no new gap reason). The 6h
+  `max_age` check applies as always, so a persistently-throttled front also ages out. A `429`
+  *is* a host talking back, so it costs budget — unlike an absent link.
+
+| | |
+|---|---|
+| `Retry-After` | **Ignored.** The surrogate backs off on its own schedule (2/6/18/54/120s). Honouring "come back in an hour" is exactly the unbounded buffering the abandon rule exists to prevent; the surrogate never lets a shedding host dictate its timing. |
+| Scope | **Per-origin.** One chatty surrogate must not throttle a quiet one — the host answers `429` for the flooding origin, and the per-origin high-water store (#29) already holds the state. |
+| What a `429` means | **Orient-loop lag** — the agent falling behind its own experience. That is the honest signal and the hardest to measure, so the host side (#30) may start with a measurable proxy (a bound on un-oriented backlog) and refine toward it. The meaning is fixed; the metric is not. |
+
+**Seams (follow-up implementation, not this decision).** Emitting the `429` is the host's (#30);
+honouring it in the retry accounting is the surrogate's (#32). Both reuse the existing abandon →
+`retry_exhausted` path, so no new gap reason or wire field is added.
