@@ -263,7 +263,7 @@ negotiate with, which would defeat the purpose of presence.
 
 ## Open questions
 
-- Auth and pairing scheme for off-LAN surrogates (precondition, not deferred — see Non-goals).
+*(All four are now resolved — the blocks below are the answers.)*
 
 **Resolved:** buffer bounding. The surrogate buffers as much as it can, evicts oldest-first
 under pressure, declares what it dropped, and keeps observing throughout.
@@ -345,3 +345,27 @@ A `429` is the host's pushback, and it is a **third** answer beside the two abov
 **Seams (follow-up implementation, not this decision).** Emitting the `429` is the host's (#30);
 honouring it in the retry accounting is the surrogate's (#32). Both reuse the existing abandon →
 `retry_exhausted` path, so no new gap reason or wire field is added.
+
+**Resolved (2026-09-14): auth and pairing (#40).** Application-level auth, TLS and pairing stay a
+non-goal — extended from "LAN only" to **every** deployment — because every surrogate↔host link
+runs over **Tailscale**, a standing infrastructure dependency this protocol does not arrange and has
+no plan to drop. WireGuard supplies peer authentication and transport encryption at the network
+layer, so the host **accepts replication and command traffic only from Tailnet peers and rejects
+everything else** — enforced at the network layer (bound to the tailnet interface / Tailscale ACLs),
+not in application code. The Tailnet is the trust boundary; inside it the tape needs no second gate.
+
+This **collapses the LAN / off-LAN distinction** rather than meeting the off-LAN precondition with
+app auth. A cellular edge device or the cloud VPS where Tam will run is *on the Tailnet*, so it is
+"on the trusted LAN" for this protocol's purposes. There is no planned deployment in which a
+surrogate reaches a host over anything but the Tailnet.
+
+It covers **both** directions the precondition named: the ingress, which appends straight to the
+agent's memory (a memory-injection surface), and the command channel, which the surrogate executes
+unconditionally (a remote-execution surface on its hardware). Network-layer peer auth guards both.
+
+**Deferred, with the trip-wire that reactivates it.** No per-surrogate credential, no
+`origin`-to-identity binding, no `X-Theseus-Token`. This is safe **only** while the Tailnet-only
+assumption holds. The day a surrogate must reach a host over an untrusted network — a public
+ingress, a non-Tailnet peer — this precondition is live again, and app-level auth plus `origin`
+binding must land **before** that endpoint is exposed. Recorded here so that exposure is ever a
+deliberate act, never a default.
