@@ -7,23 +7,35 @@ scenarios 10–11 use the real ``serve`` socket.  No test uses a live network.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+
+import httpx
 from fastapi.testclient import TestClient
 
 from theseus.high_water import HighWaterMarks
+from theseus.command_feed import CommandFeed
+from theseus.command_reports import Failed, is_report
+from theseus.commands import command_content, command_type
 from theseus.replication_events import BATCH_REJECTED, GAP, declared_gap
 from theseus.replication_ingress import ReplicationIngress
 from theseus.stimulus_log import StimulusLog
 from theseus.surrogates.buffer import BufferPolicy, BufferedStimulusLog
+from theseus.surrogates.command_executor import CommandExecutor
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
 from theseus.surrogates.replicator import Replicator
 from theseus.surrogates.retry import RetryBudget
+from theseus.surrogates.sse_command_channel import SseCommandChannel
 
 HOST = "local"
 SURROGATE = "kitchen"
+TARGET = "tam"
 URL = "http://testserver/replicate"
+FAST = {"heartbeat_seconds": 0.05, "poll_seconds": 0.01}
+FAST_BUDGET = RetryBudget(base_seconds=0.01, multiplier=2.0, jitter=0.0)
 BASE = datetime.now(tz=timezone.utc).replace(microsecond=0)
 
 
@@ -290,6 +302,73 @@ def test_scenario_08_storage_pressure_evicts_declares_and_keeps_observing(tmp_pa
     host = _host_events(rig)
     assert any(e.type == GAP and e.content["reason"] == "storage_pressure" for e in host)
     assert [e.seq for e in host if e.type != GAP] == survivors
+
+
+def test_scenario_10_command_issued_during_downtime_is_delivered_on_reconnect(tmp_path, serve):
+    """Spec acceptance scenario 10: queued commands resume in sequence order."""
+    host_log = StimulusLog(tmp_path / "host.jsonl", origin=HOST)
+    issued = [host_log.append("george", command_type("say"),
+                             command_content(target=TARGET, payload={"n": n}))
+              for n in range(3)]
+    base = serve(CommandFeed(host_log, **FAST).build_app())
+    cursor = AckedCursor(tmp_path / "commands.json", f"{SURROGATE}-surrogate")
+    channel = SseCommandChannel(
+        f"{base}/commands/{TARGET}", cursor, client=httpx.Client(),
+        max_reconnects=0, budget=FAST_BUDGET)
+    executed = []
+    done = threading.Event()
+
+    def consume():
+        try:
+            for event in channel.stream():
+                executed.append(event)
+                cursor.advance(event.seq)
+                if len(executed) == len(issued):
+                    break
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=consume, daemon=True)
+    thread.start()
+    assert done.wait(10), "commands were not delivered"
+    channel.close()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert [event.seq for event in executed] == [event.seq for event in issued]
+    assert cursor.acked_seq == issued[-1].seq
+
+
+def test_scenario_11_muted_command_produces_failed_report_on_host_log(tmp_path, serve):
+    """Spec acceptance scenario 11: muted execution reports through replication."""
+    host_log = StimulusLog(tmp_path / "host.jsonl", origin=HOST)
+    surrogate_log = StimulusLog(tmp_path / "surrogate.jsonl", origin=SURROGATE)
+    issued = host_log.append("george", command_type("say"),
+                             command_content(target=TARGET, payload={"n": 1}))
+    app = ReplicationIngress(host_log, HighWaterMarks(host_log)).build_app()
+    CommandFeed(host_log, **FAST).add_routes(app)
+    base = serve(app)
+    cmd_cursor = AckedCursor(tmp_path / "commands.json", f"{SURROGATE}-commands")
+    up_cursor = AckedCursor(tmp_path / "upstream.json", f"{SURROGATE}-upstream")
+    channel = SseCommandChannel(f"{base}/commands/{TARGET}", cmd_cursor,
+                                max_reconnects=0, budget=FAST_BUDGET)
+    executor = CommandExecutor(surrogate_log, lambda command: Failed("output muted"), cmd_cursor)
+    thread = threading.Thread(target=executor.run, args=(channel,), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not [event for event in surrogate_log.read_all() if is_report(event)]:
+        assert time.monotonic() < deadline, "report was not produced"
+        time.sleep(0.01)
+    channel.close()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    Replicator(surrogate_log, HttpTransport(f"{base}/replicate", client=httpx.Client()), up_cursor).drain()
+    reports = [event for event in host_log.read_all() if is_report(event)]
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.origin == SURROGATE
+    assert report.type == "command_report.failed"
+    assert report.content["reason"] == "output muted"
+    assert (report.content["command_origin"], report.content["command_seq"]) == (HOST, issued.seq)
 
 
 def test_scenario_12_clock_skew_is_derivable_from_both_timestamps(tmp_path):
