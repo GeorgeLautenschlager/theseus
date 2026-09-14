@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 
 def is_marker(event: StimulusEvent) -> bool:
+    """A surrogate-minted marker — a `stimulus.gap` or `replication.batch_rejected`. A
+    batch of *only* these is stepped over on abandonment without minting a marker about it,
+    so a host that is up but never accepts cannot grow the surrogate's tape without bound
+    (#44); a batch with any real event still gets its marker."""
     return event.type in (GAP, BATCH_REJECTED)
 
 
@@ -91,12 +95,7 @@ class Replicator:
     the drain stops cleanly, abandons nothing, and spends no budget — the next drain retries
     the same range.
 
-    Three known limits, named so they are not rediscovered as bugs:
-
-    **A host that answers but never accepts used to grow the tape without bound.** A batch
-    containing only surrogate-minted markers is stepped over without minting a marker about
-    it, so the loop terminates. A batch containing any real event still gets its marker;
-    a link that is genuinely down raises instead and abandons nothing.
+    Two known limits, named so they are not rediscovered as bugs:
 
     **One stale event abandons its whole batch.** Age is `min(e.ts ...)` across a batch of
     up to `DEFAULT_MAX_BATCH_EVENTS`, so a single backfilled or clock-skewed event drags
