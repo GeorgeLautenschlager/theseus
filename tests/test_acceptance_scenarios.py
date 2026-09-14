@@ -13,12 +13,14 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from theseus.high_water import HighWaterMarks
-from theseus.replication_events import GAP, declared_gap
+from theseus.replication_events import BATCH_REJECTED, GAP, declared_gap
 from theseus.replication_ingress import ReplicationIngress
 from theseus.stimulus_log import StimulusLog
+from theseus.surrogates.buffer import BufferPolicy, BufferedStimulusLog
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
 from theseus.surrogates.replicator import Replicator
+from theseus.surrogates.retry import RetryBudget
 
 HOST = "local"
 SURROGATE = "kitchen"
@@ -62,6 +64,40 @@ def _drain(rig, tmp_path, cursor_name="cursor.json", **kwargs):
 
 def _host_events(rig):
     return [event for event in rig.host_log.read_all() if event.origin == SURROGATE]
+
+
+def _pressure_rig(tmp_path):
+    host_log = StimulusLog(tmp_path / "host.jsonl", origin=HOST)
+    marks = HighWaterMarks(host_log)
+    app = ReplicationIngress(host_log, marks).build_app()
+    surrogate = BufferedStimulusLog(
+        tmp_path / "surrogate.jsonl", origin=SURROGATE,
+        policy=BufferPolicy(max_bytes=1600, low_water=0.5),
+    )
+    rig = SimpleNamespace(host_log=host_log, marks=marks, client=TestClient(app), surrogate=surrogate)
+    for i in range(1, 7):
+        surrogate.append("sensor", "test.tick", {"n": i, "pad": "x" * 100}, ts=BASE + timedelta(seconds=i))
+    return rig
+
+
+def _flaky(rig, statuses):
+    app = rig.client.app
+    calls = 0
+
+    async def wrapper(scope, receive, send):
+        nonlocal calls
+        if scope["type"] == "http" and scope["path"] == "/replicate" and calls < len(statuses):
+            status = statuses[calls]
+            calls += 1
+            if status >= 300:
+                while (await receive()).get("more_body"):
+                    pass
+                await send({"type": "http.response.start", "status": status, "headers": []})
+                await send({"type": "http.response.body", "body": b""})
+                return
+        await app(scope, receive, send)
+
+    rig.client = TestClient(wrapper, follow_redirects=False)
 
 
 def _body(events):
@@ -161,3 +197,60 @@ def test_scenario_03_lost_ack_retry_no_duplicate(tmp_path):
     assert seqs == [1, 2, 3, 4, 5]
     assert len(seqs) == len(set(seqs))
     assert cursor.acked_seq == 5
+
+
+def test_scenario_06_oversized_or_malformed_batch_is_rejected_and_marked(tmp_path):
+    """Spec acceptance scenario 06: a host 4xx advances the surrogate and is marked."""
+    # Keep the host limit below the payload while the surrogate can form the batch.
+    rig = _rig_with_host_limit(tmp_path, 500)
+    poison = rig.surrogate.append("sensor", "test.blob", {"blob": "x" * 500}, ts=BASE)
+    response = rig.client.post(URL, content=_body([poison]))
+    assert 400 <= response.status_code < 500
+    cursor, result = _drain(rig, tmp_path, max_bytes=100)
+    assert result.rejected_batches == 1
+    assert cursor.acked_seq == 1
+    assert _host_events(rig) == []
+    cursor, result = _drain(rig, tmp_path)
+    markers = [e for e in _host_events(rig) if e.type == BATCH_REJECTED]
+    assert result.stopped_on is None and len(markers) == 1
+    assert markers[0].content["from_seq"] == markers[0].content["to_seq"] == 1
+    assert 400 <= markers[0].content["status"] < 500
+
+
+def _rig_with_host_limit(tmp_path, limit):
+    host_log = StimulusLog(tmp_path / "host.jsonl", origin=HOST)
+    marks = HighWaterMarks(host_log)
+    app = ReplicationIngress(host_log, marks, max_bytes=limit).build_app()
+    return SimpleNamespace(host_log=host_log, marks=marks, client=TestClient(app), surrogate=StimulusLog(tmp_path / "surrogate.jsonl", origin=SURROGATE))
+
+
+def test_scenario_07_retry_exhaustion_abandons_and_drains_the_rest(tmp_path):
+    """Spec acceptance scenario 07: exhausted batches do not block later batches."""
+    rig = _rig(tmp_path)
+    _flaky(rig, [500, 500])
+    for i in range(1, 5):
+        rig.surrogate.append("sensor", "test.tick", {"n": i}, ts=BASE + timedelta(seconds=i))
+    clock = FakeClock(BASE)
+    cursor, result = _drain(rig, tmp_path, max_events=2, budget=RetryBudget(max_attempts=2), clock=clock)
+    assert result.abandoned_batches >= 1 and result.stopped_on is None
+    assert [e.content["n"] for e in _host_events(rig) if e.type == "test.tick"] == [3, 4]
+    _drain(rig, tmp_path, cursor_name="marker.json", max_events=2,
+           budget=RetryBudget(max_attempts=2), clock=clock)
+    assert any(e.type == GAP and e.content["reason"] == "retry_exhausted" for e in _host_events(rig))
+    assert cursor.acked_seq == 4
+    assert clock.sleeps
+
+
+def test_scenario_08_storage_pressure_evicts_declares_and_keeps_observing(tmp_path):
+    """Spec acceptance scenario 08: eviction records a hole without pausing observation."""
+    rig = _pressure_rig(tmp_path)
+    buffered = rig.surrogate.read_all()
+    survivors = [e.seq for e in buffered if e.type != GAP]
+    gaps = [e for e in buffered if e.type == GAP and e.content["reason"] == "storage_pressure"]
+    assert survivors and gaps and min(survivors) > 1
+    assert gaps[0].content["from_seq"] == 1
+    cursor, result = _drain(rig, tmp_path)
+    assert result.stopped_on is None
+    host = _host_events(rig)
+    assert any(e.type == GAP and e.content["reason"] == "storage_pressure" for e in host)
+    assert [e.seq for e in host if e.type != GAP] == survivors
