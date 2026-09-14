@@ -97,6 +97,21 @@ class CommandFeed:
         self.add_routes(app)
         return app
 
+    def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+        """Run the standalone feed server and block until it stops."""
+        import uvicorn
+
+        # Without this, uvicorn's graceful shutdown waits indefinitely for
+        # open connections to close on their own — but the command stream is
+        # an infinite SSE stream that only ends when the surrogate disconnects,
+        # so Ctrl+C would hang forever while any surrogate is connected.
+        uvicorn.run(
+            self.build_app(),
+            host=host,
+            port=port,
+            timeout_graceful_shutdown=3,
+        )
+
     async def _stream(self, request: Request, target: str):
         """Replay above the cursor, then live, with a heartbeat when idle.
 

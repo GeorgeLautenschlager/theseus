@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx
+from fastapi import FastAPI
 from starlette.requests import Request
 
 from theseus.command_feed import CommandFeed, _format_sse
@@ -422,6 +423,26 @@ def test_payload_newline_never_reaches_the_wire_raw(tmp_path):
     # The frame carries an id: line and an event: line around the data.
     assert f"id: {cmd.seq}" in frame
     assert f"event: {cmd.type}" in frame
+
+
+def test_serve_runs_standalone_app_with_graceful_shutdown_timeout(tmp_path, monkeypatch):
+    rig = _rig(tmp_path)
+    calls = []
+
+    def fake_run(app, **kwargs):
+        calls.append((app, kwargs))
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    rig.feed.serve(host="0.0.0.0", port=8123)
+
+    assert len(calls) == 1
+    app, kwargs = calls[0]
+    assert isinstance(app, FastAPI)
+    assert kwargs["host"] == "0.0.0.0"
+    assert kwargs["port"] == 8123
+    assert kwargs["timeout_graceful_shutdown"] > 0
 
 
 def test_mounted_route_serves_the_stream(tmp_path, serve):
