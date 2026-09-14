@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from time import perf_counter
 
 from fastapi.testclient import TestClient
 
@@ -239,6 +240,44 @@ def test_scenario_07_retry_exhaustion_abandons_and_drains_the_rest(tmp_path):
     assert any(e.type == GAP and e.content["reason"] == "retry_exhausted" for e in _host_events(rig))
     assert cursor.acked_seq == 4
     assert clock.sleeps
+
+
+def test_scenario_09_hour_offline_then_drains_backlog_in_chunks(tmp_path):
+    """Spec acceptance scenario 09: an hour of backlog drains in bounded batches."""
+    rig = _rig(tmp_path)
+    n = 600
+    max_events = 50
+    clock = FakeClock(BASE + timedelta(hours=1))
+    for i in range(1, n + 1):
+        rig.surrogate.append(
+            "sensor", "test.tick", {"n": i},
+            ts=BASE + timedelta(seconds=6 * (i - 1)),
+        )
+
+    class CountingClient:
+        def __init__(self, client):
+            self.client = client
+            self.posts = 0
+
+        def post(self, *args, **kwargs):
+            self.posts += 1
+            return self.client.post(*args, **kwargs)
+
+    client = CountingClient(rig.client)
+    rig.client = client
+    started = perf_counter()
+    cursor, result = _drain(rig, tmp_path, max_events=max_events, clock=clock)
+    elapsed = perf_counter() - started
+    events = _host_events(rig)
+    seqs = [event.seq for event in events]
+
+    assert result.stopped_on is None
+    assert seqs == list(range(1, n + 1))
+    assert len(seqs) == n
+    assert client.posts == (n + max_events - 1) // max_events
+    assert rig.marks.high_water(SURROGATE) == n
+    assert cursor.acked_seq == n
+    assert elapsed < 1.0
 
 
 def test_scenario_08_storage_pressure_evicts_declares_and_keeps_observing(tmp_path):
