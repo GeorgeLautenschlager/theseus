@@ -3,6 +3,14 @@ from __future__ import annotations
 from theseus.assembly import AgentSpec, InterfaceSpec, MemorySpec, ModelSpec, build_agent
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
+from theseus.command_reports import (
+    BargedIn,
+    Executed,
+    Failed,
+    Partial,
+    is_report,
+    report_outcome,
+)
 from theseus.command_feed import CommandFeed
 from theseus.durable_delivery import (
     DeliveryJournal,
@@ -28,6 +36,7 @@ from theseus.replication_ingress import ReentrantIngest, ReplicationIngress
 from theseus.schedule import Schedule
 from theseus.surrogates.buffer import BufferPolicy, BufferedStimulusLog
 from theseus.surrogates.command_channel import CommandChannel, MemoryCommandChannel
+from theseus.surrogates.command_executor import CommandExecutor
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.http_transport import HttpTransport
 from theseus.surrogates.replicator import Replicator
@@ -91,6 +100,13 @@ __all__ = [
     "Replicator",
     "RetryBudget",
     "StimulusTransport",
+    "CommandExecutor",
+    "Executed",
+    "Partial",
+    "BargedIn",
+    "Failed",
+    "is_report",
+    "report_outcome",
     "command_content",
     "command_target",
     "command_type",
