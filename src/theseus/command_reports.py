@@ -205,10 +205,10 @@ def is_report(event: StimulusEvent) -> bool:
 def report_outcome(event: StimulusEvent) -> str | None:
     """The event's type when it is a report, else `None`.
 
-    Returns rather than raises because these events come off a log that may hold anything:
-    a report line whose content is a list or is missing fields is somebody else's bug, not
-    a reason for a filtering feed to stop serving. The predicate answers about the type,
-    never the payload.
+    Returns rather than raises because these events come off a log that may hold anything,
+    and a feed that throws while filtering is a feed that stops serving. Non-dict content —
+    a list, say — answers `None`; a report that is a dict but missing fields still returns
+    its type, because the predicate answers about the type, never the payload.
     """
     if not is_report(event):
         return None

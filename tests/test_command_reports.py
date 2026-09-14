@@ -35,12 +35,12 @@ from theseus.replication_events import MAX_REASON_CHARS
 from theseus.stimulus_log import StimulusEvent
 
 
-def _event(type: str, content) -> StimulusEvent:
+def _event(type_: str, content) -> StimulusEvent:
     return StimulusEvent(
         id="e1",
         ts=datetime.now(timezone.utc),
         actor="surrogate",
-        type=type,
+        type=type_,
         content=content,
     )
 

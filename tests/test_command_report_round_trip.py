@@ -62,7 +62,7 @@ def _run_executor(
     """`executor.run` on a daemon thread against the live channel.
 
     Polls for the expected reports on the surrogate log (deadline-bounded, never a bare
-    sleep), then closes the channel — with an owned client that interrupts the in-flight
+    sleep), then closes the channel — the channel's own client interrupts the in-flight
     stream read — and joins, so `run` is guaranteed to have returned before the caller
     drains upstream.
     """

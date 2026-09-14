@@ -64,6 +64,9 @@ class CommandExecutor:
         try:
             report_type, content = self._report_for(self._render(command), command)
         except Exception as exc:  # a failed report, not an escape
+            # reports.failed cannot itself raise here: _check_command validated
+            # seq/origin/id up front, and a stringified exception is always a
+            # non-empty reason.
             content = reports.failed(
                 command_seq=command.seq,
                 command_origin=command.origin,
