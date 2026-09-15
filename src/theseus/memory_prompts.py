@@ -114,6 +114,12 @@ def build_extraction_prompt(evidence_text: str, context_text: str = "") -> str:
         "- summary: 1-3 sentences, in the agent's first person, of what happened in this "
         "episode. This is the whole episode record: carry the substance here.\n"
         "- assertions: the durable claims worth keeping, each with:\n"
+        "Keep each claim atomic and preserve names, amounts, dates, and task owners. "
+        "A decision or plan to act is not evidence that the action succeeded. "
+        "Keep intentions, attempts, failures, and confirmed outcomes distinct. "
+        "A partner's message is a report from that partner; preserve that attribution. "
+        "Use consistent subjects and predicates for updates to existing facts. "
+        "Do not infer successful payments or completed work without confirming evidence.\n"
         '  - kind: "fact" (a checkable claim about a subject), "principle" (a generalized '
         'rule or preference that would guide future behavior), or "event" (something that '
         "happened, not durable enough to be a fact).\n"

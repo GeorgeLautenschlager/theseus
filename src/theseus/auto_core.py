@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import hashlib
 import threading
@@ -14,6 +15,7 @@ from theseus.cadence import DEFAULT_TICK_SECONDS, Cadence
 from theseus.cognitive_prompts import render_tools_section
 from theseus.context_assembler import ContextAssembler
 from theseus.memory_module import MemoryModule
+from theseus.memory_consolidator import MemoryConsolidator
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.model_providers.model_provider import ModelProvider
 from theseus.schedule import Schedule
@@ -135,6 +137,7 @@ class Autocore:
         )
         self.tools: dict[str, Tool] = tools
         self.memory: Memory | MemoryModule | None = memory
+        self.memory_consolidator: MemoryConsolidator | None = None
         self.context_assembler: ContextAssembler = ContextAssembler(
             stimulus_log=self.stimulus_log
         )
@@ -230,6 +233,11 @@ class Autocore:
             prompt_chars=sum(len(message["content"]) for message in messages),
             window_chars=self.loop_memory["window_chars"],
         )
+        if self.memory_consolidator is not None:
+            try:
+                self.memory_consolidator.tick()
+            except Exception:
+                logging.getLogger(__name__).exception("Memory consolidation deferred; cursor preserved")
 
     def wake(self, trigger: StimulusEvent | str | None = None) -> None:
         """Cut short any sleep in progress so the next turn starts now.

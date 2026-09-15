@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-from theseus.assembly import AgentSpec, InterfaceSpec, ModelSpec, PairingSpec
+from theseus.assembly import AgentSpec, InterfaceSpec, ModelSpec, PairingSpec, MemorySpec
 
 
 SPEC = AgentSpec(
@@ -25,4 +25,12 @@ SPEC = AgentSpec(
         outgoing_interval_seconds=5.0, outgoing_chat_ids_only=True,
     ),
     pairing=PairingSpec("../../pair-alpha/state/stimulus_log.jsonl", "Alpha"),
+    memory=MemorySpec(
+        "module",
+        model=ModelSpec(os.getenv("PAIR_MEMORY_PROVIDER", "ollama"),
+                        os.getenv("PAIR_MEMORY_MODEL", "gemma4:e4b")),
+        embedding=ModelSpec(os.getenv("PAIR_EMBEDDING_PROVIDER", "ollama"),
+                            os.getenv("PAIR_EMBEDDING_MODEL", "nomic-embed-text")),
+        consolidate_every_seconds=300,
+    ),
 )

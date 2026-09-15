@@ -97,10 +97,12 @@ respects `recall_budget_tokens`; A-MEM retains its existing retrieval settings.
 A-MEM stores notes in `a_mem.jsonl`; MemoryModule stores layers in `memory/`.
 Switching modules preserves both stores but does not migrate between them.
 
-Autocore holds the module without automatically forming or consolidating memories.
-The agent's episode/scheduling policy still calls `memory.form()` for A-MEM or
-`memory.consolidate(episode)` for MemoryModule. This assembler does not invent that
-policy. OODA supports A-MEM and retains its existing end-of-turn `form()` call;
+Auto can opt into bounded MemoryModule formation with
+`consolidate_every_seconds=300`, `episode_max_events=20`, and
+`episode_max_chars=24000` in `MemorySpec`. Without a schedule, the application
+calls `memory.consolidate(episode)` explicitly. Auto A-MEM formation still requires
+an application policy. See [memory reliability](memory-reliability.md) for recovery,
+costs, and evaluation. OODA supports A-MEM and retains its existing end-of-turn `form()` call;
 MemoryModule does not implement that lifecycle and is rejected with OODA.
 
 ## Reassembly and state

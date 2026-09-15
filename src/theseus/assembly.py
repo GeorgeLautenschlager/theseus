@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 from pathlib import Path
 from pprint import pformat
@@ -18,6 +19,7 @@ from theseus.chat_observer import TerminalChatObserver
 from theseus.context_assembler import ContextAssembler
 from theseus.durable_delivery import DeliveryJournal, DurableInbox, DurableOutbox
 from theseus.memory_module import MemoryModule
+from theseus.memory_consolidator import MemoryConsolidator
 from theseus.memory_store import MemoryStore
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.ooda_core import OODACore
@@ -51,6 +53,9 @@ class MemorySpec:
     embedding: ModelSpec | None = None
     recall_budget_tokens: int = 2000
     recall_description: str | None = None
+    consolidate_every_seconds: float | None = None
+    episode_max_events: int = 20
+    episode_max_chars: int = 24000
 
 
 @dataclass(frozen=True)
@@ -169,6 +174,16 @@ class AgentSpec:
         if not isinstance(self.memory, MemorySpec):
             raise ValueError("memory must be a MemorySpec")
         memory = self.memory
+        if memory.consolidate_every_seconds is not None:
+            if (memory.kind != "module" or memory.model is None
+                or not isinstance(memory.consolidate_every_seconds, (int, float))
+                or not math.isfinite(memory.consolidate_every_seconds)
+                or memory.consolidate_every_seconds <= 0):
+                raise ValueError("scheduled consolidation requires module memory, an extraction model, and a positive interval")
+        if type(memory.episode_max_events) is not int or memory.episode_max_events < 1:
+            raise ValueError("episode_max_events must be positive")
+        if type(memory.episode_max_chars) is not int or memory.episode_max_chars < 4096:
+            raise ValueError("episode_max_chars must be at least 4096")
         if memory.kind not in ("none", "amem", "module"):
             raise ValueError("memory kind must be 'none', 'amem', or 'module'")
         if type(memory.recall_budget_tokens) is not int or memory.recall_budget_tokens <= 0:
@@ -295,7 +310,13 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
             stimulus_log=core.stimulus_log, memory_dir=home / "memory",
             model_providers=[_provider(spec.memory.model)] if spec.memory.model else [],
             embedding_providers=[_provider(spec.memory.embedding)] if spec.memory.embedding else [],
+            max_input_chars=spec.memory.episode_max_chars,
         )
+        if spec.memory.consolidate_every_seconds is not None:
+            core.memory_consolidator = MemoryConsolidator(
+                core.memory, every_seconds=spec.memory.consolidate_every_seconds,
+                max_events=spec.memory.episode_max_events, max_chars=spec.memory.episode_max_chars,
+            )
     if core.memory is not None:
         recall = RecallTool(core.memory, budget_tokens=spec.memory.recall_budget_tokens)
         if spec.memory.recall_description is not None:

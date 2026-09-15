@@ -23,7 +23,7 @@ from typing import Any
 
 import numpy as np
 
-from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines
+from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines, lexical_score, valid_vector, terms
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +34,7 @@ class MemoryRecord:
     summary: str                      # LLM one-paragraph rendering — what retrieval embeds and agents read back
     embedding: list[float] = field(default_factory=list)
     source_episode_id: str = ""
+    embedding_model: str = ""
 
     def to_json(self) -> str:
         return json.dumps(
@@ -44,6 +45,7 @@ class MemoryRecord:
                 "summary": self.summary,
                 "embedding": self.embedding,
                 "source_episode_id": self.source_episode_id,
+                "embedding_model": self.embedding_model,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -59,13 +61,14 @@ class MemoryRecord:
             summary=d["summary"],
             embedding=d.get("embedding", []),
             source_episode_id=d.get("source_episode_id", ""),
+            embedding_model=d.get("embedding_model", ""),
         )
 
     def render(self) -> str:
         """What an agent reads back. `content` is provenance (raw evidence);
         rendering it would echo log text the agent may already hold — same
         discipline as MemoryNote.render."""
-        return f"[{self.id}] {self.summary}"
+        return f"[{self.id}] Episode {self.ts.isoformat()}: {self.summary}"
 
 
 def _recency_weight(ts: datetime, now: datetime, half_life_days: float) -> float:
@@ -81,6 +84,9 @@ class MemoryLayer:
             self._records.append(MemoryRecord.from_json(line))
 
     def add(self, record: MemoryRecord) -> MemoryRecord:
+        existing = self.get(record.id)
+        if existing is not None:
+            return existing
         append_record(self.path, record.to_json())
         self._records.append(record)
         return record
@@ -91,24 +97,47 @@ class MemoryLayer:
         k: int = 5,
         now: datetime | None = None,
         half_life_days: float = 30.0,
+        embedding_model: str | None = None,
+        embeddings: dict[str, list[float]] | None = None,
     ) -> list[LayerHit]:
         """Top-k by cosine × recency weight. Records are never touched; the
         weight is computed here, against `now` (defaults to wall clock)."""
-        if not self._records or not embedding:
+        if not self._records or not valid_vector(embedding):
+            return []
+        overrides = embeddings or {}
+        records = [r for r in self._records if valid_vector(overrides.get(r.id, r.embedding), len(embedding))
+                   and (r.id in overrides or embedding_model is None or r.embedding_model == embedding_model)]
+        if not records:
             return []
         now = now or datetime.now(timezone.utc)
         q = np.asarray(embedding, dtype=np.float64)
-        matrix = np.asarray([r.embedding for r in self._records], dtype=np.float64)
+        matrix = np.asarray([overrides.get(r.id, r.embedding) for r in records], dtype=np.float64)
         scores = _cosine_scores(q, matrix)
         weighted = [
-            s * _recency_weight(r.ts, now, half_life_days) for s, r in zip(scores, self._records)
+            s * _recency_weight(r.ts, now, half_life_days) for s, r in zip(scores, records)
         ]
-        order = sorted(range(len(self._records)), key=lambda i: weighted[i], reverse=True)[:k]
+        order = sorted(range(len(records)), key=lambda i: weighted[i], reverse=True)[:k]
         return [
-            LayerHit(id=self._records[i].id, text=self._records[i].render(), score=weighted[i])
+            LayerHit(id=records[i].id, text=records[i].render(), score=weighted[i])
             for i in order
             if weighted[i] > 0.0
         ]
+
+    def search(self, query: str, k: int = 5) -> list[LayerHit]:
+        scored = [(max(lexical_score(query, r.summary), lexical_score(query, r.content)), r)
+                  for r in self._records]
+        scored.sort(key=lambda pair: (pair[0], pair[1].ts), reverse=True)
+        hits = []
+        for score, record in scored:
+            if score <= 0 or len(hits) >= k:
+                break
+            text = record.render()
+            if lexical_score(query, record.content) > lexical_score(query, record.summary):
+                positions = [record.content.casefold().find(term) for term in terms(query)]
+                start = max(0, min((p for p in positions if p >= 0), default=0) - 200)
+                text += "\nHistorical evidence excerpt: " + record.content[start:start + 1200]
+            hits.append(LayerHit(record.id, text, score))
+        return hits
 
     def get(self, record_id: str) -> MemoryRecord | None:
         return next((r for r in self._records if r.id == record_id), None)
