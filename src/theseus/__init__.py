@@ -45,6 +45,7 @@ from theseus.surrogates.retry import RetryBudget
 from theseus.surrogates.sse_command_channel import SseCommandChannel
 from theseus.surrogates.transport import StimulusTransport
 from theseus.stimulus_log import PairedStimulusLog, StimulusEvent, StimulusLog
+from theseus.memory_consolidator import MemoryConsolidator
 from theseus.time_observer import TimeObserver
 from theseus.telegram_api import TelegramBotAPI, TelegramSender
 from theseus.telegram_observer import TelegramObserver
@@ -81,6 +82,7 @@ __all__ = [
     "Episode",
     "Memory",
     "MemoryModule",
+    "MemoryConsolidator",
     "MemoryNote",
     "MemoryStore",
     "MemoryCommandChannel",

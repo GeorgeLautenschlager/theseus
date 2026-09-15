@@ -64,3 +64,5 @@ home directory. See [Agent Assembler](docs/agent-assembler.md) for variants, Tam
 custom parts, memory, durable Telegram configuration, and isolated E2E agents.
 For two agents sharing an observable Telegram group and read-only peer histories,
 see [Observable pair](docs/paired-agents.md).
+
+See [Memory reliability](docs/memory-reliability.md) for scheduled formation, crash recovery, and the paired-experiment evaluation.

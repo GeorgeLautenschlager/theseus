@@ -1,7 +1,8 @@
 """MemoryModule — the single memory boundary an agent core programs against.
 
 The core sees two capabilities and nothing else: `recall(query, budget_tokens)`
-and `consolidate(episode)`. Everything below this line — which layers exist,
+and `consolidate(episode)`; applications can also repair derived embeddings.
+Everything below this line — which layers exist,
 how a query fans out, how results fuse, what gets written where — is internal
 and may change without the core noticing. That is the leak contract: no layer
 name appears in a public signature or in a result field the core must
@@ -10,17 +11,20 @@ strings a caller may log but never branch on.
 
 Retrieval is deterministic fan-out + reciprocal rank fusion (RRF): every layer
 answers the query in its own way, each returns a ranked list, and RRF merges
-the rankings without comparing any layer's scores to another's (they live on
-different scales). Misses are data — a layer that finds nothing contributes a
+the rankings without comparing raw scores across layers. Within-layer lexical
+and vector hits share IDs; across layers this is a weighted rank interleave,
+not evidence of semantic agreement. Misses are data — a layer that finds nothing contributes a
 string to `RecallResult.misses`, never an exception.
 """
 
 from __future__ import annotations
 
 import json
-import string
+import threading
+import logging
+from functools import wraps
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,7 +32,8 @@ from typing import Any
 from theseus.intelligence_layer import IntelligenceLayer
 from theseus.json_utils import parse_json_response
 from theseus.knowledge_layer import KnowledgeLayer, KnowledgeRecord
-from theseus.layer_store import LayerHit, append_record, load_lines
+from theseus.layer_store import (LayerHit, append_record, load_lines, atomic_json,
+                                 fsync_directory, store_lock, terms, valid_vector)
 from theseus.memory_layer import MemoryLayer, MemoryRecord
 from theseus.memory_prompts import build_extraction_prompt, extraction_json_schema
 from theseus.stimulus_log import StimulusLog, new_id
@@ -96,6 +101,34 @@ class ConsolidationResult:
     skipped: bool = False     # True when the episode was already consolidated
 
 
+logger = logging.getLogger(__name__)
+
+
+def _serialized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock, store_lock(self.memory_dir):
+            self._reload()
+            self._recover_pending()
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
+def _provider_identity(provider) -> str:
+    model = getattr(provider, "model", "")
+    return type(provider).__module__ + "." + type(provider).__qualname__ + ":" + (model if isinstance(model, str) else "")
+
+
+def _combine(*rankings: list[LayerHit], k: int) -> list[LayerHit]:
+    scores = {}
+    hits = {}
+    for ranking in rankings:
+        for rank, hit in enumerate(ranking, 1):
+            scores[hit.id] = scores.get(hit.id, 0.0) + 1 / (_RRF_K + rank)
+            hits[hit.id] = hit
+    return [hits[key] for key in sorted(scores, key=lambda key: -scores[key])[:k]]
+
+
 class MemoryModule:
     def __init__(
         self,
@@ -108,11 +141,20 @@ class MemoryModule:
         intelligence_tail: int = 20,
         recency_half_life_days: float = 30.0,
         lenient_fact_routing: bool = False,
+        max_input_chars: int = 48000,
+        max_output_tokens: int = 4096,
     ) -> None:
         self.memory_dir = Path(memory_dir)
-        self.knowledge = KnowledgeLayer(self.memory_dir / "knowledge.jsonl")
-        self.memory = MemoryLayer(self.memory_dir / "memory.jsonl")
-        self.wisdom = WisdomLayer(self.memory_dir / "wisdom.jsonl")
+        self._lock = threading.RLock()
+        self._last_embedding_model = ""
+        self._embedding_calls = 0
+        self._embedding_tokens = 0
+        if type(max_input_chars) is not int or max_input_chars < 4096:
+            raise ValueError("max_input_chars must be at least 4096")
+        if type(max_output_tokens) is not int or max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be positive")
+        self._max_input_chars = max_input_chars
+        self._max_output_tokens = max_output_tokens
         self.intelligence = IntelligenceLayer(stimulus_log, tail=intelligence_tail)
         self._stimulus_log = stimulus_log
         self._embedding_providers = embedding_providers or []
@@ -124,19 +166,63 @@ class MemoryModule:
         # the model clearly meant "durable claim", and the statement is what
         # recall needs. A/B'd in the 2026-08-30 sonnet eval.
         self._lenient_fact_routing = lenient_fact_routing
-        # Idempotency ledger: episode ids already consolidated. Re-consolidating
-        # one is a no-op, so replaying a range never double-writes.
-        self._processed_episodes: set[str] = {
-            json.loads(line)["episode_id"]
-            for line in load_lines(self.memory_dir / "consolidation_ledger.jsonl")
-        }
+        with self._lock, store_lock(self.memory_dir):
+            self._reload()
+            self._recover_pending()
+
+    def _reload(self) -> None:
+        # Every operation reloads under the process lock: another owner or a failed
+        # append cannot leave the in-memory projection ahead of/behind durable state.
+        self.knowledge = KnowledgeLayer(self.memory_dir / "knowledge.jsonl")
+        self.memory = MemoryLayer(self.memory_dir / "memory.jsonl")
+        self.wisdom = WisdomLayer(self.memory_dir / "wisdom.jsonl")
+        ledger = [json.loads(line) for line in load_lines(self.memory_dir / "consolidation_ledger.jsonl")]
+        self._processed_episodes = {row["episode_id"] for row in ledger}
+        self._episode_ranges = {row["episode_id"]: (row.get("start_id"), row.get("end_id")) for row in ledger}
+        self._embedding_index = {}
+        for line in load_lines(self.memory_dir / "embeddings.jsonl"):
+            row = json.loads(line)
+            self._embedding_index[(row["model"], row["layer"], row["id"])] = row["vector"]
+
+    def _vectors(self, layer: str) -> dict[str, list[float]]:
+        return {rid: vector for (model, name, rid), vector in self._embedding_index.items()
+                if model == self._last_embedding_model and name == layer}
+
+    def _recover_pending(self) -> None:
+        path = self.memory_dir / "pending.json"
+        if not path.exists():
+            return
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        if plan["episode_id"] not in self._processed_episodes:
+            for name, record_type in (("knowledge", KnowledgeRecord), ("memory", MemoryRecord), ("wisdom", WisdomRecord)):
+                for line in plan["records"][name]:
+                    getattr(self, name).add(record_type.from_json(line))
+            existing = {json.loads(line)["assertion_id"] for line in load_lines(self.memory_dir / "dead_letter.jsonl")}
+            for row in plan["dead_letters"]:
+                if row["assertion_id"] not in existing:
+                    append_record(self.memory_dir / "dead_letter.jsonl", json.dumps(row))
+            append_record(self.memory_dir / "consolidation_ledger.jsonl", json.dumps({
+                "episode_id": plan["episode_id"], "start_id": plan["start_id"], "end_id": plan["end_id"],
+            }))
+            self._processed_episodes.add(plan["episode_id"])
+            self._episode_ranges[plan["episode_id"]] = (plan["start_id"], plan["end_id"])
+        traced = {json.loads(line)["episode_id"] for line in load_lines(self.memory_dir / "traces" / "consolidation.jsonl")}
+        if plan["episode_id"] not in traced:
+            self._trace_consolidation(plan["trace"])
+        path.unlink()
+        fsync_directory(self.memory_dir)
 
     # -- recall ---------------------------------------------------------------
 
+    @_serialized
     def recall(self, query: str, budget_tokens: int) -> RecallResult:
         """Fan `query` out to every layer, fuse the rankings (RRF), and fill
         `budget_tokens` of estimated window with the fused entries. Misses come
         back as data; nothing here raises for an empty or unavailable layer."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be nonempty text")
+        if type(budget_tokens) is not int or budget_tokens < 0:
+            raise ValueError("budget_tokens must be a nonnegative integer")
         started = time.monotonic()
         per_layer: dict[str, list[LayerHit]] = {}
         costs: dict[str, float] = {}
@@ -149,18 +235,26 @@ class MemoryModule:
         if embedding is not None:
             t0 = time.monotonic()
             per_layer["memory"] = self.memory.query(
-                embedding, k=self._per_layer_k, half_life_days=self._recency_half_life_days
+                embedding, k=self._per_layer_k, half_life_days=self._recency_half_life_days,
+                embedding_model=self._last_embedding_model, embeddings=self._vectors("memory")
             )
             costs["memory"] = time.monotonic() - t0
             t0 = time.monotonic()
-            per_layer["wisdom"] = self.wisdom.query(embedding, k=self._per_layer_k)
+            per_layer["wisdom"] = self.wisdom.query(
+                embedding, k=self._per_layer_k, embedding_model=self._last_embedding_model,
+                embeddings=self._vectors("wisdom"))
             costs["wisdom"] = time.monotonic() - t0
         else:
             per_layer["memory"] = []
             per_layer["wisdom"] = []
 
+        for name in ("memory", "wisdom"):
+            t0 = time.monotonic()
+            per_layer[name] = _combine(getattr(self, name).search(query, self._per_layer_k),
+                                       per_layer[name], k=self._per_layer_k)
+            costs[name] = costs.get(name, 0.0) + time.monotonic() - t0
         t0 = time.monotonic()
-        per_layer["intelligence"] = self.intelligence.read()[: self._per_layer_k]
+        per_layer["intelligence"] = self.intelligence.search(query, self._per_layer_k)
         costs["intelligence"] = time.monotonic() - t0
 
         fused = _rrf_fuse(per_layer)
@@ -184,7 +278,10 @@ class MemoryModule:
             total_tokens=total,
             costs=costs,
         )
-        self._trace_recall(result, per_layer, [(e, pr) for e, pr in entries])
+        try:
+            self._trace_recall(result, per_layer, [(e, pr) for e, pr in entries])
+        except OSError:
+            logger.exception("Could not persist recall trace")
         return result
 
     # -- instrumentation --------------------------------------------------------
@@ -221,158 +318,192 @@ class MemoryModule:
         append_record(self.memory_dir / "traces" / "recall.jsonl", json.dumps(record, ensure_ascii=False))
 
     def _search_knowledge(self, query: str) -> list[LayerHit]:
-        # strip punctuation per token: "standup?" must match "standup"
-        terms = {t.strip(string.punctuation) for t in query.lower().split() if len(t.strip(string.punctuation)) > 2}
-        return self.knowledge.search(terms, k=self._per_layer_k)
+        return self.knowledge.search(terms(query), k=self._per_layer_k)
 
     def _embed(self, text: str) -> list[float] | None:
         for provider in self._embedding_providers:
-            if not getattr(provider, "is_available", lambda: True)():
-                continue
             try:
-                return list(provider.embed(text))
+                if not getattr(provider, "is_available", lambda: True)():
+                    continue
+                self._embedding_calls += 1
+                vector = list(provider.embed(text))
+                usage = getattr(provider, "last_embedding_usage", None)
+                if type(usage) is int:
+                    self._embedding_tokens += usage
+                if not valid_vector(vector):
+                    continue
+                self._last_embedding_model = _provider_identity(provider)
+                return vector
             except Exception:
                 continue
+        self._last_embedding_model = ""
         return None
+
+    @_serialized
+    def repair_embeddings(self, limit: int = 20) -> int:
+        """Rebuild missing/legacy/incompatible vectors without changing evidence.
+
+        A bounded, explicit maintenance operation; recall itself never embeds records.
+        """
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        probe = self._embed("memory index")
+        if probe is None:
+            return 0
+        model = self._last_embedding_model
+        repaired = 0
+        for name in ("memory", "wisdom"):
+            for record in getattr(self, name).read_all():
+                key = (model, name, record.id)
+                vector = self._embedding_index.get(key)
+                if valid_vector(vector, len(probe)):
+                    continue
+                if record.embedding_model == model and valid_vector(record.embedding, len(probe)):
+                    continue
+                text = record.summary if name == "memory" else record.statement
+                vector = self._embed(text)
+                if vector is None or self._last_embedding_model != model or not valid_vector(vector, len(probe)):
+                    return repaired
+                append_record(self.memory_dir / "embeddings.jsonl", json.dumps({
+                    "id": record.id, "layer": name, "model": model, "vector": vector,
+                }))
+                self._embedding_index[key] = vector
+                repaired += 1
+                if repaired >= limit:
+                    return repaired
+        return repaired
 
     # -- consolidation ---------------------------------------------------------
 
+    @_serialized
     def consolidate(self, episode: Episode) -> ConsolidationResult:
-        """Consolidate one caller-supplied episode: extract candidate assertions
-        from its evidence, validate them, route each to a layer, and write. The
-        recall-flagged stimuli in the range are readable context only — never
-        evidence, never provenance. Idempotent per episode."""
+        """Prepare then replay a durable episode transaction, idempotently."""
         started = time.monotonic()
+        if not isinstance(episode.episode_id, str) or not episode.episode_id.strip():
+            raise ValueError("episode_id must be nonempty text")
         if episode.episode_id in self._processed_episodes:
-            return ConsolidationResult(
-                episode_id=episode.episode_id, extracted=0, routed={},
-                supersessions=0, schema_failures=0, tokens_in=0, tokens_out=0,
-                wall_time_s=0.0, skipped=True,
-            )
-
+            previous = self._episode_ranges[episode.episode_id]
+            if previous != (None, None) and previous != (episode.start_id, episode.end_id):
+                raise ValueError("episode_id already belongs to a different event range")
+            return ConsolidationResult(episode.episode_id, 0, {}, 0, 0, 0, 0, 0.0, skipped=True)
         events = self._episode_events(episode)
         evidence = [e for e in events if not _is_recall_flagged(e)]
         context_only = [e for e in events if _is_recall_flagged(e)]
         if not evidence:
-            # Nothing to consolidate (empty range, or only recall output). No
-            # ledger write: nothing was written, so a retry is safe.
-            return ConsolidationResult(
-                episode_id=episode.episode_id, extracted=0, routed={},
-                supersessions=0, schema_failures=0, tokens_in=0, tokens_out=0,
-                wall_time_s=time.monotonic() - started,
-            )
+            return ConsolidationResult(episode.episode_id, 0, {}, 0, 0, 0, 0,
+                                       time.monotonic() - started)
+        overhead = len(build_extraction_prompt("", "context"))
+        per_event = (self._max_input_chars - overhead - len(events)) // len(events)
+        truncated = 0
 
-        provider = self._first_model_provider()
-        prompt = build_extraction_prompt(
-            "\n".join(e.to_json() for e in evidence),
-            "\n".join(e.to_json() for e in context_only),
-        )
-        raw = provider.chat(prompt, json_schema=extraction_json_schema())
-        tokens_in, tokens_out = estimate_tokens(prompt), estimate_tokens(raw)
+        def render(event):
+            nonlocal truncated
+            line = event.to_json()
+            if len(line) <= per_event:
+                return line
+            truncated += 1
+            # Preserve the original in the episode record. Extraction sees an
+            # explicitly marked excerpt; the full evidence remains searchable.
+            content = json.dumps(event.content, ensure_ascii=False)
+            size = max(0, per_event - len(replace(event, content={}).to_json()) - 100)
+            while True:
+                line = replace(event, content={"excerpt": content[:size], "truncated": True}).to_json()
+                if len(line) <= per_event:
+                    return line
+                if size == 0:
+                    raise ValueError("episode has too many events for the extraction budget")
+                size //= 2
 
-        parsed = parse_json_response(raw)
-        summary = str(parsed.get("summary", ""))
-        candidates = parsed.get("assertions", [])
-        episode_ts = events[-1].ts
-
-        routed: dict[str, int] = {}
+        prompt = build_extraction_prompt("\n".join(render(e) for e in evidence),
+                                         "\n".join(render(e) for e in context_only))
+        tokens_in = tokens_out = calls = 0
+        reported_usage = []
+        parsed = None
+        for provider in self._model_providers:
+            try:
+                if not getattr(provider, "is_available", lambda: True)():
+                    continue
+                calls += 1
+                tokens_in += estimate_tokens(prompt)
+                raw = provider.chat(prompt, json_schema=extraction_json_schema(),
+                                    max_tokens=self._max_output_tokens)
+                usage = getattr(provider, "last_chat_usage", None)
+                if isinstance(usage, dict):
+                    reported_usage.append({"provider": _provider_identity(provider), **usage})
+                tokens_out += estimate_tokens(raw)
+                candidate_response = parse_json_response(raw)
+                if (not isinstance(candidate_response, dict)
+                    or not isinstance(candidate_response.get("summary"), str)
+                    or not candidate_response["summary"].strip()
+                    or not isinstance(candidate_response.get("assertions"), list)):
+                    raise ValueError("extraction requires a nonempty summary and an assertions list")
+                parsed = candidate_response
+                break
+            except Exception as exc:
+                append_record(self.memory_dir / "extraction_failures.jsonl", json.dumps({
+                    "episode_id": episode.episode_id, "provider": _provider_identity(provider),
+                    "error": str(exc), "tokens_in_estimated": tokens_in,
+                    "tokens_out_estimated": tokens_out,
+                }))
+        if parsed is None:
+            raise RuntimeError("no model provider produced a valid extraction; episode remains pending")
+        records = {name: [] for name in ("knowledge", "memory", "wisdom")}
+        dead = []
+        routed = {}
         supersessions = 0
-        schema_failures = 0
-        for candidate in candidates:
-            assertion_id = new_id()  # assigned before routing, per the brief
-            reason = _validate_assertion(
-                candidate, lenient=self._lenient_fact_routing
-            )
-            if reason is not None:
-                schema_failures += 1
-                append_record(
-                    self.memory_dir / "dead_letter.jsonl",
-                    json.dumps(
-                        {
-                            "episode_id": episode.episode_id,
-                            "assertion_id": assertion_id,
-                            "candidate": candidate,
-                            "reason": reason,
-                        },
-                        ensure_ascii=False, default=str,
-                    ),
-                )
+        before_embeddings = self._embedding_calls
+        before_embedding_tokens = self._embedding_tokens
+        ts = max(e.ts for e in evidence)
+        for candidate in parsed["assertions"]:
+            rid = new_id()
+            reason = _validate_assertion(candidate, lenient=self._lenient_fact_routing)
+            if reason:
+                dead.append({"episode_id": episode.episode_id, "assertion_id": rid,
+                             "candidate": candidate, "reason": reason})
                 continue
             layer = _route_write(candidate)
-            self._write_assertion(
-                layer, assertion_id, episode.episode_id, episode_ts, candidate
-            )
+            if layer == "knowledge":
+                record = KnowledgeRecord(rid, ts, candidate["subject"].strip(),
+                                         candidate["predicate"].strip(), candidate["value"].strip(),
+                                         source_episode_id=episode.episode_id)
+                current = self.knowledge.current(record.subject, record.predicate)
+                supersessions += int(bool(current) and ts >= current[0].ts)
+            else:
+                vector = self._embed(candidate["statement"]) or []
+                if layer == "wisdom":
+                    record = WisdomRecord(rid, ts, candidate["statement"].strip(), vector,
+                                          source_episode_id=episode.episode_id,
+                                          embedding_model=self._last_embedding_model)
+                else:
+                    record = MemoryRecord(rid, ts, candidate["statement"].strip(),
+                                          candidate["statement"].strip(), vector,
+                                          source_episode_id=episode.episode_id,
+                                          embedding_model=self._last_embedding_model)
+            records[layer].append(record.to_json())
             routed[layer] = routed.get(layer, 0) + 1
-            if layer == "knowledge" and self.knowledge.get(assertion_id).supersedes:
-                supersessions += 1
-
-        # The episode record itself: what happened, formed from the evidence.
-        self._write_episode_record(episode.episode_id, episode_ts, evidence, summary)
+        vector = self._embed(parsed["summary"]) or []
+        record = MemoryRecord(new_id(), ts, "\n".join(e.to_json() for e in evidence),
+                              parsed["summary"], vector, source_episode_id=episode.episode_id,
+                              embedding_model=self._last_embedding_model)
+        records["memory"].append(record.to_json())
         routed["memory"] = routed.get("memory", 0) + 1
-
-        append_record(
-            self.memory_dir / "consolidation_ledger.jsonl",
-            json.dumps({"episode_id": episode.episode_id}),
-        )
-        self._processed_episodes.add(episode.episode_id)
-        wall_time_s = time.monotonic() - started
-        self._trace_consolidation(
-            {
-                "episode_id": episode.episode_id,
-                "candidates_extracted": len(candidates),
-                "routed": routed,
-                "supersessions": supersessions,
-                "schema_failures": schema_failures,
-                "tokens_in": tokens_in,
-                "tokens_out": tokens_out,
-                "wall_time_s": wall_time_s,
-            }
-        )
-        return ConsolidationResult(
-            episode_id=episode.episode_id, extracted=len(candidates), routed=routed,
-            supersessions=supersessions, schema_failures=schema_failures,
-            tokens_in=tokens_in, tokens_out=tokens_out, wall_time_s=wall_time_s,
-        )
-
-    def _write_assertion(
-        self, layer: str, assertion_id: str, episode_id: str, ts, candidate: dict
-    ) -> None:
-        if layer == "knowledge":
-            self.knowledge.add(
-                KnowledgeRecord(
-                    id=assertion_id, ts=ts, subject=candidate["subject"].strip(),
-                    predicate=candidate["predicate"].strip(), value=candidate["value"].strip(),
-                    source_episode_id=episode_id,
-                )
-            )
-        elif layer == "wisdom":
-            self.wisdom.add(
-                WisdomRecord(
-                    id=assertion_id, ts=ts, statement=candidate["statement"].strip(),
-                    embedding=self._embed(candidate["statement"]) or [],
-                    evidence_count=1, source_episode_id=episode_id,
-                )
-            )
-        else:  # memory: an event assertion is a small record of its own
-            self.memory.add(
-                MemoryRecord(
-                    id=assertion_id, ts=ts, content=candidate["statement"].strip(),
-                    summary=candidate["statement"].strip(),
-                    embedding=self._embed(candidate["statement"]) or [],
-                    source_episode_id=episode_id,
-                )
-            )
-
-    def _write_episode_record(self, episode_id: str, ts, evidence, summary: str) -> None:
-        self.memory.add(
-            MemoryRecord(
-                id=new_id(), ts=ts,
-                content="\n".join(e.to_json() for e in evidence),
-                summary=summary or "(no summary)",
-                embedding=self._embed(summary) or [],
-                source_episode_id=episode_id,
-            )
-        )
+        elapsed = time.monotonic() - started
+        trace = {"episode_id": episode.episode_id, "candidates_extracted": len(parsed["assertions"]),
+                 "routed": routed, "supersessions": supersessions, "schema_failures": len(dead),
+                 "tokens_in": tokens_in, "tokens_out": tokens_out, "wall_time_s": elapsed,
+                 "token_counts_estimated": True, "chat_calls": calls,
+                 "embedding_calls": self._embedding_calls - before_embeddings}
+        trace["truncated_events"] = truncated
+        trace["reported_chat_usage"] = reported_usage
+        trace["reported_embedding_tokens"] = self._embedding_tokens - before_embedding_tokens
+        atomic_json(self.memory_dir / "pending.json", {
+            "episode_id": episode.episode_id, "start_id": episode.start_id, "end_id": episode.end_id,
+            "records": records, "dead_letters": dead, "trace": trace,
+        })
+        self._recover_pending()
+        return ConsolidationResult(episode.episode_id, len(parsed["assertions"]), routed,
+                                   supersessions, len(dead), tokens_in, tokens_out,
+                                   time.monotonic() - started)
 
     def _episode_events(self, episode: Episode) -> list:
         """The episode's stimuli in file order, between its boundary ids.
@@ -393,12 +524,6 @@ class MemoryModule:
             raise ValueError("episode boundary id not found in stimulus log")
         lo, hi = (start, end) if start <= end else (end, start)
         return events[lo : hi + 1]
-
-    def _first_model_provider(self):
-        for provider in self._model_providers:
-            if getattr(provider, "is_available", lambda: True)():
-                return provider
-        raise RuntimeError("no model providers available for consolidation")
 
     def _trace_consolidation(self, record: dict[str, Any]) -> None:
         append_record(
@@ -463,7 +588,8 @@ def _rrf_fuse(per_layer: dict[str, list[LayerHit]]) -> list[RecallEntry]:
     for layer, hits in per_layer.items():
         for rank, hit in enumerate(hits, start=1):
             key = (layer, hit.id)
-            contribution = 1.0 / (_RRF_K + rank)
+            weight = {"knowledge": 1.2, "intelligence": 0.5}.get(layer, 1.0)
+            contribution = weight / (_RRF_K + rank)
             if key in fused:
                 score, provenance, text = fused[key]
                 fused[key] = (score + contribution, provenance, text)

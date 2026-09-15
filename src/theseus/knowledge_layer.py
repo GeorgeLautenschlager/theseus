@@ -1,15 +1,15 @@
 """KnowledgeLayer — current-state facts, append-only with load-time projection.
 
 The file holds every KnowledgeRecord ever written; the *projection* (latest
-record per subject+predicate) is rebuilt in memory on load and maintained on
-append. Supersession is explicit and logged: writing a new value for an existing
-subject+predicate appends a record whose `supersedes` names the record it
-replaces — the old record stays in the file, untouched, and drops out of the
+record by timestamp per subject+predicate) is rebuilt in memory on load and maintained on
+append. Supersession is explicit and logged: writing an equally new or newer value
+for an existing subject+predicate appends a record whose `supersedes` names
+the record it replaces — the old record stays in the file, untouched, and drops out of the
 projection. There is no decay and no mutation anywhere in this layer; what the
 agent knows *now* is always derivable by replaying the file.
 
 Retrieval is deterministic token overlap between query terms and each current
-record's subject/predicate — no embedding, no LLM. Facts are looked up by
+record's subject, predicate, and value — no embedding, no LLM. Facts are looked up by
 predicate and subject, not by vibes.
 """
 
@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines
+from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines, terms as tokenize
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,11 +64,11 @@ class KnowledgeRecord:
         )
 
     def render(self) -> str:
-        return f"{self.subject} {self.predicate}: {self.value}"
+        return f"[{self.id}] Current fact: {self.subject} {self.predicate}: {self.value}"
 
 
 def _key(subject: str, predicate: str) -> tuple[str, str]:
-    return (subject.casefold(), predicate.casefold())
+    return (" ".join(subject.casefold().split()), " ".join(predicate.casefold().split()))
 
 
 class KnowledgeLayer:
@@ -81,21 +81,26 @@ class KnowledgeLayer:
             record = KnowledgeRecord.from_json(line)
             self._records.append(record)
             self._by_id[record.id] = record
-            # Replay: later records for the same key supersede earlier ones.
-            self._projection[_key(record.subject, record.predicate)] = record
+            key = _key(record.subject, record.predicate)
+            current = self._projection.get(key)
+            if current is None or record.ts >= current.ts:
+                self._projection[key] = record
 
     def add(self, record: KnowledgeRecord) -> KnowledgeRecord:
         """Append `record`, durably. If a current record exists for the same
-        subject+predicate, the appended record is rewritten to name it in
+        subject+predicate and is no newer, the appended record names it in
         `supersedes` — supersession happens here and only here."""
+        if record.id in self._by_id:
+            return self._by_id[record.id]
         key = _key(record.subject, record.predicate)
         current = self._projection.get(key)
-        if current is not None:
+        if current is not None and record.ts >= current.ts:
             record = replace(record, supersedes=current.id)
         append_record(self.path, record.to_json())
         self._records.append(record)
         self._by_id[record.id] = record
-        self._projection[key] = record
+        if current is None or record.ts >= current.ts:
+            self._projection[key] = record
         return record
 
     def current(self, subject: str | None = None, predicate: str | None = None) -> list[KnowledgeRecord]:
@@ -103,9 +108,9 @@ class KnowledgeLayer:
         subject and/or predicate (None = wildcard)."""
         out = []
         for r in self._projection.values():
-            if subject is not None and r.subject.casefold() != subject.casefold():
+            if subject is not None and _key(r.subject, "")[0] != _key(subject, "")[0]:
                 continue
-            if predicate is not None and r.predicate.casefold() != predicate.casefold():
+            if predicate is not None and _key("", r.predicate)[1] != _key("", predicate)[1]:
                 continue
             out.append(r)
         return sorted(out, key=lambda r: r.ts)
@@ -115,13 +120,13 @@ class KnowledgeLayer:
 
     def search(self, terms: set[str], k: int = 5) -> list[LayerHit]:
         """Current records ranked by how many distinct query terms hit their
-        subject or predicate. Deterministic; no embedding involved."""
+        subject, predicate, or value. Deterministic; no embedding involved."""
         if not terms:
             return []
         scored: list[tuple[float, datetime, KnowledgeRecord]] = []
         for record in self._projection.values():
-            haystack = f"{record.subject} {record.predicate}".casefold()
-            hits = sum(1 for t in terms if t.casefold() in haystack)
+            haystack = tokenize(f"{record.subject} {record.predicate} {record.value}")
+            hits = len({term.casefold() for term in terms} & haystack)
             if hits:
                 scored.append((float(hits), record.ts, record))
         scored.sort(key=lambda s: (s[0], s[1]), reverse=True)

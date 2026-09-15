@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines
+from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines, lexical_score, valid_vector
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +30,7 @@ class WisdomRecord:
     embedding: list[float] = field(default_factory=list)
     evidence_count: int = 1
     source_episode_id: str = ""
+    embedding_model: str = ""
 
     def to_json(self) -> str:
         return json.dumps(
@@ -40,6 +41,7 @@ class WisdomRecord:
                 "embedding": self.embedding,
                 "evidence_count": self.evidence_count,
                 "source_episode_id": self.source_episode_id,
+                "embedding_model": self.embedding_model,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -55,6 +57,7 @@ class WisdomRecord:
             embedding=d.get("embedding", []),
             evidence_count=d.get("evidence_count", 1),
             source_episode_id=d.get("source_episode_id", ""),
+            embedding_model=d.get("embedding_model", ""),
         )
 
     def render(self) -> str:
@@ -69,6 +72,9 @@ class WisdomLayer:
             self._records.append(WisdomRecord.from_json(line))
 
     def add(self, record: WisdomRecord) -> WisdomRecord:
+        existing = self.get(record.id)
+        if existing is not None:
+            return existing
         append_record(self.path, record.to_json())
         self._records.append(record)
         return record
@@ -78,13 +84,20 @@ class WisdomLayer:
         embedding: list[float],
         k: int = 5,
         min_evidence: int = 0,
+        embedding_model: str | None = None,
+        embeddings: dict[str, list[float]] | None = None,
     ) -> list[LayerHit]:
         """Top-k by cosine among records with evidence_count >= min_evidence."""
-        eligible = [r for r in self._records if r.evidence_count >= min_evidence]
-        if not eligible or not embedding:
+        if not valid_vector(embedding):
+            return []
+        overrides = embeddings or {}
+        eligible = [r for r in self._records if r.evidence_count >= min_evidence
+                    and valid_vector(overrides.get(r.id, r.embedding), len(embedding))
+                    and (r.id in overrides or embedding_model is None or r.embedding_model == embedding_model)]
+        if not eligible:
             return []
         q = np.asarray(embedding, dtype=np.float64)
-        matrix = np.asarray([r.embedding for r in eligible], dtype=np.float64)
+        matrix = np.asarray([overrides.get(r.id, r.embedding) for r in eligible], dtype=np.float64)
         q_norm = float(np.linalg.norm(q))
         m_norms = np.linalg.norm(matrix, axis=1)
         denom = m_norms * q_norm
@@ -97,6 +110,11 @@ class WisdomLayer:
             for i in order
             if scores[i] > 0.0
         ]
+
+    def search(self, query: str, k: int = 5) -> list[LayerHit]:
+        scored = [(lexical_score(query, r.statement), r) for r in self._records]
+        scored.sort(key=lambda pair: (pair[0], pair[1].evidence_count, pair[1].ts), reverse=True)
+        return [LayerHit(r.id, r.render(), score) for score, r in scored if score > 0][:k]
 
     def get(self, record_id: str) -> WisdomRecord | None:
         return next((r for r in self._records if r.id == record_id), None)

@@ -16,6 +16,7 @@ def test_composition_entry_points_import_from_root():
         SseCommandChannel,
         PairedStimulusLog,
         PairingSpec,
+        MemoryConsolidator,
     )
 
     for name in (
@@ -30,6 +31,7 @@ def test_composition_entry_points_import_from_root():
         "SseCommandChannel",
         "PairedStimulusLog",
         "PairingSpec",
+        "MemoryConsolidator",
         "command_type",
         "command_content",
         "is_command",

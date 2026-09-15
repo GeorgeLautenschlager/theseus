@@ -43,6 +43,7 @@ class ModelProvider(ABC):
     ) -> str:
         """`images` are data URIs (e.g. "data:image/jpeg;base64,...") attached
         to the user message; the model must support vision."""
+        self.last_chat_usage = None
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -69,6 +70,12 @@ class ModelProvider(ABC):
             temperature=temperature,
             **extra_kwargs,
         )
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.last_chat_usage = {
+                name: value for name in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if type(value := getattr(usage, name, None)) is int
+            }
         return response.choices[0].message.content
 
     def complete_with_tools(
@@ -119,5 +126,10 @@ class ModelProvider(ABC):
         )
 
     def embed(self, text: str) -> list[float]:
+        self.last_embedding_usage = None
         response = self._client.embeddings.create(model=self.model, input=text)
+        usage = getattr(response, "usage", None)
+        tokens = getattr(usage, "total_tokens", None)
+        if type(tokens) is int:
+            self.last_embedding_usage = tokens
         return response.data[0].embedding

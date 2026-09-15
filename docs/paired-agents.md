@@ -54,3 +54,16 @@ one process, then post another message; its durable inbox should not append the
 earlier Telegram update again, and its peer-history window should still read the
 partner's current file. Shared group messages can appear in both histories, so
 the peer section is labeled and does not copy its records into the local log.
+
+## Durable memory
+
+Both examples enable a separate MemoryModule with formation every 300 seconds
+at the end of an active Auto step. Before assembly, set `PAIR_MEMORY_PROVIDER`
+and `PAIR_MEMORY_MODEL` for extraction, and `PAIR_EMBEDDING_PROVIDER` and
+`PAIR_EMBEDDING_MODEL` for embeddings. Defaults are Ollama with `gemma4:e4b`
+and `nomic-embed-text`. Remote providers require their normal runtime credentials;
+these additional calls use that provider's balance. Each runtime home retains
+its own `memory/`; the peer window does not import durable memories.
+
+See [memory reliability](memory-reliability.md) for scheduling, recovery, observed
+benchmark misses, and the live-model validation still needed for the experiment.

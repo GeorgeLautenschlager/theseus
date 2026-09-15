@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 
-from theseus.layer_store import LayerHit
+from theseus.layer_store import LayerHit, lexical_score
 from theseus.stimulus_log import StimulusLog
 
 
@@ -36,3 +36,17 @@ class IntelligenceLayer:
                 )
             )
         return hits
+
+    def search(self, query: str, k: int = 5) -> list[LayerHit]:
+        """Query-relevant recent evidence; recalled outputs cannot feed themselves."""
+        events = self._log.read_all()[-self._tail:]
+        scored = []
+        for event in reversed(events):
+            if event.type == "tool_result" and event.content.get("tool") == "recall":
+                continue
+            text = json.dumps(event.content, ensure_ascii=False)
+            score = lexical_score(query, text)
+            if score:
+                scored.append(LayerHit(event.id, f"[{event.id}] {event.actor} {event.type}: {text}", score))
+        scored.sort(key=lambda hit: hit.score, reverse=True)
+        return scored[:k]
