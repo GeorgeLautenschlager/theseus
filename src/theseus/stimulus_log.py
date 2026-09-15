@@ -504,23 +504,7 @@ class StimulusLog:
                 traceback.print_exc()
 
     def read_all(self) -> list[StimulusEvent]:
-        events: list[StimulusEvent] = []
-        with open(self.path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        for i, line in enumerate(lines):
-            stripped = line.rstrip("\n")
-            if not stripped:
-                continue
-            try:
-                events.append(
-                    StimulusEvent.from_json(stripped, default_origin=self.origin)
-                )
-            except (json.JSONDecodeError, KeyError) as exc:
-                is_last = i == len(lines) - 1
-                if is_last and not line.endswith("\n"):
-                    break  # torn final write — recover by dropping it
-                raise ValueError(f"corrupt interior record at line {i}: {exc}") from exc
-        return events
+        return _read_events(self.path, self.origin)
 
     def read_range(self, start_id: str, end_id: str) -> list[StimulusEvent]:
         """Inclusive [start_id, end_id]. IDs are lexically sortable, so a span
@@ -529,3 +513,75 @@ class StimulusLog:
 
     def __iter__(self) -> Iterator[StimulusEvent]:
         return iter(self.read_all())
+
+
+def _read_events(path: Path, origin: str) -> list[StimulusEvent]:
+    """Read a JSONL stream without opening it for writing."""
+    events: list[StimulusEvent] = []
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        stripped = line.rstrip("\n")
+        if not stripped:
+            continue
+        try:
+            events.append(StimulusEvent.from_json(stripped, default_origin=origin))
+        except (json.JSONDecodeError, KeyError) as exc:
+            if i == len(lines) - 1 and not line.endswith("\n"):
+                break
+            raise ValueError(f"corrupt interior record at line {i}: {exc}") from exc
+    return events
+
+
+class _PeerLogReader:
+    """A peer view with read operations only; never creates or touches its file."""
+
+    def __init__(self, path: Path, origin: str) -> None:
+        self.path = path
+        self.origin = origin
+        self.available = False
+
+    def read_all(self) -> list[StimulusEvent]:
+        try:
+            events = _read_events(self.path, self.origin)
+        except FileNotFoundError:
+            self.available = False
+            return []
+        self.available = True
+        return events
+
+    def read_range(self, start_id: str, end_id: str) -> list[StimulusEvent]:
+        return [e for e in self.read_all() if start_id <= e.id <= end_id]
+
+    def __iter__(self) -> Iterator[StimulusEvent]:
+        return iter(self.read_all())
+
+
+class PairedStimulusLog(StimulusLog):
+    """An ordinary owned log with an explicitly paired, read-only peer stream."""
+
+    def __init__(
+        self, path: str | os.PathLike[str], peer_path: str | os.PathLike[str],
+        *, peer_name: str, origin: str = DEFAULT_ORIGIN,
+        peer_context_fraction: float = 0.25,
+    ) -> None:
+        own = Path(path).resolve()
+        peer = Path(peer_path).resolve()
+        if own == peer:
+            raise ValueError("paired logs must use distinct files")
+        if not peer_name or not peer_name.strip():
+            raise ValueError("peer_name must be nonempty text")
+        if not isinstance(peer_context_fraction, (int, float)) or not 0 < peer_context_fraction < 1:
+            raise ValueError("peer_context_fraction must be between 0 and 1")
+        super().__init__(path, origin=origin)
+        self.peer_path = peer
+        self.peer_name = peer_name
+        self.peer_context_fraction = float(peer_context_fraction)
+        self.peer_log = _PeerLogReader(peer, peer_name)
+
+    @property
+    def peer_available(self) -> bool:
+        return self.peer_log.available
+
+    def read_peer_all(self) -> list[StimulusEvent]:
+        return self.peer_log.read_all()

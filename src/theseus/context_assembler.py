@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
-from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.stimulus_log import PairedStimulusLog, StimulusEvent, StimulusLog
 
 # Seed ratio for English-ish JSON, used until the first real measurement lands. The error
 # is asymmetric: too low merely underfills the window, too high under-charges every event
@@ -57,6 +57,9 @@ class AssembledContext:
     recent_events: str   # tail of the stimulus log, one JSON event per line
     window_chars: int = 0
     budget_tokens: float | None = None  # what the window was fitted against, for debugging
+    peer_events: str = ""
+    peer_name: str | None = None
+    peer_available: bool = True
 
 
 def _chronological(event: StimulusEvent) -> tuple[datetime, datetime, str]:
@@ -169,6 +172,9 @@ class ContextAssembler:
         events = self.stimulus_log.read_all()[-self.window_size:]
         budget = self._budget_tokens(overhead_chars)
 
+        if isinstance(self.stimulus_log, PairedStimulusLog):
+            return self._assemble_paired(events, budget)
+
         if budget is None:
             lines = [event.to_json() for event in sorted(events, key=_chronological)]
         else:
@@ -180,6 +186,55 @@ class ContextAssembler:
             window_chars=len(recent_events),
             budget_tokens=budget,
         )
+
+    def _assemble_paired(
+        self, own_events: list[StimulusEvent], budget: float | None
+    ) -> AssembledContext:
+        paired = self.stimulus_log
+        assert isinstance(paired, PairedStimulusLog)
+        peer_window = (
+            max(1, int(self.window_size * paired.peer_context_fraction))
+            if budget is None else self.window_size
+        )
+        peer_events = paired.read_peer_all()[-peer_window:]
+        peer_status = "" if paired.peer_available else " status='unavailable'"
+        label_chars = len("<stimulus_log>\n</stimulus_log>\n\n") + len(
+            f"<peer_stimulus_log name={paired.peer_name!r}{peer_status}>\n</peer_stimulus_log>\n\n"
+        )
+        if budget is None:
+            own_lines = [e.to_json() for e in sorted(own_events, key=_chronological)]
+            peer_lines = [e.to_json() for e in sorted(peer_events, key=_chronological)]
+        else:
+            available = max(0.0, budget - label_chars / self.chars_per_token)
+            peer_cap = available * paired.peer_context_fraction
+            peer_lines = self._fit_peer(peer_events, peer_cap)
+            peer_cost = sum(len(line) / self.chars_per_token for line in peer_lines)
+            own_lines = self._fit_to_budget(own_events, max(0.0, available - peer_cost))
+        own = "\n".join(own_lines)
+        peer = "\n".join(peer_lines)
+        return AssembledContext(
+            recent_events=own, peer_events=peer, peer_name=paired.peer_name,
+            peer_available=paired.peer_available,
+            window_chars=len(own) + len(peer) + label_chars,
+            budget_tokens=budget,
+        )
+
+    def _fit_peer(self, events: list[StimulusEvent], cap: float) -> list[str]:
+        """Honor the peer share even when its newest event is oversized."""
+        kept: list[tuple[StimulusEvent, str]] = []
+        used = 0.0
+        for event in reversed(events):
+            remaining = cap - used
+            if remaining <= 0:
+                break
+            max_chars = min(self._max_event_chars(cap), int(remaining * self.chars_per_token))
+            line = self._serialize(event, max_chars)
+            if len(line) > max_chars:
+                break
+            kept.append((event, line))
+            used += len(line) / self.chars_per_token
+        kept.sort(key=lambda pair: _chronological(pair[0]))
+        return [line for _, line in kept]
 
     def observe(
         self,

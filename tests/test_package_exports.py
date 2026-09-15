@@ -14,6 +14,8 @@ def test_composition_entry_points_import_from_root():
         ReentrantIngest,
         ReplicationIngress,
         SseCommandChannel,
+        PairedStimulusLog,
+        PairingSpec,
     )
 
     for name in (
@@ -26,6 +28,8 @@ def test_composition_entry_points_import_from_root():
         "CommandChannel",
         "MemoryCommandChannel",
         "SseCommandChannel",
+        "PairedStimulusLog",
+        "PairingSpec",
         "command_type",
         "command_content",
         "is_command",

@@ -66,12 +66,19 @@ def build_decide_system_prompt(constitution: str, persona: str, tools: List[Tool
     )
 
 
-def build_decide_user_prompt(context: str, now: str) -> str:
+def build_decide_user_prompt(
+    context: str, now: str, *, peer_events: str = "", peer_name: str | None = None,
+    peer_available: bool = True,
+) -> str:
     """The stimulus log is the only context channel. Long-term memories reach the model
     by being recalled — the `recall` tool's result is a stimulus event like any other —
     so there is no separate memories section to render."""
+    peer_status = "" if peer_available else " status='unavailable'"
     return (
         f"{_render_stimulus_log_section(context)}\n\n"
-        f"Current system time: {now}\n\n"
-        "Decide your next action."
+        + (f"<peer_stimulus_log name={peer_name!r}{peer_status}>\n"
+           f"{peer_events}\n</peer_stimulus_log>\n\n"
+           if peer_name is not None else "")
+        + f"Current system time: {now}\n\n"
+        + "Decide your next action."
     )

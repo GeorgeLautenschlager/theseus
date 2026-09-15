@@ -21,7 +21,7 @@ from theseus.memory_module import MemoryModule
 from theseus.memory_store import MemoryStore
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.ooda_core import OODACore
-from theseus.stimulus_log import StimulusLog
+from theseus.stimulus_log import PairedStimulusLog, StimulusLog
 from theseus.telegram_api import TelegramBotAPI, TelegramSender
 from theseus.telegram_observer import TELEGRAM_TRANSPORT, TelegramObserver
 from theseus.tools.recall import RecallTool
@@ -62,6 +62,15 @@ class InterfaceSpec:
     allowed_user_ids: tuple[int, ...] = ()
     allowed_chat_ids: tuple[int, ...] = ()
     poll_timeout_seconds: int = 25
+    outgoing_interval_seconds: float = 0.0
+    outgoing_chat_ids_only: bool = False
+
+
+@dataclass(frozen=True)
+class PairingSpec:
+    peer_log_path: str
+    peer_name: str
+    peer_context_fraction: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,7 @@ class AgentSpec:
     memory: MemorySpec = field(default_factory=MemorySpec)
     interface: InterfaceSpec = field(default_factory=InterfaceSpec)
     window_size: int = 200
+    pairing: PairingSpec | None = None
 
     def validate(self) -> None:
         for label, value in (("name", self.name), ("constitution", self.constitution)):
@@ -86,6 +96,16 @@ class AgentSpec:
             raise ValueError("core must be 'auto' or 'ooda'")
         if type(self.window_size) is not int or self.window_size <= 0:
             raise ValueError("window_size must be a positive integer")
+        if self.pairing is not None:
+            pair = self.pairing
+            if not isinstance(pair, PairingSpec):
+                raise ValueError("pairing must be a PairingSpec")
+            if not isinstance(pair.peer_log_path, str) or not pair.peer_log_path.strip():
+                raise ValueError("pairing peer_log_path must be nonempty text")
+            if not isinstance(pair.peer_name, str) or not pair.peer_name.strip():
+                raise ValueError("pairing peer_name must be nonempty text")
+            if not isinstance(pair.peer_context_fraction, (int, float)) or not 0 < pair.peer_context_fraction < 1:
+                raise ValueError("pairing peer_context_fraction must be between 0 and 1")
         if not isinstance(self.models, tuple) or not self.models:
             raise ValueError("models must be a nonempty tuple of ModelSpec values")
         for model in self.models:
@@ -140,6 +160,12 @@ class AgentSpec:
             or not 1 <= self.interface.poll_timeout_seconds <= 50
         ):
             raise ValueError("interface poll_timeout_seconds must be between 1 and 50")
+        if not isinstance(self.interface.outgoing_interval_seconds, (int, float)) or self.interface.outgoing_interval_seconds < 0:
+            raise ValueError("interface outgoing_interval_seconds must be nonnegative")
+        if not isinstance(self.interface.outgoing_chat_ids_only, bool):
+            raise ValueError("interface outgoing_chat_ids_only must be a boolean")
+        if self.interface.outgoing_chat_ids_only and not self.interface.allowed_chat_ids:
+            raise ValueError("outgoing_chat_ids_only requires allowed_chat_ids")
         if not isinstance(self.memory, MemorySpec):
             raise ValueError("memory must be a MemorySpec")
         memory = self.memory
@@ -236,11 +262,21 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
                           ("CADENCE.md", spec.cadence_text())):
         _atomic_write(home / name, content)
     tools = {name: tool for name, tool in all_tools(cwd=home).items() if name in spec.tools}
+    log_path = home / "stimulus_log.jsonl"
+    if spec.pairing is not None:
+        peer_path = Path(spec.pairing.peer_log_path)
+        if not peer_path.is_absolute():
+            peer_path = home / peer_path
+        log = PairedStimulusLog(
+            log_path, peer_path, peer_name=spec.pairing.peer_name,
+            peer_context_fraction=spec.pairing.peer_context_fraction,
+        )
+    else:
+        log = StimulusLog(log_path)
     if spec.core == "auto":
-        core = Autocore(name=spec.name, home_directory=home, tools=tools)
+        core = Autocore(name=spec.name, home_directory=home, tools=tools, stimulus_log=log)
         core.context_assembler.window_size = spec.window_size
     else:
-        log = StimulusLog(home / "stimulus_log.jsonl")
         core = OODACore(
             name=spec.name, constitution=spec.constitution, persona=spec.persona,
             stimulus_log=log, tools=tools, model_providers=providers,
@@ -280,7 +316,8 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
         journal = DeliveryJournal(home / "delivery.sqlite3")
         api = TelegramBotAPI(token)
         outbox = DurableOutbox(
-            journal, TELEGRAM_TRANSPORT, TelegramSender(api, cwd=home)
+            journal, TELEGRAM_TRANSPORT, TelegramSender(api, cwd=home),
+            min_group_interval_seconds=spec.interface.outgoing_interval_seconds,
         )
         observer = TelegramObserver(
             stimulus_log=core.stimulus_log,
@@ -295,7 +332,7 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
         mouth = TelegramTool(
             outbox,
             allowed_chat_ids=spec.interface.allowed_chat_ids,
-            allowed_user_ids=spec.interface.allowed_user_ids,
+            allowed_user_ids=() if spec.interface.outgoing_chat_ids_only else spec.interface.allowed_user_ids,
         )
     else:
         observer = TerminalChatObserver(core.stimulus_log, callback)
@@ -309,7 +346,7 @@ def render(spec: AgentSpec) -> str:
     return (
         GENERATED_HEADER + "from __future__ import annotations\n\n"
         "from pathlib import Path\n"
-        "from theseus.assembly import AgentSpec, ModelSpec, MemorySpec, InterfaceSpec, run_agent\n\n"
+        "from theseus.assembly import AgentSpec, ModelSpec, MemorySpec, InterfaceSpec, PairingSpec, run_agent\n\n"
         f"SPEC = {pformat(spec, width=100)}\n\n"
         "if __name__ == '__main__':\n"
         "    run_agent(SPEC, Path(__file__).resolve().parent / 'state')\n"

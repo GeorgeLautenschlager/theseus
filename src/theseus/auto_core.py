@@ -126,10 +126,11 @@ class Autocore:
         tools: Dict[str, Tool], #TODO: why not pull this from config as well?
         memory: Memory | MemoryModule | None = None,
         wake_on: Callable[[StimulusEvent], bool] | None = None,
+        stimulus_log: StimulusLog | None = None,
     ):
         self.name: str = name
         self._initialize_home_directory(home_directory)
-        self.stimulus_log: StimulusLog = StimulusLog(
+        self.stimulus_log: StimulusLog = stimulus_log or StimulusLog(
             str(self.home_directory / "stimulus_log.jsonl")
         )
         self.tools: dict[str, Tool] = tools
@@ -199,9 +200,15 @@ class Autocore:
         self.loop_memory["window_chars"] = context.window_chars
 
         # assemble autonomous prompt
+        peer_status = "" if context.peer_available else " status='unavailable'"
         autonomous_prompt = (
             f"{goals_and_tasks}"
             f"<stimulus_log>\n{context.recent_events}\n</stimulus_log>\n\n"
+            + (
+                f"<peer_stimulus_log name={context.peer_name!r}{peer_status}>\n"
+                f"{context.peer_events}\n</peer_stimulus_log>\n\n"
+                if context.peer_name is not None else ""
+            )
         )
 
         messages = [

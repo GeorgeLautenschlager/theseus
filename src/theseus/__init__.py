@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from theseus.assembly import AgentSpec, InterfaceSpec, MemorySpec, ModelSpec, build_agent
+from theseus.assembly import AgentSpec, InterfaceSpec, MemorySpec, ModelSpec, PairingSpec, build_agent
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_reports import (
@@ -44,7 +44,7 @@ from theseus.surrogates.replicator import Replicator
 from theseus.surrogates.retry import RetryBudget
 from theseus.surrogates.sse_command_channel import SseCommandChannel
 from theseus.surrogates.transport import StimulusTransport
-from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.stimulus_log import PairedStimulusLog, StimulusEvent, StimulusLog
 from theseus.time_observer import TimeObserver
 from theseus.telegram_api import TelegramBotAPI, TelegramSender
 from theseus.telegram_observer import TelegramObserver
@@ -90,6 +90,8 @@ __all__ = [
     "SseCommandChannel",
     "StimulusEvent",
     "StimulusLog",
+    "PairedStimulusLog",
+    "PairingSpec",
     "TimeObserver",
     "TelegramBotAPI",
     "TelegramObserver",

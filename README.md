@@ -62,3 +62,5 @@ poetry run python build/test-agent/agent.py
 Edit the definition, assemble again, and restart. Runtime state stays in its own
 home directory. See [Agent Assembler](docs/agent-assembler.md) for variants, Tam,
 custom parts, memory, durable Telegram configuration, and isolated E2E agents.
+For two agents sharing an observable Telegram group and read-only peer histories,
+see [Observable pair](docs/paired-agents.md).

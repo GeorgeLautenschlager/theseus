@@ -103,6 +103,9 @@ class OODACore:
         through try_orient() or orient_and_wait()."""
         assembled = self.context_assembler.assemble_context()
         self.loop_memory["recent_events"] = assembled.recent_events
+        self.loop_memory["peer_events"] = assembled.peer_events
+        self.loop_memory["peer_name"] = assembled.peer_name
+        self.loop_memory["peer_available"] = assembled.peer_available
         self.loop_memory["window_chars"] = assembled.window_chars
 
         self.decide()
@@ -114,6 +117,9 @@ class OODACore:
         prompt = build_decide_user_prompt(
             self.loop_memory["recent_events"],
             str(datetime.now()),
+            peer_events=self.loop_memory.get("peer_events", ""),
+            peer_name=self.loop_memory.get("peer_name"),
+            peer_available=self.loop_memory.get("peer_available", True),
         )
 
         messages = [
