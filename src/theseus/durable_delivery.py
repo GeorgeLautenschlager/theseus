@@ -265,6 +265,16 @@ class DeliveryJournal:
             ).fetchone()
         return self._outbox_item(row) if row is not None else None
 
+    def last_group_start(self, transport: str) -> float | None:
+        """Time the most recent logical outgoing message began delivery."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT MAX(delivered_at) AS started FROM delivery_outbox
+                   WHERE transport = ? AND part_index = 1 AND status = 'delivered'""",
+                (transport,),
+            ).fetchone()
+        return row["started"]
+
     def mark_sending(self, item_id: str, *, now: float) -> OutboxItem:
         with self._lock, self._connect() as connection:
             changed = connection.execute(
@@ -380,6 +390,7 @@ class DurableOutbox:
         now: Callable[[], float] = time.time,
         base_retry_seconds: float = 2.0,
         max_retry_seconds: float = 300.0,
+        min_group_interval_seconds: float = 0.0,
     ) -> None:
         self.journal = journal
         self.transport = transport
@@ -387,6 +398,9 @@ class DurableOutbox:
         self._now = now
         self._base_retry_seconds = base_retry_seconds
         self._max_retry_seconds = max_retry_seconds
+        if min_group_interval_seconds < 0:
+            raise ValueError("min_group_interval_seconds cannot be negative")
+        self.min_group_interval_seconds = min_group_interval_seconds
         self._drain_lock = threading.Lock()
 
     def enqueue(
@@ -414,6 +428,10 @@ class DurableOutbox:
                 item = self.journal.next_outbox(self.transport)
                 if item is None or item.available_at > self._now():
                     break
+                if self.min_group_interval_seconds and item.part_index == 1:
+                    started = self.journal.last_group_start(self.transport)
+                    if started is not None and self._now() < started + self.min_group_interval_seconds:
+                        break
                 item = self.journal.mark_sending(item.id, now=self._now())
                 attempted += 1
                 try:
