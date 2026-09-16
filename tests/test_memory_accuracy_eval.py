@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -17,6 +18,8 @@ from theseus.memory_accuracy_eval import (
     measure_correct_updates,
     measure_supported_retained,
     measure_unsupported_present,
+    measure_source_validity,
+    measure_labeled_assertions,
     validate_scenarios,
     run_offline,
     run_live,
@@ -33,6 +36,18 @@ def test_dataset_is_well_formed_and_covers_every_category():
     for s in SCENARIOS:
         covered = [i for ep in s.episodes for i in ep.event_indices]
         assert sorted(covered) == list(range(len(s.events))), s.name
+        for ep in s.episodes:
+            for assertion in ep.assertions:
+                assert assertion["support_event_indices"]
+                assert all(s.events[i][3] == "evidence" for i in assertion["support_event_indices"])
+
+
+def test_dataset_rejects_context_only_reference_support():
+    original = next(s for s in SCENARIOS if s.name == "raven-code")
+    bad_label = {**original.episodes[0].assertions[0], "support_event_indices": (1,)}
+    broken = replace(original, episodes=(replace(original.episodes[0], assertions=(bad_label,)),))
+    with pytest.raises(ValueError, match="eligible supporting events"):
+        validate_scenarios((broken,))
 
 
 def test_validator_rejects_a_transition_without_a_supporting_fact():
@@ -66,13 +81,19 @@ def _drive_all(tmp_path):
 
 
 def test_metrics_all_pass_on_the_reference_run(tmp_path):
-    memory, _ = _drive_all(tmp_path)
+    extractor = ReferenceExtractor()
+    memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
+    trace = drive_scenarios(memory, log, SCENARIOS, reference=True, extractor=extractor,
+                            start=datetime(2026, 1, 1, tzinfo=timezone.utc))
     updates = measure_correct_updates(memory, SCENARIOS)
     retained = measure_supported_retained(memory, SCENARIOS, budget_tokens=2000)
     unsupported = measure_unsupported_present(memory, SCENARIOS)
     assert updates["total"] > 0 and updates["passed"] == updates["total"]
     assert retained["total"] > 0 and retained["passed"] == retained["total"]
     assert unsupported["total"] > 0 and unsupported["violations"] == 0
+    assert measure_source_validity(memory, SCENARIOS, trace)["passed"] > 0
+    labeled = measure_labeled_assertions(memory, SCENARIOS, trace)
+    assert labeled["passed"] == labeled["total"] > 0
 
 
 def test_unsupported_metric_flags_a_leaked_current_fact(tmp_path):
@@ -113,6 +134,30 @@ def test_driver_never_promotes_recall_context_to_a_fact(tmp_path):
     assert "QUAIL-7" in prompt
 
 
+def test_valid_source_id_does_not_make_a_false_outcome_semantically_correct(tmp_path):
+    class FalseOutcomeExtractor:
+        def chat(self, prompt, **kwargs):
+            evidence = prompt.split("<evidence>\n", 1)[1].split("\n</evidence>", 1)[0]
+            tool_id = json.loads(evidence.splitlines()[1])["id"]
+            return json.dumps({"summary": "Atlas payment completed.", "assertions": [{
+                "kind": "fact", "subject": "Atlas", "predicate": "payment status",
+                "value": "completed", "statement": "Atlas payment completed.",
+                "support_event_ids": [tool_id], "attribution": "direct_observation",
+                "action_status": "confirmed_outcome",
+            }]})
+
+    scenario = next(s for s in SCENARIOS if s.name == "atlas-payment")
+    extractor = FalseOutcomeExtractor()
+    memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
+    trace = drive_scenarios(memory, log, (scenario,), reference=False, extractor=extractor,
+                            start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    validity = measure_source_validity(memory, (scenario,), trace)
+    semantics = measure_labeled_assertions(memory, (scenario,), trace)
+    assert validity["passed"] == validity["total"] == 1
+    assert semantics["passed"] == 0 and semantics["total"] == 1
+    assert measure_correct_updates(memory, (scenario,))["passed"] == 0
+
+
 def test_run_offline_reports_separated_metrics_and_survives_restart(tmp_path):
     report = run_offline(tmp_path)
     assert report["mode"] == "reference-extraction-offline"
@@ -120,6 +165,8 @@ def test_run_offline_reports_separated_metrics_and_survives_restart(tmp_path):
     assert metrics["correct_updates"]["passed"] == metrics["correct_updates"]["total"] > 0
     assert metrics["supported_retained"]["passed"] == metrics["supported_retained"]["total"] > 0
     assert metrics["unsupported_present"]["violations"] == 0
+    assert metrics["source_validity"]["passed"] == metrics["source_validity"]["total"] > 0
+    assert metrics["labeled_assertions"]["passed"] == metrics["labeled_assertions"]["total"] > 0
     assert report["restart_recall"]["passed"] == report["restart_recall"]["total"] > 0
     assert report["context_departure_recall"]["passed"] == report["context_departure_recall"]["total"] > 0
     assert report["provider"] is None
@@ -146,7 +193,8 @@ class _ScriptedProvider:
 
     def chat(self, prompt, **kwargs):
         if "assertions" in prompt or "consolidation" in prompt:
-            return json.dumps({"summary": "ok", "assertions": [{"kind": "fact", "subject": "Atlas", "predicate": "phase", "value": "production", "statement": "Atlas phase: production."}]})
+            event_id = json.loads(prompt.split("<evidence>\n", 1)[1].splitlines()[0])["id"]
+            return json.dumps({"summary": "ok", "assertions": [{"kind": "fact", "subject": "Atlas", "predicate": "phase", "value": "production", "statement": "Atlas phase: production.", "support_event_ids": [event_id], "attribution": "inference", "action_status": "not_applicable"}]})
         return json.dumps({"answer": "production", "evidence_ids": ["invented-id"]})
 
 

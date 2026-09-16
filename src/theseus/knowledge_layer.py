@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from theseus.assertion_metadata import render_metadata
 from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines, terms as tokenize
 
 
@@ -34,6 +35,10 @@ class KnowledgeRecord:
     value: str
     source_episode_id: str = ""
     supersedes: str | None = None
+    support_event_ids: tuple[str, ...] | None = None
+    attribution: str | None = None
+    reported_by: str | None = None
+    action_status: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -45,6 +50,10 @@ class KnowledgeRecord:
                 "value": self.value,
                 "source_episode_id": self.source_episode_id,
                 "supersedes": self.supersedes,
+                "support_event_ids": self.support_event_ids,
+                "attribution": self.attribution,
+                "reported_by": self.reported_by,
+                "action_status": self.action_status,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -61,10 +70,16 @@ class KnowledgeRecord:
             value=d["value"],
             source_episode_id=d.get("source_episode_id", ""),
             supersedes=d.get("supersedes"),
+            support_event_ids=tuple(d["support_event_ids"]) if d.get("support_event_ids") is not None else None,
+            attribution=d.get("attribution"),
+            reported_by=d.get("reported_by"),
+            action_status=d.get("action_status"),
         )
 
     def render(self) -> str:
-        return f"[{self.id}] Current fact: {self.subject} {self.predicate}: {self.value}"
+        return (f"[{self.id}] Current fact: {self.subject} {self.predicate}: {self.value}"
+                + render_metadata(self.support_event_ids, self.attribution,
+                                  self.reported_by, self.action_status))
 
 
 def _key(subject: str, predicate: str) -> tuple[str, str]:

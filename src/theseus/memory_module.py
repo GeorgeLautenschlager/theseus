@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from theseus.assertion_metadata import ACTION_STATUSES, ATTRIBUTIONS
 from theseus.intelligence_layer import IntelligenceLayer
 from theseus.json_utils import parse_json_response
 from theseus.knowledge_layer import KnowledgeLayer, KnowledgeRecord
@@ -389,6 +390,8 @@ class MemoryModule:
         events = self._episode_events(episode)
         evidence = [e for e in events if not _is_recall_flagged(e)]
         context_only = [e for e in events if _is_recall_flagged(e)]
+        eligible_events = {e.id: e for e in evidence}
+        context_only_ids = {e.id for e in context_only}
         if not evidence:
             return ConsolidationResult(episode.episode_id, 0, {}, 0, 0, 0, 0,
                                        time.monotonic() - started)
@@ -456,16 +459,23 @@ class MemoryModule:
         ts = max(e.ts for e in evidence)
         for candidate in parsed["assertions"]:
             rid = new_id()
-            reason = _validate_assertion(candidate, lenient=self._lenient_fact_routing)
+            reason = _validate_assertion(candidate, eligible_events, context_only_ids,
+                                         lenient=self._lenient_fact_routing)
             if reason:
                 dead.append({"episode_id": episode.episode_id, "assertion_id": rid,
                              "candidate": candidate, "reason": reason})
                 continue
             layer = _route_write(candidate)
+            metadata = {
+                "support_event_ids": tuple(candidate["support_event_ids"]),
+                "attribution": candidate["attribution"],
+                "reported_by": candidate.get("reported_by"),
+                "action_status": candidate["action_status"],
+            }
             if layer == "knowledge":
                 record = KnowledgeRecord(rid, ts, candidate["subject"].strip(),
                                          candidate["predicate"].strip(), candidate["value"].strip(),
-                                         source_episode_id=episode.episode_id)
+                                         source_episode_id=episode.episode_id, **metadata)
                 current = self.knowledge.current(record.subject, record.predicate)
                 supersessions += int(bool(current) and ts >= current[0].ts)
             else:
@@ -473,18 +483,19 @@ class MemoryModule:
                 if layer == "wisdom":
                     record = WisdomRecord(rid, ts, candidate["statement"].strip(), vector,
                                           source_episode_id=episode.episode_id,
-                                          embedding_model=self._last_embedding_model)
+                                          embedding_model=self._last_embedding_model, **metadata)
                 else:
                     record = MemoryRecord(rid, ts, candidate["statement"].strip(),
                                           candidate["statement"].strip(), vector,
                                           source_episode_id=episode.episode_id,
-                                          embedding_model=self._last_embedding_model)
+                                          embedding_model=self._last_embedding_model, **metadata)
             records[layer].append(record.to_json())
             routed[layer] = routed.get(layer, 0) + 1
         vector = self._embed(parsed["summary"]) or []
         record = MemoryRecord(new_id(), ts, "\n".join(e.to_json() for e in evidence),
                               parsed["summary"], vector, source_episode_id=episode.episode_id,
-                              embedding_model=self._last_embedding_model)
+                              embedding_model=self._last_embedding_model,
+                              support_event_ids=tuple(e.id for e in evidence))
         records["memory"].append(record.to_json())
         routed["memory"] = routed.get("memory", 0) + 1
         elapsed = time.monotonic() - started
@@ -560,7 +571,8 @@ def _has_triple(candidate: dict) -> bool:
     )
 
 
-def _validate_assertion(candidate: Any, lenient: bool = False) -> str | None:
+def _validate_assertion(candidate: Any, eligible_events: dict[str, Any],
+                        context_only_ids: set[str], lenient: bool = False) -> str | None:
     """Routing contract per candidate. Returns a dead-letter reason, or None.
 
     With `lenient`, a fact missing its triple is still valid — it just cannot
@@ -573,6 +585,31 @@ def _validate_assertion(candidate: Any, lenient: bool = False) -> str | None:
     statement = candidate.get("statement")
     if not isinstance(statement, str) or not statement.strip():
         return "missing statement"
+    support_ids = candidate.get("support_event_ids")
+    if (not isinstance(support_ids, list) or not support_ids
+        or any(not isinstance(event_id, str) or not event_id.strip() for event_id in support_ids)
+        or len(set(support_ids)) != len(support_ids)):
+        return "missing or invalid support_event_ids"
+    for event_id in support_ids:
+        if event_id in context_only_ids:
+            return f"context-only support event {event_id}"
+        if event_id not in eligible_events:
+            return f"unknown support event {event_id}"
+    attribution = candidate.get("attribution")
+    if not isinstance(attribution, str) or attribution not in ATTRIBUTIONS:
+        return "missing or invalid attribution"
+    reported_by = candidate.get("reported_by")
+    if attribution == "partner_report":
+        if not isinstance(reported_by, str) or not reported_by.strip():
+            return "partner report missing reported_by"
+        if not any(eligible_events[event_id].actor.casefold() == reported_by.strip().casefold()
+                   for event_id in support_ids):
+            return "reported_by is not a supporting event actor"
+    elif reported_by is not None:
+        return "reported_by requires partner_report attribution"
+    status = candidate.get("action_status")
+    if not isinstance(status, str) or status not in ACTION_STATUSES:
+        return "missing or invalid action_status"
     if kind == "fact" and not lenient:
         for field_name in ("subject", "predicate", "value"):
             value = candidate.get(field_name)

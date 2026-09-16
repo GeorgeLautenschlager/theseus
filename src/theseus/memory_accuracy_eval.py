@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass
 
+from theseus.assertion_metadata import ACTION_STATUSES, ATTRIBUTIONS
 from theseus.json_utils import parse_json_response
 from theseus.model_providers import PROVIDER_REGISTRY
 
@@ -79,9 +80,17 @@ def drive_scenarios(memory, log, scenarios, *, reference, extractor, start):
         for index, episode_spec in enumerate(scenario.episodes):
             episode_id = f"{scenario.name}-ep{index}"
             if reference:
+                assertions = []
+                for label in episode_spec.assertions:
+                    assertion = dict(label)
+                    indices = assertion.pop("support_event_indices")
+                    assertion["support_event_ids"] = [ids[i] for i in indices]
+                    if assertion["attribution"] == "partner_report":
+                        assertion["reported_by"] = scenario.events[indices[0]][0]
+                    assertions.append(assertion)
                 extractor.response = json.dumps({
                     "summary": episode_spec.summary,
-                    "assertions": [dict(assertion) for assertion in episode_spec.assertions],
+                    "assertions": assertions,
                 })
             memory.consolidate(Episode(
                 episode_id, ids[episode_spec.event_indices[0]],
@@ -130,18 +139,25 @@ def _ev(actor, message, role="evidence"):
     return (actor, "chat_message", {"message": message}, role)
 
 
-def _fact(subject, predicate, value, statement=None):
+def _fact(subject, predicate, value, statement=None, *, support, attribution="partner_report",
+          action_status="not_applicable"):
     return {"kind": "fact", "subject": subject, "predicate": predicate,
-            "value": value, "statement": statement or f"{subject} {predicate}: {value}"}
+            "value": value, "statement": statement or f"{subject} {predicate}: {value}",
+            "support_event_indices": support, "attribution": attribution,
+            "action_status": action_status}
 
 
-def _principle(statement):
-    return {"kind": "principle", "statement": statement}
+def _principle(statement, *, support):
+    return {"kind": "principle", "statement": statement,
+            "support_event_indices": support, "attribution": "partner_report",
+            "action_status": "not_applicable"}
 
 
-def _note(statement):
+def _note(statement, *, support):
     # kind "event" = a non-fact episodic note; unrelated to the StimulusEvent event_type
-    return {"kind": "event", "statement": statement}
+    return {"kind": "event", "statement": statement,
+            "support_event_indices": support, "attribution": "partner_report",
+            "action_status": "not_applicable"}
 
 
 REQUIRED_CATEGORIES = frozenset({
@@ -155,47 +171,47 @@ _OVERSIZED_MESSAGE = ("padding. " * 8000) + "DECISIVE: The Atlas security token 
 SCENARIOS = (
     Scenario("atlas-payment", "plan_then_failure",
         (_ev("Alpha", "I will attempt the Atlas payment now."), _ev("tool", "Atlas payment attempt failed; no funds were received.")),
-        (EpisodeSpec((0, 1), "I attempted the Atlas payment; it failed and no funds arrived.", (_fact("Atlas", "payment status", "failed", "Atlas payment attempt failed; no funds received."),)),),
+        (EpisodeSpec((0, 1), "I attempted the Atlas payment; it failed and no funds arrived.", (_fact("Atlas", "payment status", "failed", "Atlas payment attempt failed; no funds received.", support=(1,), attribution="direct_observation", action_status="failure"),)),),
         (Transition("Atlas", "payment status", "failed"),), ("failed",), ("completed", "received"),
         (Query("What is Atlas's payment status?", "failed", ("completed", "received", "paid")), Query("What is Atlas's bank account number?", None))),
     Scenario("project-backup", "plan_then_success",
         (_ev("Beta", "I plan to back up the project database."), _ev("tool", "Project database backup completed successfully.")),
-        (EpisodeSpec((0, 1), "Beta planned the backup and it completed successfully.", (_fact("Project", "backup status", "completed"),)),),
+        (EpisodeSpec((0, 1), "Beta planned the backup and it completed successfully.", (_fact("Project", "backup status", "completed", support=(1,), attribution="direct_observation", action_status="confirmed_outcome"),)),),
         (Transition("Project", "backup status", "completed"),), ("completed",), ("planned", "not yet"),
         (Query("What is the project backup status?", "completed", ("planned", "not yet")),)),
     Scenario("atlas-deadline", "alternate_wording_correction",
         (_ev("human", "The Atlas prototype is due Friday."), _ev("human", "Scratch that — we pushed Atlas delivery to Monday.")),
-        (EpisodeSpec((0,), "Atlas prototype is due Friday.", (_fact("Atlas", "prototype deadline", "Friday"),)), EpisodeSpec((1,), "Atlas delivery was pushed to Monday.", (_fact("Atlas", "prototype deadline", "Monday"),))),
+        (EpisodeSpec((0,), "Atlas prototype is due Friday.", (_fact("Atlas", "prototype deadline", "Friday", support=(0,)),)), EpisodeSpec((1,), "Atlas delivery was pushed to Monday.", (_fact("Atlas", "prototype deadline", "Monday", support=(1,)),))),
         (Transition("Atlas", "prototype deadline", "Monday", ("Friday",)),), ("Monday",), ("Friday",),
         (Query("What is Atlas's prototype deadline?", "Monday", ("Friday",)),)),
     Scenario("user-prefs", "coexisting_preferences",
         (_ev("human", "I prefer morning meetings."), _ev("human", "I prefer concise written summaries.")),
-        (EpisodeSpec((0,), "The user prefers morning meetings.", (_fact("George", "meeting time preference", "morning"),)), EpisodeSpec((1,), "The user prefers concise written summaries.", (_fact("George", "summary format preference", "concise written"),))),
+        (EpisodeSpec((0,), "The user prefers morning meetings.", (_fact("George", "meeting time preference", "morning", support=(0,)),)), EpisodeSpec((1,), "The user prefers concise written summaries.", (_fact("George", "summary format preference", "concise written", support=(1,)),))),
         (Transition("George", "meeting time preference", "morning"), Transition("George", "summary format preference", "concise written")), ("morning", "concise"), (),
         (Query("What meeting time does the user prefer?", "morning"), Query("What summary format does the user prefer?", "concise"))),
     Scenario("atlas-phase", "historical_report",
         (_ev("Alpha", "Last quarter Atlas was in the pilot phase."), _ev("human", "Atlas is now in the production phase.")),
-        (EpisodeSpec((0,), "Alpha reported that last quarter Atlas was in the pilot phase.", (_note("Last quarter Atlas was in the pilot phase."),)), EpisodeSpec((1,), "Atlas is now in the production phase.", (_fact("Atlas", "phase", "production"),))),
+        (EpisodeSpec((0,), "Alpha reported that last quarter Atlas was in the pilot phase.", (_note("Last quarter Atlas was in the pilot phase.", support=(0,)),)), EpisodeSpec((1,), "Atlas is now in the production phase.", (_fact("Atlas", "phase", "production", support=(1,)),))),
         (Transition("Atlas", "phase", "production"),), ("production", "pilot"), ("pilot",),
         (Query("What phase is Atlas in now?", "production", ("pilot",)),)),
     Scenario("raven-code", "recall_repetition",
         (_ev("human", "The Atlas access code is RAVEN-42."), _ev("agent", "(recalled) The Atlas access code was once QUAIL-7.", "recall_context")),
-        (EpisodeSpec((0, 1), "The Atlas access code is RAVEN-42.", (_fact("Atlas", "access code", "RAVEN-42"),)),),
+        (EpisodeSpec((0, 1), "The Atlas access code is RAVEN-42.", (_fact("Atlas", "access code", "RAVEN-42", support=(0,)),)),),
         (Transition("Atlas", "access code", "RAVEN-42"),), ("RAVEN-42",), ("QUAIL-7",),
         (Query("What is the Atlas access code?", "RAVEN-42"),) * 3),
     Scenario("boreal-invoice", "split_action_result",
         (_ev("Alpha", "Sending the Boreal invoice now."), _ev("tool", "Boreal invoice sent; confirmation BOR-77.")),
-        (EpisodeSpec((0, 1), "Alpha sent the Boreal invoice; confirmation BOR-77.", (_fact("Boreal", "invoice status", "sent", "Boreal invoice sent; confirmation BOR-77."),)),),
+        (EpisodeSpec((0, 1), "Alpha sent the Boreal invoice; confirmation BOR-77.", (_fact("Boreal", "invoice status", "sent", "Boreal invoice sent; confirmation BOR-77.", support=(1,), attribution="direct_observation", action_status="confirmed_outcome"),)),),
         (Transition("Boreal", "invoice status", "sent"),), ("sent", "BOR-77"), ("draft",),
         (Query("What is Boreal's invoice status?", "sent", ("draft", "not sent")),)),
     Scenario("confirm-policy", "principles",
         (_ev("human", "Always confirm risky actions before executing."), _ev("human", "Reminder: confirm risky actions before executing."), _ev("human", "For low-risk actions, skip the confirmation step.")),
-        (EpisodeSpec((0,), "The user set a rule to always confirm risky actions.", (_principle("Always confirm risky actions before executing."),)), EpisodeSpec((1,), "The user repeated the rule to confirm risky actions.", (_principle("Always confirm risky actions before executing."),)), EpisodeSpec((2,), "The user added that low-risk actions can skip confirmation.", (_principle("For low-risk actions, skip the confirmation step."),))),
+        (EpisodeSpec((0,), "The user set a rule to always confirm risky actions.", (_principle("Always confirm risky actions before executing.", support=(0,)),)), EpisodeSpec((1,), "The user repeated the rule to confirm risky actions.", (_principle("Always confirm risky actions before executing.", support=(1,)),)), EpisodeSpec((2,), "The user added that low-risk actions can skip confirmation.", (_principle("For low-risk actions, skip the confirmation step.", support=(2,)),))),
         (), ("confirm risky actions", "low-risk"), (),
         (Query("What is the policy for risky actions?", "confirm"), Query("What is the policy for low-risk actions?", "low-risk"))),
     Scenario("atlas-token", "oversized_tail",
         (("tool", "tool_result", {"message": _OVERSIZED_MESSAGE}, "evidence"), _ev("human", "Store the Atlas security token safely.")),
-        (EpisodeSpec((0, 1), "Atlas security token noted.", (_fact("Atlas", "security token", "ZULU-9"),)),),
+        (EpisodeSpec((0, 1), "Atlas security token noted.", (_fact("Atlas", "security token", "ZULU-9", support=(0,), attribution="direct_observation"),)),),
         (Transition("Atlas", "security token", "ZULU-9"),), ("ZULU-9",), (),
         (Query("What is the Atlas security token?", "ZULU-9"),)),
 )
@@ -257,11 +273,74 @@ def measure_unsupported_present(memory, scenarios):
     return {"violations": len(failures), "total": total, "failures": failures}
 
 
+def measure_source_validity(memory, scenarios, traces):
+    """Check accepted claims against the evidence IDs of their own episode."""
+    eligible = {}
+    for scenario in scenarios:
+        ids = traces[scenario.name]["event_ids"]
+        for index, episode in enumerate(scenario.episodes):
+            eligible[f"{scenario.name}-ep{index}"] = {
+                ids[i] for i in episode.event_indices
+                if scenario.events[i][3] == "evidence"
+            }
+    failures = []
+    total = passed = 0
+    for layer in (memory.knowledge, memory.memory, memory.wisdom):
+        for record in layer.read_all():
+            if record.source_episode_id not in eligible or record.attribution is None:
+                continue  # episode summaries and unrelated/legacy records are not assertions
+            total += 1
+            support = record.support_event_ids
+            if support and len(set(support)) == len(support) and set(support) <= eligible[record.source_episode_id]:
+                passed += 1
+            else:
+                failures.append({"episode_id": record.source_episode_id, "record_id": record.id,
+                                 "support_event_ids": support})
+    return {"passed": passed, "total": total, "failures": failures}
+
+
+def measure_labeled_assertions(memory, scenarios, traces):
+    """Compare stored claims with semantic labels, separately from ID validity."""
+    failures = []
+    total = passed = 0
+    for scenario in scenarios:
+        ids = traces[scenario.name]["event_ids"]
+        for index, episode in enumerate(scenario.episodes):
+            episode_id = f"{scenario.name}-ep{index}"
+            for label in episode.assertions:
+                total += 1
+                kind = label["kind"]
+                if kind == "fact":
+                    records = memory.knowledge.read_all()
+                    matches = [r for r in records if r.source_episode_id == episode_id
+                               and (r.subject, r.predicate, r.value) ==
+                               (label["subject"], label["predicate"], label["value"])]
+                elif kind == "principle":
+                    matches = [r for r in memory.wisdom.read_all()
+                               if r.source_episode_id == episode_id and r.statement == label["statement"]]
+                else:
+                    matches = [r for r in memory.memory.read_all()
+                               if r.source_episode_id == episode_id and r.content == label["statement"]]
+                support = tuple(ids[i] for i in label["support_event_indices"])
+                expected_reporter = (scenario.events[label["support_event_indices"][0]][0]
+                                     if label["attribution"] == "partner_report" else None)
+                if any(r.support_event_ids == support and r.attribution == label["attribution"]
+                       and r.reported_by == expected_reporter
+                       and r.action_status == label["action_status"] for r in matches):
+                    passed += 1
+                else:
+                    failures.append({"scenario": scenario.name, "episode_id": episode_id,
+                                     "kind": kind, "statement": label["statement"]})
+    return {"passed": passed, "total": total, "failures": failures}
+
+
 def _evaluate(memory, log, scenarios, traces, workdir, *, budget_tokens):
     metrics = {
         "correct_updates": measure_correct_updates(memory, scenarios),
         "supported_retained": measure_supported_retained(memory, scenarios, budget_tokens=budget_tokens),
         "unsupported_present": measure_unsupported_present(memory, scenarios),
+        "source_validity": measure_source_validity(memory, scenarios, traces),
+        "labeled_assertions": measure_labeled_assertions(memory, scenarios, traces),
     }
     restarted = MemoryModule(workdir / "memory", log, model_providers=memory._model_providers, embedding_providers=[])
     restart_recall = measure_supported_retained(restarted, scenarios, budget_tokens=budget_tokens)
@@ -324,7 +403,8 @@ def run_offline(workdir, *, budget_tokens=2000) -> dict:
             "shows the decisive fact is dropped from the extraction budget under the current "
             "head-first packing (see #65) and the reference label includes it only because it "
             "is scripted; reported usage may omit failed requests and provider retries; live "
-            "semantic accuracy requires run_live with an explicit model."),
+            "semantic accuracy requires run_live with an explicit model; valid supporting "
+            "event IDs alone do not prove a claim is true."),
         "scenarios": scenarios,
     }
     (workdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -379,7 +459,9 @@ def run_live(workdir, *, extractor, embedder=None, answerer=None, budget_tokens=
         "scenarios": _scenario_rows(memory, SCENARIOS, budget_tokens),
         "limitations": (
             "Substring matches and valid citation IDs are recorded for review "
-            "but are not treated as proof of semantic support. Live model "
+            "but are not treated as proof of semantic support. Source validity "
+            "checks eligible IDs; labeled assertions separately check what those "
+            "events establish. Live model "
             "quality and provider usage may vary."
         ),
     }
@@ -430,6 +512,18 @@ def validate_scenarios(scenarios):
                 raise ValueError(f"{scenario.name}: episode index out of range")
             covered.extend(indices)
             for assertion in episode.assertions:
+                support = assertion.get("support_event_indices")
+                if (not isinstance(support, tuple) or not support
+                    or any(type(i) is not int for i in support)
+                    or len(set(support)) != len(support)
+                    or any(i not in indices or scenario.events[i][3] != "evidence"
+                           for i in support)):
+                    raise ValueError(f"{scenario.name}: assertion lacks eligible supporting events")
+                attribution = assertion.get("attribution")
+                status = assertion.get("action_status")
+                if (not isinstance(attribution, str) or attribution not in ATTRIBUTIONS
+                    or not isinstance(status, str) or status not in ACTION_STATUSES):
+                    raise ValueError(f"{scenario.name}: invalid assertion metadata")
                 if assertion.get("kind") == "fact":
                     if not all(assertion.get(k) for k in ("subject", "predicate", "value")):
                         raise ValueError(f"{scenario.name}: malformed fact assertion")
