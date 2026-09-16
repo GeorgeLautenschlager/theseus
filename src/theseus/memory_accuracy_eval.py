@@ -329,6 +329,8 @@ def run_live(workdir, *, extractor, embedder=None, answerer=None, budget_tokens=
                 try:
                     parsed = parse_json_response(raw)
                     answer = parsed["answer"]
+                    if not isinstance(answer, str):
+                        raise ValueError("non-string answer")
                     cited = parsed.get("evidence_ids", [])
                     valid = isinstance(answer, str) and isinstance(cited, list) and all(i in {r["id"] for r in records} for i in cited)
                 except (ValueError, TypeError, KeyError, json.JSONDecodeError):

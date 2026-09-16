@@ -162,6 +162,20 @@ def test_run_live_stamps_mode_and_rejects_unknown_citations(tmp_path):
     assert "not treated as proof" in report["limitations"]
 
 
+def test_run_live_survives_a_nonstring_answer(tmp_path):
+    class BadAnswerProvider:
+        model = "bad-answer"
+
+        def chat(self, prompt, **kwargs):
+            if "assertions" in prompt or "consolidation" in prompt:
+                return json.dumps({"summary": "ok", "assertions": []})
+            return json.dumps({"answer": 42, "evidence_ids": []})
+
+    report = run_live(tmp_path, extractor=BadAnswerProvider(), answerer=BadAnswerProvider())
+    assert report["answers"]
+    assert all(not a["valid_citations"] for a in report["answers"])
+
+
 def test_main_offline_writes_a_report(tmp_path, capsys):
     main(["--workdir", str(tmp_path / "run")])
     assert json.loads((tmp_path / "run" / "report.json").read_text())["mode"] == "reference-extraction-offline"
