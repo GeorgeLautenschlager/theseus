@@ -110,11 +110,13 @@ class TestLayers:
         assert m2.get("m1").to_json() == m.get("m1").to_json()
 
     def test_knowledge_supersession_is_explicit_and_logged(self, tmp_path):
-        """Criterion 6: supersession is explicit (new record names the old) and
-        logged (both records stay in the append-only file)."""
+        """Criterion 6: supersession is explicit (new record names the old,
+        decided by the caller — see #66 reconciliation) and logged (both
+        records stay in the append-only file)."""
         k = KnowledgeLayer(tmp_path / "knowledge.jsonl")
         first = k.add(KnowledgeRecord(id="k1", ts=_ts(2), subject="George", predicate="prefers", value="dark mode"))
-        second = k.add(KnowledgeRecord(id="k2", ts=_ts(0), subject="George", predicate="prefers", value="light mode"))
+        second = k.add(KnowledgeRecord(id="k2", ts=_ts(0), subject="George", predicate="prefers",
+                                       value="light mode", supersedes="k1"))
 
         assert second.supersedes == first.id
         current = k.current(subject="George", predicate="prefers")

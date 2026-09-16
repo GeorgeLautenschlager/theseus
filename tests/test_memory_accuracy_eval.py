@@ -111,12 +111,16 @@ def _scenario(name):
 
 
 def test_driver_applies_correction_across_episodes(tmp_path):
+    """#66: the correction is worded under a different predicate than the
+    original ("delivery date" vs "prototype deadline") — reconciliation, not
+    a shared key, is what has to resolve it as the same attribute."""
     extractor = ReferenceExtractor()
     memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
     drive_scenarios(memory, log, (_scenario("atlas-deadline"),),
                     reference=True, extractor=extractor,
                     start=datetime(2026, 1, 1, tzinfo=timezone.utc))
-    current = memory.knowledge.current("Atlas", "prototype deadline")
+    assert memory.knowledge.current("Atlas", "prototype deadline") == []
+    current = memory.knowledge.current("Atlas", "delivery date")
     assert current and current[0].value == "Monday"
     assert all(r.value != "Friday" for r in memory.knowledge.current())
 
@@ -173,6 +177,30 @@ def test_run_offline_reports_separated_metrics_and_survives_restart(tmp_path):
     assert report["costs"]["answer_chat_calls"] == 0
     assert report["costs"]["embedding_calls_at_consolidation"] == 0
     assert json.loads((tmp_path / "report.json").read_text())["mode"] == report["mode"]
+
+
+def test_driver_keeps_coexisting_preferences_under_one_broad_predicate(tmp_path):
+    extractor = ReferenceExtractor()
+    memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
+    drive_scenarios(memory, log, (_scenario("user-prefs"),),
+                    reference=True, extractor=extractor,
+                    start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    current = memory.knowledge.current("George", "preference")
+    assert {r.value for r in current} == {"morning meetings", "concise written summaries"}
+    added = next(r for r in current if r.value == "concise written summaries")
+    assert added.reconciliation == "coexist" and added.supersedes is None
+
+
+def test_driver_keeps_an_unresolved_contradiction_visible_and_attributed(tmp_path):
+    extractor = ReferenceExtractor()
+    memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
+    drive_scenarios(memory, log, (_scenario("boreal-conflict"),),
+                    reference=True, extractor=extractor,
+                    start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    current = {r.reported_by: r for r in memory.knowledge.current("Boreal", "deadline")}
+    assert {r.value for r in current.values()} == {"Thursday", "Friday"}
+    assert current["Beta"].contradicts == (current["Alpha"].id,)
+    assert current["Beta"].reconciliation == "contradiction"
 
 
 def test_run_offline_confirms_the_decisive_tail_reaches_extraction(tmp_path):

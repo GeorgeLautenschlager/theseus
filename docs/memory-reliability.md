@@ -63,16 +63,35 @@ still depends on the filesystem and host honoring fsync.
 
 Embedding outages fall back to lexical search over summaries, original episode
 evidence, and wisdom. Recent-event search filters for the query and excludes
-recall results. Current facts use normalized subject/predicate keys and the newest
-source episode timestamp; late consolidation of an older episode cannot replace
-a newer fact with the same key. Historical episodes remain available and are
-labeled separately from current facts.
+recall results. Historical episodes remain available and are labeled separately
+from current facts.
+
+A newly extracted fact is reconciled against the subject's existing current
+knowledge (bounded to `reconciliation_context_k` records, default 6) before it is
+written, rather than simply replacing whatever shares its subject+predicate key
+and has an equal-or-newer episode timestamp. Reconciliation decides one of:
+`new` (nothing existing describes the same attribute), `reinforce` (restates an
+existing value — recorded, but not a change), `replace` (a genuine update, in
+whatever wording), `coexist` (a different attribute sharing a broad predicate,
+e.g. two independent preferences both filed under "preference"), `contradiction`
+(conflicting reports with no clear resolution — both stay current, the newer one
+names the other in `contradicts`), or `historical` (the claim itself describes a
+past or superseded state and must never become current, regardless of when its
+episode was processed — report time is not effective time). A subject with no
+existing knowledge costs no reconciliation call at all. A failed, unavailable, or
+malformed reconciliation response falls back to the pre-reconciliation default
+(replace an exact subject+predicate match, otherwise write new) rather than
+blocking the episode; failures are recorded to `reconciliation_failures.jsonl`.
+`KnowledgeRecord.supersedes` is therefore decided by this step, not inferred by
+`KnowledgeLayer` from keys or timestamps — more than one record can legitimately
+be current for the same subject+predicate at once (coexistence or an unresolved
+contradiction), and a `reconciliation="historical"` record is kept in the
+append-only file but never enters the current set.
 
 Lexical and vector rankings combine within a layer. Across layers the result is
 a weighted rank interleave, favoring current facts; it does not detect semantic
-agreement or contradictions between different records. Different wording for the
-same predicate can still create separate facts. Timestamp order is not a substitute
-for understanding when a reported fact actually became effective.
+agreement between different records beyond what reconciliation already resolved
+at write time.
 
 Extraction requires a nonempty summary and an assertions list. Malformed responses
 try the next provider and leave the episode retryable if none succeeds. Invalid
@@ -94,9 +113,14 @@ true, or that a planned action succeeded. Multi-event offline tests include a
 falsely confirmed payment with a valid event reference and mark it semantically
 wrong; live extraction still requires accuracy evaluation.
 
-Requests have character and output-token bounds. Oversized events are explicitly
-excerpted in the prompt; complete source evidence is retained in the episode
-record. A bound on characters is an approximate token bound. Huge individual
+Requests have character and output-token bounds. Complete events are packed into
+a shared extraction request using redistributed unused capacity rather than a
+fixed equal share per event; an event too large even after redistribution is
+pulled out and chunked into its own bounded request(s) that together cover it
+completely, so decisive evidence near its end (a success/failure marker, a final
+total) still reaches extraction instead of being cut away by a prefix
+truncation. Complete source evidence is retained in the episode record
+regardless. A bound on characters is an approximate token bound. Huge individual
 events still occupy disk and memory. Reads rebuild file-backed projections, so
 long-run performance needs measurement at the experiment's actual event volume.
 
@@ -148,14 +172,20 @@ partners' context windows. No live inference was used for this validation.
 **knowledge transitions across multi-event episodes** (the older
 `memory_experiment_eval.py` keeps the single-event raw-lexical retrieval control).
 It consolidates labeled multi-event scenarios — plans followed by failure or
-success, alternate-wording corrections, coexisting preferences, historical
-reports, decisive evidence at the end of an oversized event, recall repetition,
-split action/result pairs, and repeated or contradictory principles — and reports
+success, alternate-wording corrections (under a genuinely different predicate,
+not just a shared key), coexisting preferences under one broad predicate,
+historical reports, an unresolved contradiction between two partner reports,
+decisive evidence at the end of an oversized event, recall repetition, split
+action/result pairs, and repeated or contradictory principles — and reports
 correct knowledge updates, supported-claim retention, unsupported claims,
 source-ID validity, and agreement with labeled assertion metadata **separately**.
 The latter compares attribution, action status, and labeled supporting events;
-valid IDs alone do not count as semantic correctness. It also verifies recall
-after a cold restart and after the source events leave the live context window.
+valid IDs alone do not count as semantic correctness. Reconciliation decisions
+for scenarios that need one (replace across differently worded predicates,
+coexistence, contradiction) are scripted per episode against the module's live
+knowledge state, the same way reference extractions are scripted. It also
+verifies recall after a cold restart and after the source events leave the live
+context window.
 
 Run it offline (deterministic, no live endpoint — reference extractions, part of
 the offline suite):
@@ -172,8 +202,8 @@ env -u VIRTUAL_ENV poetry run python -m theseus.memory_accuracy_eval \
   [--embedding-provider PROVIDER --embedding-model MODEL] [--answers]
 ```
 
-The offline oversized-tail scenario reports `decisive_tail_in_budget: false` — the
-decisive fact at the end of an oversized event is dropped from the extraction
-budget under the current head-first packing; that is the baseline the budget work
-(#65) will flip. Substring matches and valid citation IDs are recorded for review
-but are **not** treated as proof of semantic support.
+The offline oversized-tail scenario reports `decisive_tail_in_budget: true` — the
+decisive fact at the end of an oversized event reaches extraction because the
+event is chunked rather than head-truncated (#65). Substring matches and valid
+citation IDs are recorded for review but are **not** treated as proof of
+semantic support.
