@@ -256,6 +256,160 @@ def test_restart_keeps_failed_episode_boundaries_even_after_more_events(tmp_path
     assert restarted.pending_events == 1
 
 
+def _last_extraction_prompt(chat):
+    # A tick can also fire a #66 reconciliation call, whose prompt has no
+    # <evidence> block — skip those to find the actual extraction prompt.
+    return next(p for p in reversed(chat.prompts) if "<evidence>" in p)
+
+
+def test_action_result_pair_is_not_split_by_a_forced_batch_limit(tmp_path):
+    """#67: the naive `events[:max_events]` slice would land exactly between
+    a decision and its own tool_result here — the batch stops one event
+    earlier instead, and the pair rides together into one episode."""
+    module, log, _, chat = setup(tmp_path)
+    d1 = log.append("agent", "decision", {"text": "attempt Atlas payment"})
+    r1 = log.append("agent", "tool_result", {"tool": "pay", "output": "failed"})
+    log.append("agent", "decision", {"text": "notify the user"})
+    r2 = log.append("agent", "tool_result", {"tool": "reply", "output": "sent"})
+    clock = [0.0]
+    policy = MemoryConsolidator(module, max_events=3, every_seconds=10, now=lambda: clock[0])
+
+    first = policy.tick()
+    assert not first.skipped
+    state = json.loads((module.memory_dir / "formation" / "cursor.json").read_text())
+    assert state["last_id"] == r1.id  # stopped after the pair, not mid-pair
+
+    clock[0] = 10.0
+    second = policy.tick()
+    assert not second.skipped
+    state = json.loads((module.memory_dir / "formation" / "cursor.json").read_text())
+    assert state["last_id"] == r2.id
+    # The second episode's extraction carries the first pair as bounded context.
+    prompt = _last_extraction_prompt(chat)
+    assert "<context_only>" in prompt
+    assert d1.id in prompt and r1.id in prompt
+
+
+def test_oversized_interaction_unit_forces_through_together(tmp_path):
+    """A decision with more tool_results than max_events alone allows still
+    lands in one episode — keeping an action with its own outcome takes
+    priority over the configured batch size; #65's chunking still bounds
+    what actually reaches extraction."""
+    log = StimulusLog(tmp_path / "log.jsonl")
+    chat = Extractor()
+    module = MemoryModule(tmp_path / "memory", log, model_providers=[chat])
+    log.append("agent", "decision", {"text": "run three checks"})
+    log.append("agent", "tool_result", {"tool": "check1", "output": "ok"})
+    log.append("agent", "tool_result", {"tool": "check2", "output": "ok"})
+    r3 = log.append("agent", "tool_result", {"tool": "check3", "output": "ok"})
+    policy = MemoryConsolidator(module, max_events=2)
+
+    result = policy.tick()
+    assert not result.skipped
+    state = json.loads((module.memory_dir / "formation" / "cursor.json").read_text())
+    assert state["last_id"] == r3.id
+
+
+def test_logs_without_decision_result_typing_batch_per_event(tmp_path):
+    """Deterministic fallback: a log with no `decision`/`tool_result` events at
+    all (an egocentric capture stream, say) batches one event per unit, same
+    as the pre-#67 per-event slicing — bounded work continues without
+    needing any richer interaction metadata."""
+    log = StimulusLog(tmp_path / "log.jsonl")
+    chat = Extractor()
+    module = MemoryModule(tmp_path / "memory", log, model_providers=[chat])
+    events = [log.append("sensor", "observation", {"i": i}) for i in range(5)]
+    policy = MemoryConsolidator(module, max_events=3)
+
+    policy.tick()
+    state = json.loads((module.memory_dir / "formation" / "cursor.json").read_text())
+    assert state["last_id"] == events[2].id
+
+
+def test_context_event_ids_survive_a_failed_attempt_and_restart(tmp_path):
+    log = StimulusLog(tmp_path / "log.jsonl")
+    chat = Extractor()
+    module = MemoryModule(tmp_path / "memory", log, model_providers=[chat])
+    d1 = log.append("agent", "decision", {"text": "step one"})
+    r1 = log.append("agent", "tool_result", {"tool": "x", "output": "ok"})
+    policy = MemoryConsolidator(module, max_events=2)
+    assert not policy.tick().skipped
+
+    log.append("agent", "decision", {"text": "step two"})
+    log.append("agent", "tool_result", {"tool": "y", "output": "fail"})
+    broken = MemoryModule(module.memory_dir, log, model_providers=[Extractor('{}')])
+    broken_policy = MemoryConsolidator(broken, max_events=2)
+    with pytest.raises(RuntimeError):
+        broken_policy.tick()
+    pending = json.loads((module.memory_dir / "formation" / "cursor.json").read_text())["pending"]
+    assert set(pending["context_event_ids"]) == {d1.id, r1.id}
+
+    log.append("human", "chat_message", {"message": "NEW_EVENT_SHOULD_NOT_APPEAR"})
+    fixed_chat = Extractor()
+    restarted = MemoryConsolidator(MemoryModule(module.memory_dir, log, model_providers=[fixed_chat]))
+    result = restarted.tick()
+    assert result.episode_id == pending["episode_id"]
+    prompt = _last_extraction_prompt(fixed_chat)
+    assert "NEW_EVENT_SHOULD_NOT_APPEAR" not in prompt
+    assert "<context_only>" in prompt
+    assert d1.id in prompt and r1.id in prompt
+
+
+def test_pending_state_without_context_event_ids_still_replays(tmp_path):
+    """A cursor.json pending block written before #67 (no context_event_ids
+    key) still replays under the new code — the field is additive."""
+    module, log, episode, chat = setup(tmp_path)
+    policy = MemoryConsolidator(module)
+    path = module.memory_dir / "formation" / "cursor.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pending": {
+        "episode_id": "legacy-ep", "start_id": episode.start_id, "end_id": episode.end_id,
+    }}))
+    result = policy.tick()
+    assert result.episode_id == "legacy-ep"
+
+
+def test_context_event_ids_are_readable_but_never_citable_as_support(tmp_path):
+    module, log, _, chat = setup(tmp_path)
+    prior = log.append("agent", "tool_result", {"tool": "pay", "output": "PRIOR_CONTEXT_MARKER"})
+    new_event = log.append("human", "chat_message", {"message": "what happened with the payment?"})
+
+    module.consolidate(Episode("ep1", new_event.id, new_event.id, context_event_ids=(prior.id,)))
+
+    prompt = _last_extraction_prompt(chat)
+    assert "PRIOR_CONTEXT_MARKER" in prompt
+    assert "<context_only>" in prompt
+    for record in module.knowledge.read_all() + module.memory.read_all() + module.wisdom.read_all():
+        assert prior.id not in (record.support_event_ids or ())
+
+
+def test_context_event_id_cited_as_support_is_dead_lettered(tmp_path):
+    class CitingExtractor:
+        def __init__(self, context_id):
+            self.context_id = context_id
+            self.calls = 0
+
+        def chat(self, prompt, **kwargs):
+            self.calls += 1
+            return json.dumps({"summary": "s", "assertions": [{
+                "kind": "event", "statement": "cites prior context",
+                "support_event_ids": [self.context_id],
+                "attribution": "direct_observation", "action_status": "not_applicable",
+            }]})
+
+    log = StimulusLog(tmp_path / "log.jsonl")
+    prior = log.append("agent", "tool_result", {"tool": "pay", "output": "ok"})
+    new_event = log.append("human", "chat_message", {"message": "next"})
+    chat = CitingExtractor(prior.id)
+    module = MemoryModule(tmp_path / "memory", log, model_providers=[chat])
+
+    result = module.consolidate(Episode("ep1", new_event.id, new_event.id, context_event_ids=(prior.id,)))
+
+    assert result.schema_failures == 1
+    dead = json.loads((module.memory_dir / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert "context-only support event" in dead["reason"]
+
+
 # Direct-observation/inference attribution only, so validity doesn't depend on
 # which actor produced the (tool-authored) oversized event.
 _CHUNK_TEST_RESPONSE = json.dumps({

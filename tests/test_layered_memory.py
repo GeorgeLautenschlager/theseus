@@ -408,7 +408,9 @@ class TestRecall:
         has no episode-detection surface at all."""
         public = [name for name in dir(MemoryModule) if not name.startswith("_")]
         assert not {n for n in public if "segment" in n.lower() or "detect" in n.lower()}
-        assert {f.name for f in fields(Episode)} == {"episode_id", "start_id", "end_id"}
+        assert {f.name for f in fields(Episode)} == {
+            "episode_id", "start_id", "end_id", "context_event_ids",
+        }
 
 
 class TestTornLineRecovery:

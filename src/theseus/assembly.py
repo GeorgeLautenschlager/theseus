@@ -56,6 +56,7 @@ class MemorySpec:
     consolidate_every_seconds: float | None = None
     episode_max_events: int = 20
     episode_max_chars: int = 24000
+    episode_context_events: int = 2
 
 
 @dataclass(frozen=True)
@@ -184,6 +185,8 @@ class AgentSpec:
             raise ValueError("episode_max_events must be positive")
         if type(memory.episode_max_chars) is not int or memory.episode_max_chars < 4096:
             raise ValueError("episode_max_chars must be at least 4096")
+        if type(memory.episode_context_events) is not int or memory.episode_context_events < 0:
+            raise ValueError("episode_context_events must be a nonnegative integer")
         if memory.kind not in ("none", "amem", "module"):
             raise ValueError("memory kind must be 'none', 'amem', or 'module'")
         if type(memory.recall_budget_tokens) is not int or memory.recall_budget_tokens <= 0:
@@ -316,6 +319,7 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
             core.memory_consolidator = MemoryConsolidator(
                 core.memory, every_seconds=spec.memory.consolidate_every_seconds,
                 max_events=spec.memory.episode_max_events, max_chars=spec.memory.episode_max_chars,
+                context_events=spec.memory.episode_context_events,
             )
     if core.memory is not None:
         recall = RecallTool(core.memory, budget_tokens=spec.memory.recall_budget_tokens)
