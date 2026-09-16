@@ -208,14 +208,77 @@ def test_restart_keeps_failed_episode_boundaries_even_after_more_events(tmp_path
     assert restarted.pending_events == 1
 
 
-def test_oversized_event_is_bounded_for_extraction_but_evidence_is_preserved(tmp_path):
+def test_oversized_event_is_chunked_and_decisive_ending_reaches_extraction(tmp_path):
+    """An event too large for one request is split into several bounded chunks
+    that together cover it completely, so the decisive marker at its very end
+    reaches extraction instead of being cut away by a prefix truncation — and
+    identical assertions the same canned response yields per chunk collapse
+    into one via dedup."""
     module, log, _, chat = setup(tmp_path)
     event = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
-    module.consolidate(Episode("big", event.id, event.id))
-    assert len(chat.prompts[-1]) <= module._max_input_chars
-    assert "truncated" in chat.prompts[-1]
+    result = module.consolidate(Episode("big", event.id, event.id))
+    assert len(chat.prompts) > 1
+    assert all(len(p) <= module._max_input_chars for p in chat.prompts)
+    assert all(event.id in p for p in chat.prompts)  # original event id carried through every chunk
+    assert "END_MARKER" in chat.prompts[-1]
+    assert result.extracted == 3  # repeated per-chunk assertions deduped, not multiplied
     assert "END_MARKER" in module.memory.read_all()[-1].content
     assert "END_MARKER" in module.recall("END_MARKER", 2000).entries[0].text
+
+
+def test_mixed_short_and_long_events_pack_short_ones_whole_and_chunk_the_long_one(tmp_path):
+    """Short events aren't truncated down to an equal per-event share just
+    because one event in the same episode is huge — unused capacity from the
+    short events is not imposed as a ceiling on them."""
+    module, log, _, chat = setup(tmp_path)
+    first = log.append("human", "chat_message", {"message": "short one"})
+    log.append("human", "chat_message", {"message": "short two"})
+    big = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
+    last = log.append("human", "chat_message", {"message": "short three"})
+    module.consolidate(Episode("mix", first.id, last.id))
+
+    pack_prompts = [p for p in chat.prompts if "short one" in p]
+    assert len(pack_prompts) == 1
+    assert "short two" in pack_prompts[0] and "short three" in pack_prompts[0]
+    assert big.id not in pack_prompts[0]  # the oversized event stayed out of the shared pack
+
+    chunk_prompts = [p for p in chat.prompts if big.id in p]
+    assert chunk_prompts and all(len(p) <= module._max_input_chars for p in chunk_prompts)
+    assert "END_MARKER" in chunk_prompts[-1]
+
+
+def test_failed_chunk_extraction_leaves_episode_pending_and_writes_nothing(tmp_path):
+    """A required chunk that no provider can extract must not complete the
+    episode partially — same transaction guarantee a single-request failure
+    already gets, extended to every unit chunking can produce."""
+
+    class FlakyExtractor:
+        def __init__(self, fail_after):
+            self.calls = 0
+            self.prompts = []
+            self.fail_after = fail_after
+
+        def chat(self, prompt, **kwargs):
+            self.calls += 1
+            self.prompts.append(prompt)
+            if self.calls > self.fail_after:
+                raise RuntimeError("boom")
+            return Extractor().response
+
+    chat = FlakyExtractor(fail_after=1)
+    module, log, _, _ = setup(tmp_path, extractor=chat)
+    event = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
+    episode = Episode("big", event.id, event.id)
+    with pytest.raises(RuntimeError, match="valid extraction"):
+        module.consolidate(episode)
+    assert len(module.memory) == 0
+    assert not (module.memory_dir / "consolidation_ledger.jsonl").exists()
+    assert not (module.memory_dir / "pending.json").exists()
+
+    chat.fail_after = 999  # provider recovers; retry from scratch succeeds
+    result = module.consolidate(episode)
+    assert not result.skipped
+    assert "END_MARKER" in module.memory.read_all()[-1].content
 
 
 def test_recall_and_consolidation_are_serialized_across_module_instances(tmp_path, monkeypatch):

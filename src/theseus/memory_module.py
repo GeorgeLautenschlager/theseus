@@ -44,6 +44,11 @@ from theseus.wisdom_layer import WisdomLayer, WisdomRecord
 # between layers so rank order, not raw scores, drives fusion.
 _RRF_K = 60
 
+# Chars of overlap between consecutive chunks of one oversized event, so a
+# sentence straddling a chunk boundary isn't lost from both sides' context.
+# The resulting repeated text is why extraction runs a dedup pass afterward.
+_CHUNK_OVERLAP_CHARS = 200
+
 
 def estimate_tokens(text: str) -> int:
     """Naive token estimate: ~4 chars/token. Good enough to budget a window."""
@@ -392,61 +397,63 @@ class MemoryModule:
         if not evidence:
             return ConsolidationResult(episode.episode_id, 0, {}, 0, 0, 0, 0,
                                        time.monotonic() - started)
-        overhead = len(build_extraction_prompt("", "context"))
-        per_event = (self._max_input_chars - overhead - len(events)) // len(events)
-        truncated = 0
 
-        def render(event):
-            nonlocal truncated
-            line = event.to_json()
-            if len(line) <= per_event:
-                return line
-            truncated += 1
-            # Preserve the original in the episode record. Extraction sees an
-            # explicitly marked excerpt; the full evidence remains searchable.
-            content = json.dumps(event.content, ensure_ascii=False)
-            size = max(0, per_event - len(replace(event, content={}).to_json()) - 100)
-            while True:
-                line = replace(event, content={"excerpt": content[:size], "truncated": True}).to_json()
-                if len(line) <= per_event:
-                    return line
-                if size == 0:
-                    raise ValueError("episode has too many events for the extraction budget")
-                size //= 2
+        context_text = "\n".join(e.to_json() for e in context_only)
+        # Real overhead: the prompt shape plus whatever context this episode actually
+        # carries, not a fixed guess — a large recalled-context block eats real budget.
+        overhead = len(build_extraction_prompt("", context_text))
+        solo_budget = self._max_input_chars - overhead
+        if solo_budget <= 0:
+            raise ValueError("episode has too many events for the extraction budget")
 
-        prompt = build_extraction_prompt("\n".join(render(e) for e in evidence),
-                                         "\n".join(render(e) for e in context_only))
+        units, oversized_events = _pack_units(evidence, solo_budget)
+
         tokens_in = tokens_out = calls = 0
         reported_usage = []
-        parsed = None
-        for provider in self._model_providers:
-            try:
-                if not getattr(provider, "is_available", lambda: True)():
-                    continue
-                calls += 1
-                tokens_in += estimate_tokens(prompt)
-                raw = provider.chat(prompt, json_schema=extraction_json_schema(),
-                                    max_tokens=self._max_output_tokens)
-                usage = getattr(provider, "last_chat_usage", None)
-                if isinstance(usage, dict):
-                    reported_usage.append({"provider": _provider_identity(provider), **usage})
-                tokens_out += estimate_tokens(raw)
-                candidate_response = parse_json_response(raw)
-                if (not isinstance(candidate_response, dict)
-                    or not isinstance(candidate_response.get("summary"), str)
-                    or not candidate_response["summary"].strip()
-                    or not isinstance(candidate_response.get("assertions"), list)):
-                    raise ValueError("extraction requires a nonempty summary and an assertions list")
-                parsed = candidate_response
-                break
-            except Exception as exc:
-                append_record(self.memory_dir / "extraction_failures.jsonl", json.dumps({
-                    "episode_id": episode.episode_id, "provider": _provider_identity(provider),
-                    "error": str(exc), "tokens_in_estimated": tokens_in,
-                    "tokens_out_estimated": tokens_out,
-                }))
-        if parsed is None:
-            raise RuntimeError("no model provider produced a valid extraction; episode remains pending")
+        parsed_units = []
+        for unit_text, unit_meta in units:
+            unit_prompt = build_extraction_prompt(unit_text, context_text)
+            parsed = None
+            for provider in self._model_providers:
+                try:
+                    if not getattr(provider, "is_available", lambda: True)():
+                        continue
+                    calls += 1
+                    tokens_in += estimate_tokens(unit_prompt)
+                    raw = provider.chat(unit_prompt, json_schema=extraction_json_schema(),
+                                        max_tokens=self._max_output_tokens)
+                    usage = getattr(provider, "last_chat_usage", None)
+                    if isinstance(usage, dict):
+                        reported_usage.append({"provider": _provider_identity(provider), **usage})
+                    tokens_out += estimate_tokens(raw)
+                    candidate_response = parse_json_response(raw)
+                    if (not isinstance(candidate_response, dict)
+                        or not isinstance(candidate_response.get("summary"), str)
+                        or not candidate_response["summary"].strip()
+                        or not isinstance(candidate_response.get("assertions"), list)):
+                        raise ValueError("extraction requires a nonempty summary and an assertions list")
+                    parsed = candidate_response
+                    break
+                except Exception as exc:
+                    append_record(self.memory_dir / "extraction_failures.jsonl", json.dumps({
+                        "episode_id": episode.episode_id, "provider": _provider_identity(provider),
+                        "error": str(exc), "tokens_in_estimated": tokens_in,
+                        "tokens_out_estimated": tokens_out, **unit_meta,
+                    }))
+            if parsed is None:
+                # Nothing durable has been written yet (pending.json is built only after
+                # every unit succeeds), so a failed chunk leaves the whole episode
+                # pending, exactly like a single-request failure always has.
+                raise RuntimeError("no model provider produced a valid extraction; episode remains pending")
+            parsed_units.append(parsed)
+
+        # Multiple requests over one episode is a v0 side effect of chunking, not a
+        # reason to change what the episode record looks like: one merged summary,
+        # deduped assertions (overlap between chunks reliably restates the same claim).
+        summary = " ".join(p["summary"].strip() for p in parsed_units if p["summary"].strip())
+        raw_assertions = [a for p in parsed_units for a in p["assertions"]]
+        assertions, duplicates = _dedupe_assertions(raw_assertions)
+
         records = {name: [] for name in ("knowledge", "memory", "wisdom")}
         dead = []
         routed = {}
@@ -454,7 +461,7 @@ class MemoryModule:
         before_embeddings = self._embedding_calls
         before_embedding_tokens = self._embedding_tokens
         ts = max(e.ts for e in evidence)
-        for candidate in parsed["assertions"]:
+        for candidate in assertions:
             rid = new_id()
             reason = _validate_assertion(candidate, lenient=self._lenient_fact_routing)
             if reason:
@@ -481,19 +488,21 @@ class MemoryModule:
                                           embedding_model=self._last_embedding_model)
             records[layer].append(record.to_json())
             routed[layer] = routed.get(layer, 0) + 1
-        vector = self._embed(parsed["summary"]) or []
+        vector = self._embed(summary) or []
         record = MemoryRecord(new_id(), ts, "\n".join(e.to_json() for e in evidence),
-                              parsed["summary"], vector, source_episode_id=episode.episode_id,
+                              summary, vector, source_episode_id=episode.episode_id,
                               embedding_model=self._last_embedding_model)
         records["memory"].append(record.to_json())
         routed["memory"] = routed.get("memory", 0) + 1
         elapsed = time.monotonic() - started
-        trace = {"episode_id": episode.episode_id, "candidates_extracted": len(parsed["assertions"]),
+        trace = {"episode_id": episode.episode_id, "candidates_extracted": len(assertions),
                  "routed": routed, "supersessions": supersessions, "schema_failures": len(dead),
                  "tokens_in": tokens_in, "tokens_out": tokens_out, "wall_time_s": elapsed,
                  "token_counts_estimated": True, "chat_calls": calls,
                  "embedding_calls": self._embedding_calls - before_embeddings}
-        trace["truncated_events"] = truncated
+        trace["oversized_events"] = len(oversized_events)
+        trace["extraction_requests"] = len(units)
+        trace["duplicate_assertions_dropped"] = duplicates
         trace["reported_chat_usage"] = reported_usage
         trace["reported_embedding_tokens"] = self._embedding_tokens - before_embedding_tokens
         atomic_json(self.memory_dir / "pending.json", {
@@ -501,7 +510,7 @@ class MemoryModule:
             "records": records, "dead_letters": dead, "trace": trace,
         })
         self._recover_pending()
-        return ConsolidationResult(episode.episode_id, len(parsed["assertions"]), routed,
+        return ConsolidationResult(episode.episode_id, len(assertions), routed,
                                    supersessions, len(dead), tokens_in, tokens_out,
                                    time.monotonic() - started)
 
@@ -538,6 +547,152 @@ def _is_recall_flagged(event) -> bool:
     """A recall-flagged stimulus is the logged output of the agent's own recall
     act — readable as context during consolidation, never evidence."""
     return event.type == "tool_result" and event.content.get("tool") == RECALL_TOOL_NAME
+
+
+# -- extraction packing -----------------------------------------------------------
+
+def _water_fill(sizes: list[int], budget: int) -> list[int]:
+    """Per-item share of `budget`, redistributing what small items don't need
+    onto the items still competing for room — instead of handing every item
+    the same fixed slice regardless of whether it needed it.
+
+    Classic water-filling: take the smallest remaining item; if it fits inside
+    an equal split of what is left, it keeps its own (smaller) size and drops
+    out, growing the share for what remains. The moment the smallest
+    remaining item no longer fits an equal split, nothing larger will either
+    (the list is sorted ascending), so everything still in play gets that
+    same equal share and allocation stops.
+    """
+    order = sorted(range(len(sizes)), key=lambda i: sizes[i])
+    allocation = [0] * len(sizes)
+    remaining_budget = max(0, budget)
+    remaining = list(order)
+    while remaining:
+        share = remaining_budget // len(remaining)
+        smallest = remaining[0]
+        if sizes[smallest] <= share:
+            allocation[smallest] = sizes[smallest]
+            remaining_budget -= sizes[smallest]
+            remaining.pop(0)
+        else:
+            for i in remaining:
+                allocation[i] = share
+            break
+    return allocation
+
+
+def _chunk_event(event, budget: int, overlap: int = _CHUNK_OVERLAP_CHARS) -> list:
+    """Split one event's content into ordered, bounded pieces that together
+    cover it completely, each still carrying the event's own id.
+
+    This is what keeps decisive evidence near the end of a long event (a
+    success/failure marker, a final total) reachable by extraction: nothing
+    is cut away the way a prefix truncation would — the tail simply lands in
+    a later chunk instead of an earlier one.
+    """
+    content_str = json.dumps(event.content, ensure_ascii=False)
+    skeleton = len(replace(event, content={}).to_json())
+    size = max(0, budget - skeleton - 64)
+    while size > 0:
+        probe = replace(event, content={
+            "chunk_of": event.id, "chunk_index": 0, "chunk_count": 1,
+            "excerpt": content_str[:size],
+        }).to_json()
+        if len(probe) <= budget:
+            break
+        size //= 2
+    if size <= 0:
+        raise ValueError("episode has too many events for the extraction budget")
+    pieces = []
+    step = max(1, size - overlap)
+    start = 0
+    while True:
+        pieces.append(content_str[start:start + size])
+        if start + size >= len(content_str):
+            break
+        start += step
+    total = len(pieces)
+    return [
+        replace(event, content={
+            "chunk_of": event.id, "chunk_index": i, "chunk_count": total, "excerpt": piece,
+        })
+        for i, piece in enumerate(pieces)
+    ]
+
+
+def _pack_units(evidence: list, solo_budget: int) -> tuple[list[tuple[str, dict]], list]:
+    """Complete events that fit a shared request, packed into one; anything
+    left over gets its own bounded request(s).
+
+    Two passes: first try every event at full size — if the episode simply
+    fits, nothing is split at all. Otherwise, water-fill the budget: events
+    small enough to be satisfied stay whole and share one request; the rest
+    (individually too large for what redistribution leaves them) are pulled
+    out entirely and given a dedicated request each, at the full per-request
+    budget rather than a cramped leftover share — chunked further only if
+    even that isn't enough.
+    """
+    full_lines = [e.to_json() for e in evidence]
+    sizes = [len(line) for line in full_lines]
+    separators = max(0, len(evidence) - 1)
+    pack_budget = max(0, solo_budget - separators)
+
+    if sum(sizes) <= pack_budget:
+        packed_events, oversized_events = evidence, []
+    else:
+        allocation = _water_fill(sizes, pack_budget)
+        packed_events = [e for e, sz, alloc in zip(evidence, sizes, allocation) if sz <= alloc]
+        oversized_events = [e for e, sz, alloc in zip(evidence, sizes, allocation) if sz > alloc]
+
+    units: list[tuple[str, dict]] = []
+    if packed_events:
+        units.append((
+            "\n".join(e.to_json() for e in packed_events),
+            {"unit": "pack", "event_ids": [e.id for e in packed_events]},
+        ))
+    for event in oversized_events:
+        chunks = [event] if len(event.to_json()) <= solo_budget else _chunk_event(event, solo_budget)
+        for chunk in chunks:
+            units.append((chunk.to_json(), {"unit": "chunk", "event_ids": [event.id]}))
+    if not units:
+        raise ValueError("episode has too many events for the extraction budget")
+    return units, oversized_events
+
+
+def _assertion_key(candidate: Any) -> tuple | None:
+    """Identity used to dedupe assertions across extraction requests. Facts key
+    on their triple (case/whitespace-insensitive) so the same fact restated
+    with a differently worded `statement` still merges; everything else keys
+    on kind + exact statement text. Invalid candidates (caught later by
+    `_validate_assertion`) return None and are never deduped against."""
+    if not isinstance(candidate, dict):
+        return None
+    kind = candidate.get("kind")
+    if kind == "fact" and _has_triple(candidate):
+        return ("fact", candidate["subject"].strip().casefold(),
+                candidate["predicate"].strip().casefold(), candidate["value"].strip().casefold())
+    statement = candidate.get("statement")
+    if isinstance(statement, str) and statement.strip():
+        return (kind, statement.strip().casefold())
+    return None
+
+
+def _dedupe_assertions(candidates: list) -> tuple[list, int]:
+    """Drop exact repeats — the predictable side effect of running more than
+    one extraction request over an episode (overlapping chunk context, or the
+    same fact restated in more than one chunk). First occurrence wins."""
+    seen: set = set()
+    kept = []
+    dropped = 0
+    for candidate in candidates:
+        key = _assertion_key(candidate)
+        if key is not None:
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+        kept.append(candidate)
+    return kept, dropped
 
 
 def _route_write(candidate: dict) -> str:
