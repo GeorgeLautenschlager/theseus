@@ -54,6 +54,8 @@ class DeploymentSpec:
     platform: str = "linux/amd64"
     resources: Mapping[str, ResourceSpec] = field(default_factory=dict)
     image: str | None = None
+    runtime: str = "base"
+    installed_tools: tuple[str, ...] = ()
     build_inputs: tuple[str, ...] = ()
     secrets: tuple[str, ...] = ()
     uid: int = 10001
@@ -118,9 +120,28 @@ class DeploymentSpec:
                 raise ValueError(f"resources[{agent_id!r}] must be a ResourceSpec")
             resource.validate()
         if self.image is not None and (
-            not isinstance(self.image, str) or not self.image.strip()
+            not isinstance(self.image, str)
+            or not self.image.strip()
+            or any(character.isspace() for character in self.image)
         ):
-            raise ValueError("image must be nonempty text when provided")
+            raise ValueError("image must be a nonempty container reference without whitespace")
+        if self.runtime not in ("base", "coding-browser"):
+            raise ValueError("runtime must be 'base' or 'coding-browser'")
+        if not isinstance(self.installed_tools, tuple) or any(
+            not isinstance(tool, str) or re.fullmatch(r"[A-Za-z0-9._+-]+", tool) is None
+            for tool in self.installed_tools
+        ):
+            raise ValueError("installed_tools must be a tuple of executable names")
+        if len(set(self.installed_tools)) != len(self.installed_tools):
+            raise ValueError("installed_tools contains duplicate names")
+        if self.runtime == "base" and self.installed_tools:
+            raise ValueError("installed_tools requires the coding-browser runtime")
+        if self.runtime == "coding-browser" and (
+            self.image is None or not self.installed_tools
+        ):
+            raise ValueError(
+                "coding-browser requires an explicit image and installed_tools"
+            )
         if not isinstance(self.build_inputs, tuple):
             raise ValueError("build_inputs must be a tuple of relative paths")
         for value in self.build_inputs:
@@ -177,4 +198,3 @@ class DeploymentSpec:
             for workspace_id, members in self.workspaces.items()
             if agent_id in members
         )
-

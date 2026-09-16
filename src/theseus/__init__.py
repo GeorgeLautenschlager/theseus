@@ -5,6 +5,7 @@ from theseus.assembly import (
     ResourceSpec, build_agent,
 )
 from theseus.deployment_store import ContainerMount, DeploymentPaths, import_stopped_home
+from theseus.deployment_bundle import assemble_compose, build_bundle
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_reports import (
@@ -72,6 +73,8 @@ __all__ = [
     "DeploymentPaths",
     "ContainerMount",
     "import_stopped_home",
+    "assemble_compose",
+    "build_bundle",
     "InterfaceSpec",
     "MemorySpec",
     "ModelSpec",

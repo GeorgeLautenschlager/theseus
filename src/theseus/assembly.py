@@ -442,12 +442,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Assemble a Theseus agent from a Python definition exporting SPEC")
     parser.add_argument("definition", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--target", choices=("agent", "compose"), default="agent")
     args = parser.parse_args()
     try:
-        spec = runpy.run_path(str(args.definition)).get("SPEC")
-        if not isinstance(spec, AgentSpec):
-            raise ValueError("Definition must export SPEC = AgentSpec(...)")
-        print(assemble(spec, args.output))
+        definition = runpy.run_path(str(args.definition))
+        if args.target == "compose":
+            from theseus.deployment import DeploymentSpec
+            from theseus.deployment_bundle import assemble_compose
+
+            deployment = definition.get("DEPLOYMENT")
+            if not isinstance(deployment, DeploymentSpec):
+                raise ValueError("Compose definition must export DEPLOYMENT = DeploymentSpec(...)")
+            print(assemble_compose(
+                deployment, args.output, definition_root=args.definition.resolve().parent
+            ))
+        else:
+            spec = definition.get("SPEC")
+            if not isinstance(spec, AgentSpec):
+                raise ValueError("Definition must export SPEC = AgentSpec(...)")
+            print(assemble(spec, args.output))
     except (ValueError, TypeError, OSError, ImportError, AttributeError, SyntaxError) as exc:
         parser.exit(1, f"assemble: {exc}\n")
 
