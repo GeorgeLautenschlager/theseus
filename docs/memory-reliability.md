@@ -76,9 +76,23 @@ for understanding when a reported fact actually became effective.
 
 Extraction requires a nonempty summary and an assertions list. Malformed responses
 try the next provider and leave the episode retryable if none succeeds. Invalid
-individual assertions go to `dead_letter.jsonl`. The prompt distinguishes plans,
-attempts, failures, and completed actions, but schema validation does not prove
-semantic accuracy or verify claims against their source events.
+individual assertions go to `dead_letter.jsonl`. Newly accepted assertions must
+name one or more exact `support_event_ids` from the episode's extraction evidence.
+Missing, unknown, duplicate, and recall-context IDs are rejected before routing.
+Each accepted claim also stores `attribution` (`direct_observation`,
+`partner_report`, or `inference`), `reported_by` for partner reports, and
+`action_status` (`not_applicable`, `intention`, `attempt`, `failure`, or
+`confirmed_outcome`). These distinctions appear in recall text. The original
+stimulus events remain in the episode record, even when extraction receives
+truncated excerpts. Records written before these fields existed read with
+unknown provenance; their source episode ID is not converted into invented
+event IDs. The pending transaction replays the metadata unchanged after a crash.
+
+Valid event references establish only that a claim cites eligible input. They do
+not prove that the cited events say what the claim says, that a partner report is
+true, or that a planned action succeeded. Multi-event offline tests include a
+falsely confirmed payment with a valid event reference and mark it semantically
+wrong; live extraction still requires accuracy evaluation.
 
 Requests have character and output-token bounds. Oversized events are explicitly
 excerpted in the prompt; complete source evidence is retained in the episode
@@ -137,9 +151,11 @@ It consolidates labeled multi-event scenarios — plans followed by failure or
 success, alternate-wording corrections, coexisting preferences, historical
 reports, decisive evidence at the end of an oversized event, recall repetition,
 split action/result pairs, and repeated or contradictory principles — and reports
-three metrics **separately**: correct knowledge updates, supported-claim
-retention, and unsupported claims. It also verifies recall after a cold restart
-and after the source events leave the live context window.
+correct knowledge updates, supported-claim retention, unsupported claims,
+source-ID validity, and agreement with labeled assertion metadata **separately**.
+The latter compares attribution, action status, and labeled supporting events;
+valid IDs alone do not count as semantic correctness. It also verifies recall
+after a cold restart and after the source events leave the live context window.
 
 Run it offline (deterministic, no live endpoint — reference extractions, part of
 the offline suite):

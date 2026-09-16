@@ -35,7 +35,11 @@ def make_embedder(embedding: list[float] | None = None) -> MagicMock:
 def make_chat_provider(response_json: str) -> MagicMock:
     provider = MagicMock()
     provider.is_available.return_value = True
-    provider.chat.return_value = response_json
+    def answer(prompt, **kwargs):
+        evidence = prompt.split("<evidence>\n", 1)[1].split("\n</evidence>", 1)[0]
+        event_id = json.loads(evidence.splitlines()[0])["id"]
+        return response_json.replace("<EVIDENCE_ID>", event_id)
+    provider.chat.side_effect = answer
     return provider
 
 
@@ -44,8 +48,12 @@ EXTRACTION = json.dumps(
         "summary": "George introduced himself and stated a preference.",
         "assertions": [
             {"kind": "fact", "subject": "George", "predicate": "prefers",
-             "value": "dark mode", "statement": "George prefers dark mode."},
-            {"kind": "event", "statement": "George greeted the agent."},
+             "value": "dark mode", "statement": "George prefers dark mode.",
+             "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "partner_report",
+             "reported_by": "george", "action_status": "not_applicable"},
+            {"kind": "event", "statement": "George greeted the agent.",
+             "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "partner_report",
+             "reported_by": "george", "action_status": "not_applicable"},
         ],
     }
 )
@@ -350,7 +358,9 @@ class TestRecall:
                 "summary": "s",
                 "assertions": [
                     {"kind": "fact", "subject": "George", "predicate": "prefers",
-                     "value": "dark mode", "statement": "George prefers dark mode."},
+                     "value": "dark mode", "statement": "George prefers dark mode.",
+                     "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "partner_report",
+                     "reported_by": "george", "action_status": "not_applicable"},
                     {"kind": "bogus", "statement": "unknown kind"},
                     {"kind": "fact", "subject": "X", "predicate": "y"},  # missing value+statement
                 ],
@@ -375,7 +385,9 @@ class TestRecall:
         """Lenient A/B variant: a fact without its triple is not dead-lettered —
         it routes to Memory with the statement intact (strict default unchanged)."""
         candidate = {"kind": "fact",
-                     "statement": "The staging database uses Postgres 16."}
+                     "statement": "The staging database uses Postgres 16.",
+                     "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "partner_report",
+                     "reported_by": "mara", "action_status": "not_applicable"}
         chat_response = json.dumps({"summary": "s", "assertions": [candidate]})
         module = make_module(tmp_path, chat_response=chat_response, lenient=True)
         first = module._stimulus_log.append(actor="mara", type="exchange",

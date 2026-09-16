@@ -88,6 +88,10 @@ def run_evaluation(workdir: Path, *, extractor=None, embedder=None, answerer=Non
             extractor.response = json.dumps({"summary": f"{actor} reported: {message}", "assertions": [{
                 "kind": "fact", "subject": subject, "predicate": predicate, "value": value,
                 "statement": f"{subject} {predicate}: {value}",
+                "support_event_ids": [event.id],
+                "attribution": "direct_observation" if actor == "tool" else "partner_report",
+                **({"reported_by": actor} if actor != "tool" else {}),
+                "action_status": {7: "failure", 8: "intention", 11: "confirmed_outcome"}.get(index, "not_applicable"),
             }]})
         memory.consolidate(Episode(f"scenario-{index}", event.id, event.id))
         raw_records.append({"id": event.id, "text": message, "ordinal": index})

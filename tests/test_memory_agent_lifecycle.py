@@ -19,7 +19,10 @@ class ExtractionModel:
         if "RAVEN-42" in prompt:
             return json.dumps({"summary": "Atlas delivery uses RAVEN-42.", "assertions": [
                 {"kind": "fact", "subject": "Atlas", "predicate": "delivery code",
-                 "value": "RAVEN-42", "statement": "Atlas delivery code is RAVEN-42."}
+                 "value": "RAVEN-42", "statement": "Atlas delivery code is RAVEN-42.",
+                 "support_event_ids": [json.loads(prompt.split("<evidence>\n", 1)[1].splitlines()[0])["id"]],
+                 "attribution": "partner_report", "reported_by": "human",
+                 "action_status": "not_applicable"}
             ]})
         return json.dumps({"summary": "The agent continued routine work.", "assertions": []})
 
