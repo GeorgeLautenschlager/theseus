@@ -399,12 +399,9 @@ def run_offline(workdir, *, budget_tokens=2000) -> dict:
         "oversized": oversized, "costs": costs,
         "limitations": (
             "Reference extractions are labels not model output; exact-text checks are "
-            "retrieval diagnostics not semantic correctness; the oversized-tail scenario "
-            "shows the decisive fact is dropped from the extraction budget under the current "
-            "head-first packing (see #65) and the reference label includes it only because it "
-            "is scripted; reported usage may omit failed requests and provider retries; live "
-            "semantic accuracy requires run_live with an explicit model; valid supporting "
-            "event IDs alone do not prove a claim is true."),
+            "retrieval diagnostics not semantic correctness; reported usage may omit failed "
+            "requests and provider retries; live semantic accuracy requires run_live with an "
+            "explicit model; valid supporting event IDs alone do not prove a claim is true."),
         "scenarios": scenarios,
     }
     (workdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

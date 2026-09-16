@@ -126,7 +126,12 @@ def build_extraction_prompt(evidence_text: str, context_text: str = "") -> str:
         "Keep intentions, attempts, failures, and confirmed outcomes distinct. "
         "A partner's message is a report from that partner; preserve that attribution. "
         "Use consistent subjects and predicates for updates to existing facts. "
-        "Do not infer successful payments or completed work without confirming evidence.\n"
+        "Do not infer successful payments or completed work without confirming evidence. "
+        "Some entries are a bounded excerpt of one larger event, marked with chunk_of, "
+        "chunk_index, and chunk_count fields rather than being the whole event — treat "
+        "each as one piece of a longer record. Do not conclude an event failed or is "
+        "incomplete just because a given excerpt stops before showing the outcome; the "
+        "decisive result may be in a later chunk.\n"
         '  - kind: "fact" (a checkable claim about a subject), "principle" (a generalized '
         'rule or preference that would guide future behavior), or "event" (something that '
         "happened, not durable enough to be a fact).\n"

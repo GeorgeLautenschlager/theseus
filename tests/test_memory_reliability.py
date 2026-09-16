@@ -223,14 +223,137 @@ def test_restart_keeps_failed_episode_boundaries_even_after_more_events(tmp_path
     assert restarted.pending_events == 1
 
 
-def test_oversized_event_is_bounded_for_extraction_but_evidence_is_preserved(tmp_path):
-    module, log, _, chat = setup(tmp_path)
+# Direct-observation/inference attribution only, so validity doesn't depend on
+# which actor produced the (tool-authored) oversized event.
+_CHUNK_TEST_RESPONSE = json.dumps({
+    "summary": "A large tool output was consolidated.",
+    "assertions": [
+        {"kind": "fact", "subject": "Output", "predicate": "marker", "value": "END_MARKER",
+         "statement": "The tool output contains an END_MARKER.", "support_event_ids": ["<EVIDENCE_ID>"],
+         "attribution": "direct_observation", "action_status": "confirmed_outcome"},
+        {"kind": "event", "statement": "The tool produced a large output.",
+         "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "direct_observation",
+         "action_status": "not_applicable"},
+        {"kind": "principle", "statement": "Watch for decisive markers in tool output.",
+         "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "inference",
+         "action_status": "not_applicable"},
+    ],
+})
+
+
+def test_oversized_event_is_chunked_and_decisive_ending_reaches_extraction(tmp_path):
+    """An event too large for one request is split into several bounded chunks
+    that together cover it completely, so the decisive marker at its very end
+    reaches extraction instead of being cut away by a prefix truncation — and
+    identical assertions the same canned response yields per chunk collapse
+    into one via dedup."""
+    module, log, _, chat = setup(tmp_path, extractor=Extractor(_CHUNK_TEST_RESPONSE))
     event = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
-    module.consolidate(Episode("big", event.id, event.id))
-    assert len(chat.prompts[-1]) <= module._max_input_chars
-    assert "truncated" in chat.prompts[-1]
+    result = module.consolidate(Episode("big", event.id, event.id))
+    assert len(chat.prompts) > 1
+    assert all(len(p) <= module._max_input_chars for p in chat.prompts)
+    assert all(event.id in p for p in chat.prompts)  # original event id carried through every chunk
+    assert "END_MARKER" in chat.prompts[-1]
+    assert result.schema_failures == 0
+    assert result.extracted == 3  # repeated per-chunk assertions deduped, not multiplied
     assert "END_MARKER" in module.memory.read_all()[-1].content
     assert "END_MARKER" in module.recall("END_MARKER", 2000).entries[0].text
+
+
+def test_mixed_short_and_long_events_pack_short_ones_whole_and_chunk_the_long_one(tmp_path):
+    """Short events aren't truncated down to an equal per-event share just
+    because one event in the same episode is huge — unused capacity from the
+    short events is not imposed as a ceiling on them."""
+    module, log, _, chat = setup(tmp_path)
+    first = log.append("human", "chat_message", {"message": "short one"})
+    log.append("human", "chat_message", {"message": "short two"})
+    big = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
+    last = log.append("human", "chat_message", {"message": "short three"})
+    module.consolidate(Episode("mix", first.id, last.id))
+
+    pack_prompts = [p for p in chat.prompts if "short one" in p]
+    assert len(pack_prompts) == 1
+    assert "short two" in pack_prompts[0] and "short three" in pack_prompts[0]
+    assert big.id not in pack_prompts[0]  # the oversized event stayed out of the shared pack
+
+    chunk_prompts = [p for p in chat.prompts if big.id in p]
+    assert chunk_prompts and all(len(p) <= module._max_input_chars for p in chunk_prompts)
+    assert "END_MARKER" in chunk_prompts[-1]
+
+
+def test_assertion_cannot_cite_support_from_an_event_its_own_request_never_saw(tmp_path):
+    """support_event_ids is validated against what THIS request was given, not
+    the whole episode: an oversized event pulled out of the shared pack means
+    the pack's own request never saw it, so a pack-unit assertion citing that
+    event's (real, in-episode) id is dead-lettered — while the same id cited by
+    that event's own chunk requests, which did see it, validates fine."""
+
+    class CrossCitingExtractor:
+        def __init__(self, oversized_event_id):
+            self.oversized_event_id = oversized_event_id
+            self.calls = 0
+            self.prompts = []
+
+        def chat(self, prompt, **kwargs):
+            self.calls += 1
+            self.prompts.append(prompt)
+            evidence = prompt.split("<evidence>\n", 1)[1].split("\n</evidence>", 1)[0]
+            this_id = json.loads(evidence.splitlines()[0])["id"]
+            return json.dumps({
+                "summary": "s",
+                "assertions": [{"kind": "event", "statement": "cross-cited claim",
+                               "support_event_ids": [self.oversized_event_id],
+                               "attribution": "direct_observation", "action_status": "not_applicable"}],
+            })
+
+    module, log, _, _ = setup(tmp_path)
+    first = log.append("human", "chat_message", {"message": "short one"})
+    big = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
+    chat = CrossCitingExtractor(big.id)
+    module._model_providers = [chat]
+
+    result = module.consolidate(Episode("cross", first.id, big.id))
+    assert chat.calls > 1  # a pack call plus at least one chunk call
+    assert result.schema_failures == 1  # the pack-unit occurrence, citing an id it never saw
+    dead = json.loads((module.memory_dir / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert "unknown support event" in dead["reason"]
+    # every chunk-unit occurrence legitimately self-cites the same id and is
+    # identical, so dedup collapses them to the one accepted record.
+    assert result.routed.get("memory", 0) == 2  # the accepted assertion + the episode summary
+
+
+def test_failed_chunk_extraction_leaves_episode_pending_and_writes_nothing(tmp_path):
+    """A required chunk that no provider can extract must not complete the
+    episode partially — same transaction guarantee a single-request failure
+    already gets, extended to every unit chunking can produce."""
+
+    class FlakyExtractor:
+        def __init__(self, fail_after):
+            self.calls = 0
+            self.prompts = []
+            self.fail_after = fail_after
+
+        def chat(self, prompt, **kwargs):
+            self.calls += 1
+            self.prompts.append(prompt)
+            if self.calls > self.fail_after:
+                raise RuntimeError("boom")
+            return Extractor().response
+
+    chat = FlakyExtractor(fail_after=1)
+    module, log, _, _ = setup(tmp_path, extractor=chat)
+    event = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
+    episode = Episode("big", event.id, event.id)
+    with pytest.raises(RuntimeError, match="valid extraction"):
+        module.consolidate(episode)
+    assert len(module.memory) == 0
+    assert not (module.memory_dir / "consolidation_ledger.jsonl").exists()
+    assert not (module.memory_dir / "pending.json").exists()
+
+    chat.fail_after = 999  # provider recovers; retry from scratch succeeds
+    result = module.consolidate(episode)
+    assert not result.skipped
+    assert "END_MARKER" in module.memory.read_all()[-1].content
 
 
 def test_recall_and_consolidation_are_serialized_across_module_instances(tmp_path, monkeypatch):

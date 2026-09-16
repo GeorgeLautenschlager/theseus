@@ -175,9 +175,12 @@ def test_run_offline_reports_separated_metrics_and_survives_restart(tmp_path):
     assert json.loads((tmp_path / "report.json").read_text())["mode"] == report["mode"]
 
 
-def test_run_offline_detects_the_dropped_decisive_tail(tmp_path):
+def test_run_offline_confirms_the_decisive_tail_reaches_extraction(tmp_path):
+    """#65: oversized evidence is chunked, not head-truncated, so the decisive
+    fact at the end of a huge event reaches the model instead of being cut
+    away by the extraction budget."""
     oversized = run_offline(tmp_path)["oversized"]
-    assert oversized["decisive_tail_in_budget"] is False
+    assert oversized["decisive_tail_in_budget"] is True
     assert oversized["full_event_searchable"] is True
 
 
