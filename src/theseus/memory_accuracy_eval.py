@@ -16,6 +16,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Callable
 
 from theseus.assertion_metadata import ACTION_STATUSES, ATTRIBUTIONS
 from theseus.json_utils import parse_json_response
@@ -32,9 +33,14 @@ class ReferenceExtractor:
 
     def __init__(self):
         self.response = ""
-        self.last_prompt = None
+        self.reconciliation_response = None  # None => empty decisions; falls back to key matching
+        self.last_prompt = None                  # last *extraction* prompt only
+        self.last_reconciliation_prompt = None
 
     def chat(self, prompt, **kwargs):
+        if "<candidates>" in prompt and "<existing_knowledge>" in prompt:
+            self.last_reconciliation_prompt = prompt
+            return self.reconciliation_response if self.reconciliation_response is not None else '{"decisions": []}'
         self.last_prompt = prompt
         return self.response
 
@@ -92,6 +98,9 @@ def drive_scenarios(memory, log, scenarios, *, reference, extractor, start):
                     "summary": episode_spec.summary,
                     "assertions": assertions,
                 })
+                extractor.reconciliation_response = (
+                    episode_spec.reconciliation(memory) if episode_spec.reconciliation is not None else None
+                )
             memory.consolidate(Episode(
                 episode_id, ids[episode_spec.event_indices[0]],
                 ids[episode_spec.event_indices[-1]],
@@ -106,6 +115,12 @@ class EpisodeSpec:
     event_indices: tuple[int, ...]
     summary: str
     assertions: tuple[dict, ...] = ()
+    # Scripts the reference reconciliation response for this episode, given the
+    # live MemoryModule (queried right before consolidation, so it can name a
+    # real prior record's id — those are assigned during consolidation, not
+    # known ahead of time). None leaves reconciliation unscripted for this
+    # episode, which falls back to exact subject+predicate key matching.
+    reconciliation: Callable[[MemoryModule], str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +178,7 @@ def _note(statement, *, support):
 REQUIRED_CATEGORIES = frozenset({
     "plan_then_failure", "plan_then_success", "alternate_wording_correction",
     "coexisting_preferences", "historical_report", "recall_repetition",
-    "split_action_result", "principles", "oversized_tail",
+    "split_action_result", "principles", "oversized_tail", "contradiction",
 })
 
 _OVERSIZED_MESSAGE = ("padding. " * 8000) + "DECISIVE: The Atlas security token is ZULU-9."
@@ -180,15 +195,44 @@ SCENARIOS = (
         (Transition("Project", "backup status", "completed"),), ("completed",), ("planned", "not yet"),
         (Query("What is the project backup status?", "completed", ("planned", "not yet")),)),
     Scenario("atlas-deadline", "alternate_wording_correction",
-        (_ev("human", "The Atlas prototype is due Friday."), _ev("human", "Scratch that — we pushed Atlas delivery to Monday.")),
-        (EpisodeSpec((0,), "Atlas prototype is due Friday.", (_fact("Atlas", "prototype deadline", "Friday", support=(0,)),)), EpisodeSpec((1,), "Atlas delivery was pushed to Monday.", (_fact("Atlas", "prototype deadline", "Monday", support=(1,)),))),
-        (Transition("Atlas", "prototype deadline", "Monday", ("Friday",)),), ("Monday",), ("Friday",),
+        (_ev("human", "The Atlas prototype is due Friday."), _ev("human", "Scratch that — Atlas delivery date moved to Monday.")),
+        (EpisodeSpec((0,), "Atlas prototype is due Friday.", (_fact("Atlas", "prototype deadline", "Friday", support=(0,)),)),
+         EpisodeSpec((1,), "Atlas delivery was pushed to Monday.", (_fact("Atlas", "delivery date", "Monday", support=(1,)),),
+                     # Genuinely different predicate wording — reconciliation, not a
+                     # shared key, is what has to recognize this as the same attribute.
+                     reconciliation=lambda memory: json.dumps({"decisions": [
+                         {"candidate_index": 0, "decision": "replace", "target_id":
+                          memory.knowledge.current(subject="Atlas", predicate="prototype deadline")[0].id},
+                     ]}))),
+        (Transition("Atlas", "delivery date", "Monday"),), ("Monday",), ("Friday",),
         (Query("What is Atlas's prototype deadline?", "Monday", ("Friday",)),)),
     Scenario("user-prefs", "coexisting_preferences",
-        (_ev("human", "I prefer morning meetings."), _ev("human", "I prefer concise written summaries.")),
-        (EpisodeSpec((0,), "The user prefers morning meetings.", (_fact("George", "meeting time preference", "morning", support=(0,)),)), EpisodeSpec((1,), "The user prefers concise written summaries.", (_fact("George", "summary format preference", "concise written", support=(1,)),))),
-        (Transition("George", "meeting time preference", "morning"), Transition("George", "summary format preference", "concise written")), ("morning", "concise"), (),
+        (_ev("human", "I prefer morning meetings."), _ev("human", "I also prefer concise written summaries.")),
+        (EpisodeSpec((0,), "The user prefers morning meetings.", (_fact("George", "preference", "morning meetings", support=(0,)),)),
+         EpisodeSpec((1,), "The user also prefers concise written summaries.",
+                     (_fact("George", "preference", "concise written summaries", support=(1,)),),
+                     # Same broad predicate on purpose — reconciliation has to tell these
+                     # are independent attributes, not competing values of one.
+                     reconciliation=lambda memory: json.dumps({
+                         "decisions": [{"candidate_index": 0, "decision": "coexist"}],
+                     }))),
+        (Transition("George", "preference", "morning meetings"),),
+        ("morning meetings", "concise written summaries"), (),
         (Query("What meeting time does the user prefer?", "morning"), Query("What summary format does the user prefer?", "concise"))),
+    Scenario("boreal-conflict", "contradiction",
+        (_ev("Alpha", "Boreal deadline is Thursday."), _ev("Beta", "Boreal deadline is Friday.")),
+        (EpisodeSpec((0,), "Alpha reported the Boreal deadline is Thursday.",
+                     (_fact("Boreal", "deadline", "Thursday", support=(0,)),)),
+         EpisodeSpec((1,), "Beta reported a conflicting Boreal deadline of Friday.",
+                     (_fact("Boreal", "deadline", "Friday", support=(1,)),),
+                     # Two partner reports, no authoritative signal either way —
+                     # reconciliation must not silently pick a winner.
+                     reconciliation=lambda memory: json.dumps({"decisions": [
+                         {"candidate_index": 0, "decision": "contradiction", "target_id":
+                          memory.knowledge.current(subject="Boreal", predicate="deadline")[0].id},
+                     ]}))),
+        (), ("Thursday", "Friday"), (),
+        (Query("What is the Boreal deadline?", None),)),
     Scenario("atlas-phase", "historical_report",
         (_ev("Alpha", "Last quarter Atlas was in the pilot phase."), _ev("human", "Atlas is now in the production phase.")),
         (EpisodeSpec((0,), "Alpha reported that last quarter Atlas was in the pilot phase.", (_note("Last quarter Atlas was in the pilot phase.", support=(0,)),)), EpisodeSpec((1,), "Atlas is now in the production phase.", (_fact("Atlas", "phase", "production", support=(1,)),))),

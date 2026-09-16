@@ -189,13 +189,46 @@ def test_vector_layers_ignore_invalid_or_wrong_dimension_vectors(tmp_path, bad):
     assert [hit.id for hit in wisdom.query([1.0, 0.0])] == ["good"]
 
 
-def test_late_old_fact_cannot_replace_new_fact(tmp_path):
+def test_add_only_supersedes_what_the_caller_explicitly_names(tmp_path):
+    """#66: KnowledgeLayer no longer infers supersession from a shared
+    subject+predicate key or a newer timestamp (that let a late, out-of-order
+    write silently win, or an unrelated fact under a broad predicate clobber
+    another) — reconciliation decides that, and this layer just applies it."""
     layer = KnowledgeLayer(tmp_path / "knowledge")
     now = datetime.now(timezone.utc)
     layer.add(KnowledgeRecord("new", now, "Client", "deadline", "Monday"))
     layer.add(KnowledgeRecord("old", now - timedelta(days=1), "Client", "deadline", "Friday"))
-    assert layer.current()[0].value == "Monday"
-    assert KnowledgeLayer(layer.path).current()[0].value == "Monday"
+    # Neither record named the other in `supersedes`, so both stay current —
+    # a shared key and timestamp order are no longer enough to replace one.
+    assert {r.value for r in layer.current()} == {"Monday", "Friday"}
+    assert {r.value for r in KnowledgeLayer(layer.path).current()} == {"Monday", "Friday"}
+
+
+def test_add_applies_explicit_supersession_regardless_of_write_order(tmp_path):
+    layer = KnowledgeLayer(tmp_path / "knowledge")
+    now = datetime.now(timezone.utc)
+    old = layer.add(KnowledgeRecord("old", now - timedelta(days=1), "Client", "deadline", "Friday"))
+    layer.add(KnowledgeRecord("new", now, "Client", "deadline", "Monday", supersedes=old.id))
+    assert [r.value for r in layer.current()] == ["Monday"]
+    assert [r.value for r in KnowledgeLayer(layer.path).current()] == ["Monday"]
+
+
+def test_add_rejects_supersedes_of_an_unknown_record(tmp_path):
+    layer = KnowledgeLayer(tmp_path / "knowledge")
+    with pytest.raises(ValueError, match="unknown record"):
+        layer.add(KnowledgeRecord("new", datetime.now(timezone.utc), "Client", "deadline", "Monday",
+                                  supersedes="never-written"))
+
+
+def test_historical_record_is_kept_but_never_current(tmp_path):
+    layer = KnowledgeLayer(tmp_path / "knowledge")
+    now = datetime.now(timezone.utc)
+    layer.add(KnowledgeRecord("current", now, "Atlas", "phase", "production"))
+    layer.add(KnowledgeRecord("past", now - timedelta(days=90), "Atlas", "phase", "pilot",
+                              reconciliation="historical"))
+    assert [r.id for r in layer.current(subject="Atlas")] == ["current"]
+    assert {r.id for r in layer.read_all()} == {"current", "past"}
+    assert KnowledgeLayer(layer.path).current(subject="Atlas")[0].id == "current"
 
 
 def test_recall_filters_unrelated_and_previous_recall_events(tmp_path):
@@ -425,7 +458,10 @@ def test_formation_limits_batch_and_defers_next_attempt(tmp_path):
     assert extractor.calls == 1
     clock[0] = 10.0
     policy.tick()
-    assert extractor.calls == 2
+    # +1 over the first tick: the second episode's canned fact shares a subject
+    # with the first episode's, so reconciliation has something to check it
+    # against and makes its own call through the same provider.
+    assert extractor.calls == 3
     assert policy.pending_events == 0
 
 

@@ -157,6 +157,81 @@ def build_extraction_prompt(evidence_text: str, context_text: str = "") -> str:
     )
 
 
+def reconciliation_json_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "candidate_index": {"type": "integer"},
+                        "decision": {"enum": ["new", "reinforce", "replace", "coexist",
+                                              "contradiction", "historical"]},
+                        "target_id": {"type": "string"},
+                    },
+                    "required": ["candidate_index", "decision"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["decisions"],
+        "additionalProperties": False,
+    }
+
+
+def build_reconciliation_prompt(candidates: list[dict], existing: list) -> str:
+    rendered_candidates = "\n".join(
+        f"[{i}] subject={c['subject']!r} predicate={c['predicate']!r} value={c['value']!r} "
+        f"statement={c['statement']!r} attribution={c.get('attribution')!r} "
+        f"reported_by={c.get('reported_by')!r} action_status={c.get('action_status')!r}"
+        for i, c in enumerate(candidates)
+    )
+    rendered_existing = "\n".join(record.render() for record in existing) or "(none)"
+    return (
+        "You are the knowledge-reconciliation step of a cognitive agent. Below are newly "
+        "extracted candidate facts and the agent's existing current knowledge that might "
+        "relate to them, by shared subject. Decide, for each candidate, how it relates to "
+        "what the agent already believes — do not just match on wording.\n\n"
+        "<candidates>\n"
+        f"{rendered_candidates}\n"
+        "</candidates>\n\n"
+        "<existing_knowledge>\n"
+        f"{rendered_existing}\n"
+        "</existing_knowledge>\n\n"
+        "For each candidate, choose exactly one decision:\n"
+        '- "new": nothing existing describes the same attribute; no target_id.\n'
+        '- "reinforce": an existing record already states the same value for the same '
+        "attribute, just worded differently or restated — this does not change what the "
+        "agent believes. target_id: that record's id.\n"
+        '- "replace": an existing record describes the same specific attribute but the '
+        "value has genuinely changed — a correction or update, however differently it is "
+        "worded (a different predicate string does not by itself mean a different "
+        "attribute). target_id: the record it replaces.\n"
+        '- "coexist": an existing record shares the subject and a similarly broad '
+        "predicate, but describes a different attribute or aspect — e.g. two independent "
+        "preferences filed under one general \"preference\" predicate. Both remain true at "
+        "once; no target_id.\n"
+        '- "contradiction": an existing record and this candidate describe the same '
+        "attribute with conflicting values, and neither is clearly more authoritative or "
+        "more current than the other — keep both visible rather than guessing which is "
+        "right. target_id: the conflicting record.\n"
+        '- "historical": this candidate itself describes a past or since-superseded state '
+        "(a prior value, something that used to be true, an earlier report), not the "
+        "current one — judge this from what the claim itself describes, never from which "
+        "episode was processed more recently. Record it, but it must not become current. "
+        "target_id: the existing record it is historical relative to, if any.\n\n"
+        "A later processing time never by itself justifies replacing a current record — "
+        "only the claim's own effective time and content do. When unsure between replace "
+        "and contradiction, prefer contradiction: an unresolved conflict should stay "
+        "visible, not be silently decided for the agent.\n\n"
+        "Reply with a single JSON object and nothing else — no code fences, no commentary. "
+        'Use double quotes: {"decisions": [{"candidate_index": 0, "decision": "new"}, '
+        '{"candidate_index": 1, "decision": "replace", "target_id": "<existing id>"}]}'
+    )
+
+
 def build_link_decision_prompt(new_note: MemoryNote, candidates: list[MemoryNote]) -> str:
     rendered = "\n\n".join(c.render() for c in candidates)
     return (

@@ -1,12 +1,22 @@
 """KnowledgeLayer — current-state facts, append-only with load-time projection.
 
-The file holds every KnowledgeRecord ever written; the *projection* (latest
-record by timestamp per subject+predicate) is rebuilt in memory on load and maintained on
-append. Supersession is explicit and logged: writing an equally new or newer value
-for an existing subject+predicate appends a record whose `supersedes` names
-the record it replaces — the old record stays in the file, untouched, and drops out of the
-projection. There is no decay and no mutation anywhere in this layer; what the
-agent knows *now* is always derivable by replaying the file.
+The file holds every KnowledgeRecord ever written; the *projection* (which
+records are current) is rebuilt in memory on load and maintained on append.
+Supersession is explicit and logged, but this layer does not decide it: a
+record's `supersedes` names the record it replaces, chosen by the caller
+(memory_module's reconciliation step, weighing wording, timing, and evidence
+that mere subject+predicate key matching and "newest timestamp wins" cannot
+capture — reconciliation exists precisely because those two are not reliable
+proxies for "the same claim" or "the more current claim"). This layer's job is
+mechanical: apply whatever supersession the caller decided, durably. A record
+that supersedes nothing stays current alongside whatever else is current for
+its subject+predicate — two records can legitimately share a key at once
+(coexisting attributes under a broad predicate, or an unresolved contradiction
+between two reports) since nothing here forces exclusivity. A record marked
+`reconciliation="historical"` is written for the append-only record but never
+enters the current set at all. There is no decay and no mutation anywhere in
+this layer; what the agent knows *now* is always derivable by replaying the
+file.
 
 Retrieval is deterministic token overlap between query terms and each current
 record's subject, predicate, and value — no embedding, no LLM. Facts are looked up by
@@ -17,7 +27,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +49,8 @@ class KnowledgeRecord:
     attribution: str | None = None
     reported_by: str | None = None
     action_status: str | None = None
+    reconciliation: str | None = None       # see assertion_metadata.RECONCILIATION_DECISIONS
+    contradicts: tuple[str, ...] | None = None  # current records this one conflicts with
 
     def to_json(self) -> str:
         return json.dumps(
@@ -54,6 +66,8 @@ class KnowledgeRecord:
                 "attribution": self.attribution,
                 "reported_by": self.reported_by,
                 "action_status": self.action_status,
+                "reconciliation": self.reconciliation,
+                "contradicts": self.contradicts,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -74,12 +88,17 @@ class KnowledgeRecord:
             attribution=d.get("attribution"),
             reported_by=d.get("reported_by"),
             action_status=d.get("action_status"),
+            reconciliation=d.get("reconciliation"),
+            contradicts=tuple(d["contradicts"]) if d.get("contradicts") is not None else None,
         )
 
     def render(self) -> str:
-        return (f"[{self.id}] Current fact: {self.subject} {self.predicate}: {self.value}"
+        text = (f"[{self.id}] Current fact: {self.subject} {self.predicate}: {self.value}"
                 + render_metadata(self.support_event_ids, self.attribution,
                                   self.reported_by, self.action_status))
+        if self.contradicts:
+            text += f" [contradicts {', '.join(self.contradicts)}]"
+        return text
 
 
 def _key(subject: str, predicate: str) -> tuple[str, str]:
@@ -90,39 +109,49 @@ class KnowledgeLayer:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = ensure_store(path)
         self._records: list[KnowledgeRecord] = []
-        self._projection: dict[tuple[str, str], KnowledgeRecord] = {}
         self._by_id: dict[str, KnowledgeRecord] = {}
+        self._current_ids: set[str] = set()
         for line in load_lines(self.path):
-            record = KnowledgeRecord.from_json(line)
-            self._records.append(record)
-            self._by_id[record.id] = record
-            key = _key(record.subject, record.predicate)
-            current = self._projection.get(key)
-            if current is None or record.ts >= current.ts:
-                self._projection[key] = record
+            self._apply(KnowledgeRecord.from_json(line))
 
-    def add(self, record: KnowledgeRecord) -> KnowledgeRecord:
-        """Append `record`, durably. If a current record exists for the same
-        subject+predicate and is no newer, the appended record names it in
-        `supersedes` — supersession happens here and only here."""
-        if record.id in self._by_id:
-            return self._by_id[record.id]
-        key = _key(record.subject, record.predicate)
-        current = self._projection.get(key)
-        if current is not None and record.ts >= current.ts:
-            record = replace(record, supersedes=current.id)
-        append_record(self.path, record.to_json())
+    def _apply(self, record: KnowledgeRecord) -> None:
+        """Fold one record into the in-memory projection. File order only: a
+        record can supersede nothing but an id already on file by the time it
+        was written, so one forward pass is enough — no re-ranking by ts."""
         self._records.append(record)
         self._by_id[record.id] = record
-        if current is None or record.ts >= current.ts:
-            self._projection[key] = record
+        if record.reconciliation != "historical":
+            self._current_ids.add(record.id)
+        if record.supersedes is not None:
+            self._current_ids.discard(record.supersedes)
+
+    def add(self, record: KnowledgeRecord) -> KnowledgeRecord:
+        """Append `record`, durably, and apply whatever supersession it names.
+
+        This layer does not decide *whether* one fact replaces, reinforces,
+        coexists with, or contradicts another, nor whether it is current or
+        merely historical — the caller (reconciliation) already decided that
+        and encoded it in `supersedes`/`reconciliation`. Applying it here is
+        pure bookkeeping: drop the named id from the current set, and skip
+        adding this one if it's marked historical.
+        """
+        if record.id in self._by_id:
+            return self._by_id[record.id]
+        if record.supersedes is not None and record.supersedes not in self._by_id:
+            raise ValueError(f"supersedes references unknown record {record.supersedes!r}")
+        append_record(self.path, record.to_json())
+        self._apply(record)
         return record
 
     def current(self, subject: str | None = None, predicate: str | None = None) -> list[KnowledgeRecord]:
-        """Current (non-superseded) records, optionally filtered by exact
-        subject and/or predicate (None = wildcard)."""
+        """Current (non-superseded, non-historical) records, optionally
+        filtered by exact subject and/or predicate (None = wildcard). More
+        than one record can be current for the same subject+predicate at
+        once — coexisting attributes or an unresolved contradiction are not
+        collapsed to a single "latest" value."""
         out = []
-        for r in self._projection.values():
+        for rid in self._current_ids:
+            r = self._by_id[rid]
             if subject is not None and _key(r.subject, "")[0] != _key(subject, "")[0]:
                 continue
             if predicate is not None and _key("", r.predicate)[1] != _key("", predicate)[1]:
@@ -139,7 +168,8 @@ class KnowledgeLayer:
         if not terms:
             return []
         scored: list[tuple[float, datetime, KnowledgeRecord]] = []
-        for record in self._projection.values():
+        for rid in self._current_ids:
+            record = self._by_id[rid]
             haystack = tokenize(f"{record.subject} {record.predicate} {record.value}")
             hits = len({term.casefold() for term in terms} & haystack)
             if hits:

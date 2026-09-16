@@ -29,14 +29,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from theseus.assertion_metadata import ACTION_STATUSES, ATTRIBUTIONS
+from theseus.assertion_metadata import ACTION_STATUSES, ATTRIBUTIONS, RECONCILIATION_DECISIONS
 from theseus.intelligence_layer import IntelligenceLayer
 from theseus.json_utils import parse_json_response
 from theseus.knowledge_layer import KnowledgeLayer, KnowledgeRecord
 from theseus.layer_store import (LayerHit, append_record, load_lines, atomic_json,
                                  fsync_directory, store_lock, terms, valid_vector)
 from theseus.memory_layer import MemoryLayer, MemoryRecord
-from theseus.memory_prompts import build_extraction_prompt, extraction_json_schema
+from theseus.memory_prompts import (build_extraction_prompt, build_reconciliation_prompt,
+                                    extraction_json_schema, reconciliation_json_schema)
 from theseus.stimulus_log import StimulusLog, new_id
 from theseus.tools.recall import RECALL_TOOL_NAME
 from theseus.wisdom_layer import WisdomLayer, WisdomRecord
@@ -149,6 +150,7 @@ class MemoryModule:
         lenient_fact_routing: bool = False,
         max_input_chars: int = 48000,
         max_output_tokens: int = 4096,
+        reconciliation_context_k: int = 6,
     ) -> None:
         self.memory_dir = Path(memory_dir)
         self._lock = threading.RLock()
@@ -159,8 +161,11 @@ class MemoryModule:
             raise ValueError("max_input_chars must be at least 4096")
         if type(max_output_tokens) is not int or max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
+        if type(reconciliation_context_k) is not int or reconciliation_context_k < 1:
+            raise ValueError("reconciliation_context_k must be a positive integer")
         self._max_input_chars = max_input_chars
         self._max_output_tokens = max_output_tokens
+        self._reconciliation_context_k = reconciliation_context_k
         self.intelligence = IntelligenceLayer(stimulus_log, tail=intelligence_tail)
         self._stimulus_log = stimulus_log
         self._embedding_providers = embedding_providers or []
@@ -486,7 +491,14 @@ class MemoryModule:
                     accepted.append((rid, candidate))
         assertions, duplicates = _dedupe_assertions(accepted)
 
-        for rid, candidate in assertions:
+        fact_indices = [i for i, (_, c) in enumerate(assertions) if _route_write(c) == "knowledge"]
+        reconciliation_calls, decisions, reconciliation_usage = self._reconcile_facts(
+            episode.episode_id, assertions, fact_indices)
+        reported_usage.extend(reconciliation_usage)
+        decision_counts: dict[str, int] = {}
+        local_supersessions: dict[str, str] = {}  # id this episode already superseded -> its replacement
+
+        for i, (rid, candidate) in enumerate(assertions):
             layer = _route_write(candidate)
             metadata = {
                 "support_event_ids": tuple(candidate["support_event_ids"]),
@@ -495,11 +507,36 @@ class MemoryModule:
                 "action_status": candidate["action_status"],
             }
             if layer == "knowledge":
-                record = KnowledgeRecord(rid, ts, candidate["subject"].strip(),
-                                         candidate["predicate"].strip(), candidate["value"].strip(),
-                                         source_episode_id=episode.episode_id, **metadata)
-                current = self.knowledge.current(record.subject, record.predicate)
-                supersessions += int(bool(current) and ts >= current[0].ts)
+                subject = candidate["subject"].strip()
+                predicate = candidate["predicate"].strip()
+                value = candidate["value"].strip()
+                decision, target_id = decisions.get(i, (None, None))
+                if decision is None:
+                    # No reconciliation opinion for this candidate (no existing
+                    # knowledge for its subject at all, or the call failed/skipped
+                    # it) — fall back to the pre-reconciliation default: replace an
+                    # exact subject+predicate match, otherwise write it as new.
+                    same_key = self.knowledge.current(subject, predicate)
+                    decision, target_id = ("replace", same_key[0].id) if same_key else ("new", None)
+                elif decision == "reinforce":
+                    # A guard, not a trust exercise: if the "reinforced" record's
+                    # value actually differs, this is a real change reconciliation
+                    # mislabeled — treat it as a replacement so it isn't lost.
+                    target_record = self.knowledge.get(target_id)
+                    if target_record is not None and target_record.value.strip().casefold() != value.casefold():
+                        decision = "replace"
+                if target_id is not None:
+                    target_id = local_supersessions.get(target_id, target_id)
+                decision_counts[decision] = decision_counts.get(decision, 0) + 1
+                supersedes = target_id if decision in ("reinforce", "replace") else None
+                contradicts = (target_id,) if decision == "contradiction" and target_id else None
+                record = KnowledgeRecord(rid, ts, subject, predicate, value,
+                                         source_episode_id=episode.episode_id,
+                                         supersedes=supersedes, reconciliation=decision,
+                                         contradicts=contradicts, **metadata)
+                if supersedes is not None:
+                    local_supersessions[supersedes] = rid
+                supersessions += int(decision == "replace")
             else:
                 vector = self._embed(candidate["statement"]) or []
                 if layer == "wisdom":
@@ -525,13 +562,15 @@ class MemoryModule:
         trace = {"episode_id": episode.episode_id, "candidates_extracted": extracted,
                  "routed": routed, "supersessions": supersessions, "schema_failures": len(dead),
                  "tokens_in": tokens_in, "tokens_out": tokens_out, "wall_time_s": elapsed,
-                 "token_counts_estimated": True, "chat_calls": calls,
+                 "token_counts_estimated": True, "chat_calls": calls + reconciliation_calls,
                  "embedding_calls": self._embedding_calls - before_embeddings}
         trace["oversized_events"] = len(oversized_events)
         trace["extraction_requests"] = len(units)
         trace["duplicate_assertions_dropped"] = duplicates
         trace["reported_chat_usage"] = reported_usage
         trace["reported_embedding_tokens"] = self._embedding_tokens - before_embedding_tokens
+        trace["reconciliation_calls"] = reconciliation_calls
+        trace["reconciliation_decisions"] = decision_counts
         atomic_json(self.memory_dir / "pending.json", {
             "episode_id": episode.episode_id, "start_id": episode.start_id, "end_id": episode.end_id,
             "records": records, "dead_letters": dead, "trace": trace,
@@ -540,6 +579,92 @@ class MemoryModule:
         return ConsolidationResult(episode.episode_id, extracted, routed,
                                    supersessions, len(dead), tokens_in, tokens_out,
                                    time.monotonic() - started)
+
+    def _reconcile_facts(
+        self, episode_id: str, assertions: list[tuple[str, Any]], fact_indices: list[int],
+    ) -> tuple[int, dict[int, tuple[str, str | None]], list[dict]]:
+        """Decide how each fact-kind candidate relates to existing current
+        knowledge for its subject — reinforcing it, replacing it, coexisting
+        beside it, contradicting it, or filed as historical relative to it —
+        instead of the blunt "same subject+predicate key, newest timestamp
+        wins" rule that can't tell an alternate-worded correction from an
+        unrelated fact, or a stale report from a current one.
+
+        Bounded and cheap by construction: a subject with no existing current
+        knowledge has nothing to reconcile against (result is always "new"),
+        so it costs no call at all; every subject that does gets at most
+        `_reconciliation_context_k` of its current records as context. One
+        request covers every fact candidate in the episode that has any
+        context to reconcile against.
+
+        Never blocks the episode: a failed, unavailable, or malformed
+        reconciliation response leaves `decisions` empty for the candidates it
+        should have covered, and the caller's own fallback (replace an exact
+        subject+predicate match, otherwise write new) takes over — the same
+        outcome consolidation always had before this step existed. Recorded
+        to `reconciliation_failures.jsonl` for visibility, same as extraction.
+        """
+        context: dict[int, dict[str, KnowledgeRecord]] = {}
+        targets: list[int] = []
+        for i in fact_indices:
+            candidate = assertions[i][1]
+            existing = self.knowledge.current(subject=candidate["subject"])[: self._reconciliation_context_k]
+            if existing:
+                context[i] = {record.id: record for record in existing}
+                targets.append(i)
+
+        decisions: dict[int, tuple[str, str | None]] = {}
+        reported_usage: list[dict] = []
+        if not targets:
+            return 0, decisions, reported_usage
+
+        candidate_payload = [assertions[i][1] for i in targets]
+        existing_union = {rid: record for i in targets for rid, record in context[i].items()}
+        prompt = build_reconciliation_prompt(candidate_payload, list(existing_union.values()))
+        calls = 0
+        parsed = None
+        for provider in self._model_providers:
+            try:
+                if not getattr(provider, "is_available", lambda: True)():
+                    continue
+                calls += 1
+                raw = provider.chat(prompt, json_schema=reconciliation_json_schema(),
+                                    max_tokens=self._max_output_tokens)
+                usage = getattr(provider, "last_chat_usage", None)
+                if isinstance(usage, dict):
+                    reported_usage.append({"provider": _provider_identity(provider), **usage})
+                candidate_response = parse_json_response(raw)
+                if (not isinstance(candidate_response, dict)
+                    or not isinstance(candidate_response.get("decisions"), list)):
+                    raise ValueError("reconciliation requires a decisions list")
+                parsed = candidate_response
+                break
+            except Exception as exc:
+                append_record(self.memory_dir / "reconciliation_failures.jsonl", json.dumps({
+                    "episode_id": episode_id, "provider": _provider_identity(provider), "error": str(exc),
+                }))
+        if parsed is None:
+            return calls, decisions, reported_usage
+
+        for row in parsed["decisions"]:
+            if not isinstance(row, dict):
+                continue
+            position = row.get("candidate_index")
+            if type(position) is not int or not (0 <= position < len(targets)):
+                continue
+            decision = row.get("decision")
+            if decision not in RECONCILIATION_DECISIONS:
+                continue
+            i = targets[position]
+            target_id = row.get("target_id")
+            if decision in ("new", "coexist", "historical"):
+                # target_id is informational at most for these — "historical" never
+                # supersedes or contradicts anything, it just never becomes current.
+                target_id = None
+            elif not isinstance(target_id, str) or target_id not in context[i]:
+                continue  # a decision needing a real target that doesn't resolve is dropped, falls back
+            decisions[i] = (decision, target_id)
+        return calls, decisions, reported_usage
 
     def _episode_events(self, episode: Episode) -> list:
         """The episode's stimuli in file order, between its boundary ids.

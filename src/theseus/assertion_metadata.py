@@ -6,6 +6,21 @@ from __future__ import annotations
 ATTRIBUTIONS = frozenset({"direct_observation", "partner_report", "inference"})
 ACTION_STATUSES = frozenset({"not_applicable", "intention", "attempt", "failure", "confirmed_outcome"})
 
+# How a newly extracted fact relates to knowledge already on file, decided by
+# the reconciliation step (see memory_module._reconcile_facts):
+#   new           - nothing existing describes the same attribute.
+#   reinforce     - restates an existing current record's value; not a change.
+#   replace       - a genuine update to the same attribute (any wording).
+#   coexist       - a different attribute under a shared/broad predicate; both
+#                   stay current.
+#   contradiction - conflicts with a current record and neither is clearly
+#                   authoritative; both stay current, visibly in tension.
+#   historical    - describes a past/superseded state relative to what's
+#                   already current; kept in history, never becomes current.
+RECONCILIATION_DECISIONS = frozenset({
+    "new", "reinforce", "replace", "coexist", "contradiction", "historical",
+})
+
 
 def render_metadata(
     support_event_ids: tuple[str, ...] | None,
