@@ -39,9 +39,15 @@ class Extractor:
             "summary": "Client deadline is Friday; Beta owns delivery.",
             "assertions": [
                 {"kind": "fact", "subject": "Client", "predicate": "deadline", "value": "Friday",
-                 "statement": "Client deadline is Friday."},
-                {"kind": "event", "statement": "Beta accepted the client delivery task."},
-                {"kind": "principle", "statement": "Confirm client deadlines."},
+                 "statement": "Client deadline is Friday.", "support_event_ids": ["<EVIDENCE_ID>"],
+                 "attribution": "partner_report", "reported_by": "human",
+                 "action_status": "not_applicable"},
+                {"kind": "event", "statement": "Beta accepted the client delivery task.",
+                 "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "partner_report",
+                 "reported_by": "human", "action_status": "intention"},
+                {"kind": "principle", "statement": "Confirm client deadlines.",
+                 "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "inference",
+                 "action_status": "not_applicable"},
             ],
         })
         self.prompts = []
@@ -49,7 +55,9 @@ class Extractor:
     def chat(self, prompt, **kwargs):
         self.calls += 1
         self.prompts.append(prompt)
-        return self.response
+        evidence = prompt.split("<evidence>\n", 1)[1].split("\n</evidence>", 1)[0]
+        event_id = json.loads(evidence.splitlines()[0])["id"]
+        return self.response.replace("<EVIDENCE_ID>", event_id)
 
 
 def setup(tmp_path, embedder=None, extractor=None):
@@ -117,6 +125,13 @@ def test_interrupted_commit_recovers_without_reextracting_or_duplicating(tmp_pat
     assert reopened.consolidate(episode).skipped
     assert chat.calls == 1
     assert [len(reopened.knowledge), len(reopened.memory), len(reopened.wisdom)] == [1, 2, 1]
+    for record in (reopened.knowledge.current()[0], *reopened.memory.read_all(),
+                   reopened.wisdom.read_all()[0]):
+        assert record.support_event_ids == (episode.start_id,)
+    assert reopened.knowledge.current()[0].attribution == "partner_report"
+    assert reopened.knowledge.current()[0].reported_by == "human"
+    assert reopened.memory.read_all()[0].action_status == "intention"
+    assert reopened.wisdom.read_all()[0].attribution == "inference"
     assert len(load_lines(module.memory_dir / "consolidation_ledger.jsonl")) == 1
     assert len(load_lines(module.memory_dir / "traces" / "consolidation.jsonl")) == 1
     assert not (module.memory_dir / "pending.json").exists()

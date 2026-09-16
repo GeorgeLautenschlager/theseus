@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 
+from theseus.assertion_metadata import render_metadata
 from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines, lexical_score, valid_vector
 
 
@@ -31,6 +32,10 @@ class WisdomRecord:
     evidence_count: int = 1
     source_episode_id: str = ""
     embedding_model: str = ""
+    support_event_ids: tuple[str, ...] | None = None
+    attribution: str | None = None
+    reported_by: str | None = None
+    action_status: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -42,6 +47,10 @@ class WisdomRecord:
                 "evidence_count": self.evidence_count,
                 "source_episode_id": self.source_episode_id,
                 "embedding_model": self.embedding_model,
+                "support_event_ids": self.support_event_ids,
+                "attribution": self.attribution,
+                "reported_by": self.reported_by,
+                "action_status": self.action_status,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -58,10 +67,16 @@ class WisdomRecord:
             evidence_count=d.get("evidence_count", 1),
             source_episode_id=d.get("source_episode_id", ""),
             embedding_model=d.get("embedding_model", ""),
+            support_event_ids=tuple(d["support_event_ids"]) if d.get("support_event_ids") is not None else None,
+            attribution=d.get("attribution"),
+            reported_by=d.get("reported_by"),
+            action_status=d.get("action_status"),
         )
 
     def render(self) -> str:
-        return f"[{self.id}] {self.statement}"
+        return (f"[{self.id}] {self.statement}"
+                + render_metadata(self.support_event_ids, self.attribution,
+                                  self.reported_by, self.action_status))
 
 
 class WisdomLayer:

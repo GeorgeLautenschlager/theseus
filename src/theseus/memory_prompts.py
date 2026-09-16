@@ -85,8 +85,15 @@ def extraction_json_schema() -> dict:
                         "predicate": {"type": "string"},
                         "value": {"type": "string"},
                         "statement": {"type": "string"},
+                        "support_event_ids": {"type": "array", "items": {"type": "string"},
+                                              "minItems": 1, "uniqueItems": True},
+                        "attribution": {"enum": ["direct_observation", "partner_report", "inference"]},
+                        "reported_by": {"type": "string"},
+                        "action_status": {"enum": ["not_applicable", "intention", "attempt",
+                                                   "failure", "confirmed_outcome"]},
                     },
-                    "required": ["kind", "statement"],
+                    "required": ["kind", "statement", "support_event_ids", "attribution",
+                                 "action_status"],
                     "additionalProperties": False,
                 },
             },
@@ -101,7 +108,7 @@ def build_extraction_prompt(evidence_text: str, context_text: str = "") -> str:
         f"\n<context_only>\n{context_text}\n</context_only>\n\n"
         "The context_only block shows what the agent recalled while this episode was "
         "happening. It is there so you can interpret the evidence; it is NOT evidence — "
-        "never source an assertion from it.\n\n" if context_text else ""
+        "never source an assertion from it or list one of its IDs as support.\n\n" if context_text else ""
     )
     return (
         "You are the memory-consolidation step of a cognitive agent. Below is one episode: "
@@ -126,10 +133,22 @@ def build_extraction_prompt(evidence_text: str, context_text: str = "") -> str:
         '  - for kind "fact": subject, predicate, value — e.g. subject "George", predicate '
         '"prefers", value "dark mode". Only use kind "fact" when you can state all three.\n'
         "  - statement: one plain sentence stating the claim, for every kind.\n"
+        "  - support_event_ids: one or more exact id strings from events in the evidence "
+        "block that support this claim. Do not use context_only IDs or invent IDs. "
+        "If no evidence event supports a claim, omit the claim.\n"
+        '  - attribution: "partner_report" for a partner or user saying something; '
+        'include reported_by with that event actor. Use "direct_observation" for '
+        'an observed tool outcome and "inference" for a deduction from evidence. '
+        "A report is not independent confirmation of its contents.\n"
+        '  - action_status: "not_applicable" for non-actions, "intention" for a plan, '
+        '"attempt" for an unfinished action, "failure" for a failed action, or '
+        '"confirmed_outcome" only when an evidence event confirms completion.\n'
         "Skip conversational filler and anything that is only true of this exact moment.\n\n"
         "Reply with a single JSON object and nothing else — no code fences, no commentary. "
         'Use double quotes: {"summary": "...", "assertions": [{"kind": "fact", '
-        '"subject": "...", "predicate": "...", "value": "...", "statement": "..."}]}'
+        '"subject": "...", "predicate": "...", "value": "...", "statement": "...", '
+        '"support_event_ids": ["<evidence event id>"], "attribution": "partner_report", '
+        '"reported_by": "<event actor>", "action_status": "not_applicable"}]}'
     )
 
 
