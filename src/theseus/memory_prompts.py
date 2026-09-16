@@ -232,6 +232,53 @@ def build_reconciliation_prompt(candidates: list[dict], existing: list) -> str:
     )
 
 
+def build_principle_reconciliation_prompt(candidates: list[dict], existing: list) -> str:
+    rendered_candidates = "\n".join(
+        f"[{i}] statement={c['statement']!r} attribution={c.get('attribution')!r} "
+        f"reported_by={c.get('reported_by')!r}"
+        for i, c in enumerate(candidates)
+    )
+    rendered_existing = "\n".join(record.render() for record in existing) or "(none)"
+    return (
+        "You are the wisdom-reconciliation step of a cognitive agent. Below are newly "
+        "extracted candidate principles — generalized rules or preferences — and the "
+        "agent's existing current principles that might relate to them. Decide, for each "
+        "candidate, how it relates to what the agent already believes.\n\n"
+        "<candidates>\n"
+        f"{rendered_candidates}\n"
+        "</candidates>\n\n"
+        "<existing_knowledge>\n"
+        f"{rendered_existing}\n"
+        "</existing_knowledge>\n\n"
+        "For each candidate, choose exactly one decision:\n"
+        '- "new": nothing existing expresses the same generalization; no target_id.\n'
+        '- "reinforce": an existing record already expresses essentially the same rule or '
+        "preference, however differently worded — independent evidence for the same "
+        "principle, not a new one. target_id: that record's id.\n"
+        '- "contradiction": an existing record and this candidate genuinely conflict (e.g. '
+        '"always confirm risky actions" vs "never ask, just proceed" for the same kind of '
+        "action) and neither is clearly the current rule — keep both visible rather than "
+        "guessing which governs. A narrower rule for a specific case is not a contradiction "
+        "of a general one (\"skip confirmation for low-risk actions\" refines, it does not "
+        "conflict with, \"confirm risky actions\") — that is \"new\". target_id: the "
+        "conflicting record.\n"
+        '- "historical": this candidate describes a rule or preference that no longer '
+        "applies (explicitly superseded, reversed, or stated as past practice), not a "
+        "living principle — record it, but it must not become current. target_id: the "
+        "existing record it is historical relative to, if any.\n\n"
+        "An inferred generalization (attribution \"inference\") stays provisional until "
+        "independent episodes reinforce it — that policy is applied outside this decision, "
+        "but it means restating the same inference twice in one breath is not two episodes "
+        "of support, and only genuinely independent reinforcement should be marked as such. "
+        "An explicitly stated preference or rule (attribution \"partner_report\" or "
+        "\"direct_observation\") does not need reinforcement to matter; judge it as new or "
+        "reinforcing on its content, not on how many times it has been said.\n\n"
+        "Reply with a single JSON object and nothing else — no code fences, no commentary. "
+        'Use double quotes: {"decisions": [{"candidate_index": 0, "decision": "new"}, '
+        '{"candidate_index": 1, "decision": "reinforce", "target_id": "<existing id>"}]}'
+    )
+
+
 def build_link_decision_prompt(new_note: MemoryNote, candidates: list[MemoryNote]) -> str:
     rendered = "\n\n".join(c.render() for c in candidates)
     return (

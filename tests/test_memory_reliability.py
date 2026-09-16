@@ -612,10 +612,10 @@ def test_formation_limits_batch_and_defers_next_attempt(tmp_path):
     assert extractor.calls == 1
     clock[0] = 10.0
     policy.tick()
-    # +1 over the first tick: the second episode's canned fact shares a subject
-    # with the first episode's, so reconciliation has something to check it
-    # against and makes its own call through the same provider.
-    assert extractor.calls == 3
+    # +2 over the first tick: the second episode's canned fact and principle
+    # both match something already on file, so fact and wisdom reconciliation
+    # each have something to check against and make their own call.
+    assert extractor.calls == 4
     assert policy.pending_events == 0
 
 

@@ -162,9 +162,9 @@ def _fact(subject, predicate, value, statement=None, *, support, attribution="pa
             "action_status": action_status}
 
 
-def _principle(statement, *, support):
+def _principle(statement, *, support, attribution="partner_report"):
     return {"kind": "principle", "statement": statement,
-            "support_event_indices": support, "attribution": "partner_report",
+            "support_event_indices": support, "attribution": attribution,
             "action_status": "not_applicable"}
 
 
@@ -179,6 +179,7 @@ REQUIRED_CATEGORIES = frozenset({
     "plan_then_failure", "plan_then_success", "alternate_wording_correction",
     "coexisting_preferences", "historical_report", "recall_repetition",
     "split_action_result", "principles", "oversized_tail", "contradiction",
+    "principle_promotion",
 })
 
 _OVERSIZED_MESSAGE = ("padding. " * 8000) + "DECISIVE: The Atlas security token is ZULU-9."
@@ -253,6 +254,26 @@ SCENARIOS = (
         (EpisodeSpec((0,), "The user set a rule to always confirm risky actions.", (_principle("Always confirm risky actions before executing.", support=(0,)),)), EpisodeSpec((1,), "The user repeated the rule to confirm risky actions.", (_principle("Always confirm risky actions before executing.", support=(1,)),)), EpisodeSpec((2,), "The user added that low-risk actions can skip confirmation.", (_principle("For low-risk actions, skip the confirmation step.", support=(2,)),))),
         (), ("confirm risky actions", "low-risk"), (),
         (Query("What is the policy for risky actions?", "confirm"), Query("What is the policy for low-risk actions?", "low-risk"))),
+    Scenario("brevity-pattern", "principle_promotion",
+        (_ev("agent", "First noticed the user replies tersely."),
+         _ev("agent", "Noticed it again in a second, unrelated exchange.")),
+        (EpisodeSpec((0,), "The agent noticed a pattern in how the user replies.",
+                     (_principle("The user seems to prefer terse replies.", support=(0,),
+                                attribution="inference"),)),
+         EpisodeSpec((1,), "The agent noticed the same pattern again, independently.",
+                     (_principle("User replies again suggest a preference for terse answers.",
+                                support=(1,), attribution="inference"),),
+                     # Independent evidence for the same inferred generalization —
+                     # reconciliation has to recognize it despite the reworded statement.
+                     # Scenarios share cumulative memory, so pick this scenario's own
+                     # principle by recency (current() is ts-sorted) rather than
+                     # index 0, which could belong to an earlier scenario.
+                     reconciliation=lambda memory: json.dumps({"decisions": [
+                         {"candidate_index": 0, "decision": "reinforce", "target_id":
+                          memory.wisdom.current()[-1].id},
+                     ]}))),
+        (), ("terse",), (),
+        (Query("What does the agent believe about the user's reply style?", "terse"),)),
     Scenario("atlas-token", "oversized_tail",
         (("tool", "tool_result", {"message": _OVERSIZED_MESSAGE}, "evidence"), _ev("human", "Store the Atlas security token safely.")),
         (EpisodeSpec((0, 1), "Atlas security token noted.", (_fact("Atlas", "security token", "ZULU-9", support=(0,), attribution="direct_observation"),)),),

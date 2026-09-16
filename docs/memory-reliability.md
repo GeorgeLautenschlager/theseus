@@ -113,6 +113,23 @@ be current for the same subject+predicate at once (coexistence or an unresolved
 contradiction), and a `reconciliation="historical"` record is kept in the
 append-only file but never enters the current set.
 
+Principle-kind candidates go through the same reconciliation machinery against
+the agent's existing current principles (bounded similarly, by lexical
+similarity to the candidate's statement rather than a subject key), but with a
+promotion policy on top: an explicitly attributed preference (`attribution`
+`direct_observation` or `partner_report` — the agent was told, or directly
+observed, not guessing) is `status: established` the moment it is written, no
+repetition required. An inferred generalization (`attribution: inference`)
+starts `status: provisional` and stays that way — visibly unconfirmed in recall
+text — until independent evidence from at least
+`assertion_metadata.WISDOM_PROMOTION_THRESHOLD` (2) distinct episodes has
+reinforced it; a `WisdomRecord.supporting_episode_ids` set tracks exactly which
+episodes, so retries (already idempotent per episode), repeated recall, and
+duplicate extraction within one episode cannot inflate it. A disputed principle
+(`contradiction`) stays current on both sides, visibly marked via `contradicts`,
+never silently resolved in favor of one — its `status` is computed the same way,
+so a contested claim is never rendered as an unqualified established rule.
+
 Lexical and vector rankings combine within a layer. Across layers the result is
 a weighted rank interleave, favoring current facts; it does not detect semantic
 agreement between different records beyond what reconciliation already resolved
@@ -201,7 +218,9 @@ success, alternate-wording corrections (under a genuinely different predicate,
 not just a shared key), coexisting preferences under one broad predicate,
 historical reports, an unresolved contradiction between two partner reports,
 decisive evidence at the end of an oversized event, recall repetition, split
-action/result pairs, and repeated or contradictory principles — and reports
+action/result pairs, repeated or contradictory principles, and an inferred
+principle promoted from provisional to established by independent supporting
+episodes — and reports
 correct knowledge updates, supported-claim retention, unsupported claims,
 source-ID validity, and agreement with labeled assertion metadata **separately**.
 The latter compares attribution, action status, and labeled supporting events;
