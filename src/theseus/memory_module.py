@@ -93,6 +93,7 @@ class Episode:
     episode_id: str
     start_id: str    # inclusive stimulus-event id
     end_id: str      # inclusive
+    context_event_ids: tuple[str, ...] = ()  # readable for interpretation, never evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +401,12 @@ class MemoryModule:
         events = self._episode_events(episode)
         evidence = [e for e in events if not _is_recall_flagged(e)]
         context_only = [e for e in events if _is_recall_flagged(e)]
+        if episode.context_event_ids:
+            # Events the caller chose to carry forward across an episode boundary
+            # (see MemoryConsolidator) — readable to interpret what follows, but
+            # never support: they already had their chance to be evidence in
+            # whichever episode originally covered them.
+            context_only = context_only + self._lookup_events(episode.context_event_ids)
         eligible_events = {e.id: e for e in evidence}
         context_only_ids = {e.id for e in context_only}
         if not evidence:
@@ -571,6 +578,7 @@ class MemoryModule:
         trace["reported_embedding_tokens"] = self._embedding_tokens - before_embedding_tokens
         trace["reconciliation_calls"] = reconciliation_calls
         trace["reconciliation_decisions"] = decision_counts
+        trace["context_event_ids"] = list(episode.context_event_ids)
         atomic_json(self.memory_dir / "pending.json", {
             "episode_id": episode.episode_id, "start_id": episode.start_id, "end_id": episode.end_id,
             "records": records, "dead_letters": dead, "trace": trace,
@@ -685,6 +693,14 @@ class MemoryModule:
             raise ValueError("episode boundary id not found in stimulus log")
         lo, hi = (start, end) if start <= end else (end, start)
         return events[lo : hi + 1]
+
+    def _lookup_events(self, event_ids: tuple[str, ...]) -> list:
+        """Named events from anywhere in the log, in file order. Best-effort:
+        an id that doesn't resolve (a caller typo, a pruned test fixture) is
+        silently omitted rather than raised — unlike an episode's own
+        boundaries, context is supplementary, not evidence integrity."""
+        wanted = set(event_ids)
+        return [e for e in self._stimulus_log.read_all() if e.id in wanted]
 
     def _trace_consolidation(self, record: dict[str, Any]) -> None:
         append_record(

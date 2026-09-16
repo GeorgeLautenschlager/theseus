@@ -14,6 +14,7 @@ memory=MemorySpec(
     consolidate_every_seconds=300,
     episode_max_events=20,
     episode_max_chars=24000,
+    episode_context_events=2,
     recall_budget_tokens=2000,
 )
 ```
@@ -30,6 +31,30 @@ starts with the beginning of the local log. Set the batch size and interval for
 the expected event rate; inspect `core.memory_consolidator.pending_events` and
 `last_error` for backlog and failures. Failures are logged without aborting the
 completed cognitive turn. A-MEM keeps its existing lifecycle.
+
+### Episode boundaries
+
+A batch is built from whole **interaction units**, not a flat event slice: a
+`decision` event and every `tool_result` immediately following it (its own tool
+calls' outcomes) form one unit, so a size-forced batch cut never separates an
+action from its own result — the cut lands before or after the whole unit, never
+inside it. Every other event (an incoming chat message, an egocentric capture, a
+replicated surrogate event) stands alone as its own unit; a log with no
+`decision`/`tool_result` events at all falls back to plain per-event batching
+automatically, with no LLM boundary detector and no metadata beyond `type`. A
+single interaction unit larger than `episode_max_events`/`episode_max_chars`
+still lands in one episode rather than being torn apart — extraction-level
+packing and chunking (see below) is what actually bounds the request from there.
+
+Each batch after the first carries up to `episode_context_events` of the
+immediately preceding, already-consolidated events as bounded context —
+readable to interpret a continuation ("...it failed") but never eligible as
+support for a new claim; those events already had their chance to be evidence in
+whichever episode covered them. Selected boundaries and context are persisted to
+`formation/cursor.json` before the extraction call, exactly like the episode
+range itself, so a restart or new stimuli arriving mid-attempt cannot change what
+gets retried. Explicit `Episode` callers are unaffected: `context_event_ids`
+defaults to empty, and the module does not select episodes on its own.
 
 ## Recovery and compatibility
 

@@ -113,6 +113,7 @@ def test_isolated_agent_completes_real_cognitive_turn(tmp_path, monkeypatch, cap
     ({"memory": MemorySpec("amem")}, "ModelSpec"),
     ({"memory": MemorySpec("module")}, "requires auto"),
     ({"memory": MemorySpec(recall_budget_tokens=0)}, "recall_budget_tokens"),
+    ({"memory": MemorySpec(episode_context_events=-1)}, "episode_context_events"),
 ])
 def test_invalid_reassembly_keeps_previous_output(tmp_path, changes, message):
     launcher = assemble(spec(), tmp_path)
