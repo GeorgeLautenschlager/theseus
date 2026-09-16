@@ -415,9 +415,11 @@ class MemoryModule:
             return ConsolidationResult(episode.episode_id, 0, {}, 0, 0, 0, 0,
                                        time.monotonic() - started)
 
-        context_text = "\n".join(e.to_json() for e in context_only)
-        # Real overhead: the prompt shape plus whatever context this episode actually
-        # carries, not a fixed guess — a large recalled-context block eats real budget.
+        # Context is optional interpretation help, never evidence. Reserve at
+        # least three quarters of the available payload for evidence; a large
+        # prior event must not poison the next persisted episode forever.
+        available = self._max_input_chars - len(build_extraction_prompt("", ""))
+        context_text = _bounded_context(context_only, min(4096, max(0, available // 4)))
         overhead = len(build_extraction_prompt("", context_text))
         solo_budget = self._max_input_chars - overhead
         if solo_budget <= 0:
@@ -527,12 +529,12 @@ class MemoryModule:
                 value = candidate["value"].strip()
                 decision, target_id = fact_decisions.get(i, (None, None))
                 if decision is None:
-                    # No reconciliation opinion for this candidate (no existing
-                    # knowledge for its subject at all, or the call failed/skipped
-                    # it) — fall back to the pre-reconciliation default: replace an
-                    # exact subject+predicate match, otherwise write it as new.
-                    same_key = self.knowledge.current(subject, predicate)
-                    decision, target_id = ("replace", same_key[0].id) if same_key else ("new", None)
+                    # Missing/invalid decisions cannot authorize a destructive
+                    # update. Retain the claim durably outside current knowledge
+                    # when this subject has existing facts. A later explicit
+                    # reconciliation can decide what it means.
+                    decision = "unresolved" if self.knowledge.current(subject) else "new"
+                    target_id = None
                 elif decision == "reinforce":
                     # A guard, not a trust exercise: if the "reinforced" record's
                     # value actually differs, this is a real change reconciliation
@@ -646,8 +648,8 @@ class MemoryModule:
 
         Never blocks the episode: a failed, unavailable, or malformed response
         just means no decisions came back (`parsed is None`), and the caller's
-        own fallback takes over — the same outcome consolidation always had
-        before reconciliation existed. Recorded to `reconciliation_failures.jsonl`
+        own fallback takes over. Facts with existing subject knowledge are
+        retained as unresolved rather than authorized to supersede it. Recorded to `reconciliation_failures.jsonl`
         for visibility, same as extraction.
         """
         calls = 0
@@ -694,7 +696,17 @@ class MemoryModule:
         targets: list[int] = []
         for i in fact_indices:
             candidate = assertions[i][1]
-            existing = self.knowledge.current(subject=candidate["subject"])[: self._reconciliation_context_k]
+            existing = self.knowledge.current(subject=candidate["subject"])
+            predicate = " ".join(candidate["predicate"].casefold().split())
+            query_terms = terms(candidate["predicate"] + " " + candidate["statement"])
+            # Exact attributes first, then lexical relevance, then recency.
+            # Stable IDs break timestamp ties across process restarts.
+            existing.sort(key=lambda record: (
+                " ".join(record.predicate.casefold().split()) == predicate,
+                len(query_terms & terms(record.predicate + " " + record.value)),
+                record.ts, record.id,
+            ), reverse=True)
+            existing = existing[:self._reconciliation_context_k]
             if existing:
                 context[i] = {record.id: record for record in existing}
                 targets.append(i)
@@ -788,6 +800,35 @@ def _is_recall_flagged(event) -> bool:
 
 
 # -- extraction packing -----------------------------------------------------------
+
+def _bounded_context(events: list, budget: int) -> str:
+    """Newest context first within a separate character allowance.
+
+    Excerpts remain valid event JSON and are explicitly marked. Keep the tail
+    of a large event, where an action's final outcome is commonly recorded.
+    Original events remain unchanged in the stimulus log.
+    """
+    lines = []
+    remaining = budget
+    for event in reversed(events):
+        line = event.to_json()
+        if len(line) > remaining:
+            content = json.dumps(event.content, ensure_ascii=False)
+            size = min(len(content), remaining)
+            while True:
+                line = replace(event, content={
+                    "context_truncated": True, "excerpt": content[-size:] if size else "",
+                }).to_json()
+                if len(line) <= remaining or size == 0:
+                    break
+                size //= 2
+        if len(line) <= remaining:
+            lines.append(line)
+            remaining -= len(line) + 1
+        if remaining <= 0:
+            break
+    return "\n".join(reversed(lines))
+
 
 def _water_fill(sizes: list[int], budget: int) -> list[int]:
     """Per-item share of `budget`, redistributing what small items don't need
@@ -955,7 +996,7 @@ def _parse_reconciliation_decisions(
         if type(position) is not int or not (0 <= position < len(targets)):
             continue
         decision = row.get("decision")
-        if decision not in RECONCILIATION_DECISIONS:
+        if not isinstance(decision, str) or decision not in RECONCILIATION_DECISIONS:
             continue
         i = targets[position]
         target_id = row.get("target_id")

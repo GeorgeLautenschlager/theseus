@@ -47,13 +47,16 @@ still lands in one episode rather than being torn apart — extraction-level
 packing and chunking (see below) is what actually bounds the request from there.
 
 Each batch after the first carries up to `episode_context_events` of the
-immediately preceding, already-consolidated events as bounded context —
+immediately preceding, already-consolidated events as optional context —
 readable to interpret a continuation ("...it failed") but never eligible as
 support for a new claim; those events already had their chance to be evidence in
 whichever episode covered them. Selected boundaries and context are persisted to
 `formation/cursor.json` before the extraction call, exactly like the episode
 range itself, so a restart or new stimuli arriving mid-attempt cannot change what
-gets retried. Explicit `Episode` callers are unaffected: `context_event_ids`
+gets retried. Rendered context is capped at 4,096 characters and at most one
+quarter of the payload budget. Newer events take priority; oversized context
+uses an explicitly marked tail excerpt. This limit also applies to recall-only
+context, and does not alter the original log or its evidence eligibility. Explicit `Episode` callers are unaffected: `context_event_ids`
 defaults to empty, and the module does not select episodes on its own.
 
 ## Recovery and compatibility
@@ -103,10 +106,21 @@ e.g. two independent preferences both filed under "preference"), `contradiction`
 names the other in `contradicts`), or `historical` (the claim itself describes a
 past or superseded state and must never become current, regardless of when its
 episode was processed — report time is not effective time). A subject with no
-existing knowledge costs no reconciliation call at all. A failed, unavailable, or
-malformed reconciliation response falls back to the pre-reconciliation default
-(replace an exact subject+predicate match, otherwise write new) rather than
-blocking the episode; failures are recorded to `reconciliation_failures.jsonl`.
+existing knowledge costs no reconciliation call at all. Candidates are selected
+by normalized exact predicate match first, lexical relevance second, and recency
+third, with stable record IDs breaking ties. This keeps relevant newer facts
+eligible after a subject accumulates more than six records.
+
+A failed, unavailable, malformed, or missing fact decision preserves existing
+current knowledge. The incoming claim is saved as `reconciliation="unresolved"`
+with its source metadata, but is excluded from current-fact retrieval. This also
+applies to alternate-wording claims for an already-known subject. An entirely
+new subject can still receive a new fact without a reconciliation call. The
+episode completes; unresolved claims are retained for inspection and future
+explicit reconciliation, not automatically retried by the formation cursor.
+Historical episode evidence remains searchable. Provider failures are recorded
+to `reconciliation_failures.jsonl`, and consolidation traces count `unresolved`
+decisions.
 `KnowledgeRecord.supersedes` is therefore decided by this step, not inferred by
 `KnowledgeLayer` from keys or timestamps — more than one record can legitimately
 be current for the same subject+predicate at once (coexistence or an unresolved

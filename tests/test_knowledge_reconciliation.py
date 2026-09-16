@@ -13,6 +13,9 @@ relative to what's already known.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+
+import pytest
 
 from theseus.memory_module import Episode, MemoryModule
 from theseus.stimulus_log import StimulusLog
@@ -26,7 +29,7 @@ class ScriptedProvider:
 
     def __init__(self, extraction_response=None):
         self.extraction_response = extraction_response
-        self.reconciliation_response = None  # None => empty decisions (falls back)
+        self.reconciliation_response = None  # None => explicit new-fact decisions
         self.calls = 0
         self.prompts = []
 
@@ -34,7 +37,10 @@ class ScriptedProvider:
         self.calls += 1
         self.prompts.append(prompt)
         if "<candidates>" in prompt and "<existing_knowledge>" in prompt:
-            return self.reconciliation_response or '{"decisions": []}'
+            return self.reconciliation_response or json.dumps({"decisions": [
+                {"candidate_index": i, "decision": "new", "target_id": None}
+                for i, _ in enumerate(json.loads(self.extraction_response)["assertions"])
+            ]})
         return self.extraction_response
 
 
@@ -244,9 +250,9 @@ def test_reconciliation_is_skipped_for_a_subject_with_no_existing_knowledge(tmp_
     assert trace["reconciliation_calls"] == 0
 
 
-def test_reconciliation_failure_falls_back_to_key_matching_without_blocking(tmp_path):
+def test_reconciliation_failure_preserves_current_fact_without_blocking(tmp_path):
     """If no provider can answer the reconciliation call, the episode still
-    completes — reconciliation refines the default, it doesn't gate it."""
+    completes, but uncertain claims must not replace current knowledge."""
     module, log, provider = setup(tmp_path)
     consolidate_fact(
         module, log, "ep1", "human", "Atlas prototype deadline is Friday.", provider,
@@ -267,15 +273,17 @@ def test_reconciliation_failure_falls_back_to_key_matching_without_blocking(tmp_
     module._model_providers = [ForwardingProvider()]
     result = module.consolidate(Episode("ep2", event.id, event.id))
     assert not result.skipped
-    # Falls back to the exact subject+predicate key match, same as before #66.
-    assert [r.value for r in module.knowledge.current(subject="Atlas")] == ["Monday"]
+    assert [r.value for r in module.knowledge.current(subject="Atlas")] == ["Friday"]
+    pending = module.knowledge.read_all()[-1]
+    assert pending.value == "Monday" and pending.reconciliation == "unresolved"
+    assert pending.supersedes is None
     assert (module.memory_dir / "reconciliation_failures.jsonl").exists()
 
 
 def test_a_hallucinated_target_id_is_rejected_and_falls_back(tmp_path):
     """A target_id that doesn't resolve to a record actually offered as
     context is dropped rather than trusted — the candidate falls back to the
-    same-key default instead of superseding something it was never shown."""
+    unresolved state instead of superseding something it was never shown."""
     module, log, provider = setup(tmp_path)
     consolidate_fact(
         module, log, "ep1", "human", "Atlas prototype deadline is Friday.", provider,
@@ -292,8 +300,8 @@ def test_a_hallucinated_target_id_is_rejected_and_falls_back(tmp_path):
     )
 
     current = module.knowledge.current(subject="Atlas")
-    assert [r.value for r in current] == ["Monday"]
-    assert current[0].supersedes == original.id  # fell back to the exact-key match
+    assert current == [original]
+    assert module.knowledge.read_all()[-1].reconciliation == "unresolved"
 
 
 def test_two_corrections_in_one_episode_chain_instead_of_both_staying_current(tmp_path):
@@ -344,3 +352,62 @@ def test_reconciliation_context_per_subject_is_bounded(tmp_path):
 
     prompt = provider.prompts[-1]
     assert prompt.count("Current fact: Atlas") == 2
+
+
+@pytest.mark.parametrize('response', ['broken', '{"decisions": []}',
+    '{"decisions": [{"candidate_index": 0, "decision": [], "target_id": null}]}'])
+@pytest.mark.parametrize('predicate', ['deadline', 'delivery date'])
+def test_unusable_reconciliation_retains_stale_claim_without_promoting_it(tmp_path, response, predicate):
+    module, log, provider = setup(tmp_path)
+    for episode_id, day, attr, value in [('recent', 16, 'deadline', 'Monday'), ('old', 1, predicate, 'Friday')]:
+        event = log.append('human', 'chat_message', {'message': f'Atlas {attr}: {value}'},
+                           ts=datetime(2026, 9, day, tzinfo=timezone.utc))
+        provider.extraction_response = extraction_response('Deadline report', fact('Atlas', attr, value)).replace('<EVIDENCE_ID>', event.id)
+        provider.reconciliation_response = response
+        module.consolidate(Episode(episode_id, event.id, event.id))
+    reopened = MemoryModule(module.memory_dir, log)
+    assert [r.value for r in reopened.knowledge.current('Atlas')] == ['Monday']
+    retained = reopened.knowledge.read_all()[-1]
+    assert retained.value == 'Friday'
+    assert retained.reconciliation == 'unresolved' and retained.supersedes is None
+    assert retained.support_event_ids == (event.id,)
+    assert 'Unresolved claim' in retained.render()
+    assert all(hit.id != retained.id for hit in reopened.knowledge.search({'atlas'}))
+
+
+@pytest.mark.parametrize('exact', [False, True])
+def test_reconciliation_selects_relevant_target_beyond_first_six_facts(tmp_path, exact):
+    module, log, provider = setup(tmp_path)
+    for i in range(8):
+        attr = 'prototype delivery deadline' if i == 7 else f'unrelated attribute {i}'
+        consolidate_fact(module, log, f'ep{i}', 'human', f'Atlas {attr}', provider,
+                         extraction_response('Attribute', fact('Atlas', attr, 'Friday')))
+    target = module.knowledge.current('Atlas', 'prototype delivery deadline')[0]
+    correction = 'prototype delivery deadline' if exact else 'prototype delivery date'
+    consolidate_fact(module, log, 'update', 'human', 'Atlas prototype delivery moved to Monday', provider,
+                     extraction_response('Correction', fact('Atlas', correction, 'Monday')),
+                     reconciliation_response=json.dumps({'decisions': [
+                         {'candidate_index': 0, 'decision': 'replace', 'target_id': target.id}]}))
+    prompt = provider.prompts[-1]
+    assert prompt.count('Current fact: Atlas') == 6
+    assert target.id in prompt
+    current = module.knowledge.current('Atlas')
+    assert len(current) == 8
+    assert target.id not in {r.id for r in current}
+    assert any(r.value == 'Monday' and r.supersedes == target.id for r in current)
+
+
+def test_exact_attribute_precedes_newer_lexically_similar_facts(tmp_path):
+    module, log, provider = setup(tmp_path)
+    module._reconciliation_context_k = 1
+    for i, predicate in enumerate(['deadline', 'deadline for prototype', 'deadline for invoice']):
+        consolidate_fact(module, log, f'ep{i}', 'human', 'Atlas deadline', provider,
+                         extraction_response('Noted', fact('Atlas', predicate, 'Friday')))
+    target = module.knowledge.current('Atlas', 'deadline')[0]
+    consolidate_fact(module, log, 'update', 'human', 'Atlas deadline is Monday', provider,
+                     extraction_response('Correction', fact('Atlas', ' DEADLINE ', 'Monday')),
+                     reconciliation_response=json.dumps({'decisions': [
+                         {'candidate_index': 0, 'decision': 'replace', 'target_id': target.id}]}))
+    assert provider.prompts[-1].count('Current fact: Atlas') == 1
+    assert target.id in provider.prompts[-1]
+    assert [r.value for r in module.knowledge.current('Atlas', 'deadline')] == ['Monday']

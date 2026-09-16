@@ -13,7 +13,7 @@ that supersedes nothing stays current alongside whatever else is current for
 its subject+predicate — two records can legitimately share a key at once
 (coexisting attributes under a broad predicate, or an unresolved contradiction
 between two reports) since nothing here forces exclusivity. A record marked
-`reconciliation="historical"` is written for the append-only record but never
+`reconciliation="historical"` or `"unresolved"` is written for the append-only record but never
 enters the current set at all. There is no decay and no mutation anywhere in
 this layer; what the agent knows *now* is always derivable by replaying the
 file.
@@ -49,7 +49,7 @@ class KnowledgeRecord:
     attribution: str | None = None
     reported_by: str | None = None
     action_status: str | None = None
-    reconciliation: str | None = None       # see assertion_metadata.RECONCILIATION_DECISIONS
+    reconciliation: str | None = None       # model decisions, or internal "unresolved" on failure
     contradicts: tuple[str, ...] | None = None  # current records this one conflicts with
 
     def to_json(self) -> str:
@@ -93,7 +93,8 @@ class KnowledgeRecord:
         )
 
     def render(self) -> str:
-        text = (f"[{self.id}] Current fact: {self.subject} {self.predicate}: {self.value}"
+        label = "Unresolved claim" if self.reconciliation == "unresolved" else "Current fact"
+        text = (f"[{self.id}] {label}: {self.subject} {self.predicate}: {self.value}"
                 + render_metadata(self.support_event_ids, self.attribution,
                                   self.reported_by, self.action_status))
         if self.contradicts:
@@ -120,7 +121,7 @@ class KnowledgeLayer:
         was written, so one forward pass is enough — no re-ranking by ts."""
         self._records.append(record)
         self._by_id[record.id] = record
-        if record.reconciliation != "historical":
+        if record.reconciliation not in ("historical", "unresolved"):
             self._current_ids.add(record.id)
         if record.supersedes is not None:
             self._current_ids.discard(record.supersedes)
@@ -133,7 +134,7 @@ class KnowledgeLayer:
         merely historical — the caller (reconciliation) already decided that
         and encoded it in `supersedes`/`reconciliation`. Applying it here is
         pure bookkeeping: drop the named id from the current set, and skip
-        adding this one if it's marked historical.
+        adding this one if it is historical or unresolved.
         """
         if record.id in self._by_id:
             return self._by_id[record.id]
@@ -144,7 +145,7 @@ class KnowledgeLayer:
         return record
 
     def current(self, subject: str | None = None, predicate: str | None = None) -> list[KnowledgeRecord]:
-        """Current (non-superseded, non-historical) records, optionally
+        """Current (non-superseded, non-historical, resolved) records, optionally
         filtered by exact subject and/or predicate (None = wildcard). More
         than one record can be current for the same subject+predicate at
         once — coexisting attributes or an unresolved contradiction are not

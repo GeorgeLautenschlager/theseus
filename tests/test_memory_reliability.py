@@ -632,3 +632,30 @@ def test_fact_lookup_normalizes_whitespace_and_keeps_search_keyword(tmp_path):
     layer.add(record)
     assert layer.current('atlas team', 'delivery owner') == [record]
     assert layer.search(terms={'ATLAS'})[0].id == 'fact'
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def test_large_prior_context_does_not_stall_next_scheduled_episode(tmp_path, restart):
+    log = StimulusLog(tmp_path / 'log.jsonl')
+    chat = Extractor(json.dumps({'summary': 'Source retained.', 'assertions': []}))
+    module = MemoryModule(tmp_path / 'memory', log, model_providers=[chat], max_input_chars=24000)
+    large = log.append('tool', 'tool_result', {'output': 'x' * 60000 + ' FINAL_OUTCOME'})
+    now = [0.0]
+    policy = MemoryConsolidator(module, max_events=1, now=lambda: now[0])
+    policy.tick()
+    small = log.append('human', 'chat_message', {'message': 'Next small task'})
+    if restart:
+        module = MemoryModule(module.memory_dir, log, model_providers=[chat], max_input_chars=24000)
+        policy = MemoryConsolidator(module, max_events=1, now=lambda: now[0])
+    now[0] = 301
+    assert not policy.tick().skipped
+    state = json.loads((module.memory_dir / 'formation' / 'cursor.json').read_text())
+    assert state['last_id'] == small.id and 'pending' not in state
+    assert policy.pending_events == 0
+    assert all(len(prompt) <= 24000 for prompt in chat.prompts)
+    prompt = _last_extraction_prompt(chat)
+    context = prompt.split('<context_only>\n')[1].split('\n</context_only>')[0]
+    assert len(context) <= 4096
+    assert 'context_truncated' in context and 'FINAL_OUTCOME' in context
+    assert large.id in context and small.id in prompt
+    assert any('x' * 60000 in record.content for record in module.memory.read_all())

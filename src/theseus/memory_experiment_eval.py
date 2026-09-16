@@ -57,7 +57,11 @@ QUERIES = (
 class ReferenceExtractor:
     response = ""
 
+    reconciliation_response = '{"decisions": []}'
+
     def chat(self, prompt, **kwargs):
+        if "<existing_knowledge>" in prompt:
+            return self.reconciliation_response
         return self.response
 
 
@@ -85,6 +89,13 @@ def run_evaluation(workdir: Path, *, extractor=None, embedder=None, answerer=Non
         timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(days=index)
         event = log.append(actor, "chat_message", {"message": message}, ts=timestamp)
         if reference:
+            # The offline control supplies labeled reconciliation as well as
+            # extraction; it must not depend on production failure fallbacks.
+            current = memory.knowledge.current(subject, predicate)
+            extractor.reconciliation_response = json.dumps({"decisions": [{
+                "candidate_index": 0, "decision": "replace" if current else "new",
+                "target_id": current[0].id if current else None,
+            }]})
             extractor.response = json.dumps({"summary": f"{actor} reported: {message}", "assertions": [{
                 "kind": "fact", "subject": subject, "predicate": predicate, "value": value,
                 "statement": f"{subject} {predicate}: {value}",

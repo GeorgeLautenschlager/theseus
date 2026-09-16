@@ -33,14 +33,22 @@ class ReferenceExtractor:
 
     def __init__(self):
         self.response = ""
-        self.reconciliation_response = None  # None => empty decisions; falls back to key matching
+        self.reconciliation_response = None  # None => new facts; default principle handling
         self.last_prompt = None                  # last *extraction* prompt only
         self.last_reconciliation_prompt = None
 
     def chat(self, prompt, **kwargs):
         if "<candidates>" in prompt and "<existing_knowledge>" in prompt:
             self.last_reconciliation_prompt = prompt
-            return self.reconciliation_response if self.reconciliation_response is not None else '{"decisions": []}'
+            if self.reconciliation_response is not None:
+                return self.reconciliation_response
+            if "wisdom-reconciliation" in prompt:
+                return '{"decisions": []}'
+            candidates = prompt.split("<candidates>\n", 1)[1].split("\n</candidates>", 1)[0].splitlines()
+            return json.dumps({"decisions": [
+                {"candidate_index": i, "decision": "new", "target_id": None}
+                for i in range(len(candidates))
+            ]})
         self.last_prompt = prompt
         return self.response
 
@@ -118,8 +126,8 @@ class EpisodeSpec:
     # Scripts the reference reconciliation response for this episode, given the
     # live MemoryModule (queried right before consolidation, so it can name a
     # real prior record's id — those are assigned during consolidation, not
-    # known ahead of time). None leaves reconciliation unscripted for this
-    # episode, which falls back to exact subject+predicate key matching.
+    # known ahead of time). None labels fact candidates as new independent attributes; corrections
+    # must explicitly script their reconciliation decision.
     reconciliation: Callable[[MemoryModule], str] | None = None
 
 
