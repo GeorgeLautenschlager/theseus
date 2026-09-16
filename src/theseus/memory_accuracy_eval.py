@@ -1,4 +1,13 @@
-"""Labeled multi-event scenarios for consolidation accuracy evaluation."""
+"""Multi-event consolidation accuracy eval.
+
+Consolidates labeled multi-event scenarios (plans followed by failure or
+success, corrections, coexisting preferences, historical reports, oversized-tail
+evidence, recall repetition, split action/result pairs, principles) and reports
+correct knowledge updates, supported-claim retention, and unsupported claims
+separately. Provides a deterministic offline reference-extraction run (part of
+the offline suite), an opt-in live run, and a CLI (``python -m
+theseus.memory_accuracy_eval``).
+"""
 
 from __future__ import annotations
 
@@ -40,6 +49,19 @@ def build_memory(workdir, *, extractor, embedder):
 
 
 def drive_scenarios(memory, log, scenarios, *, reference, extractor, start):
+    """Append each scenario's events to the log and consolidate its episodes.
+
+    Events are stamped one per calendar day starting at ``start``; the day
+    counter advances across all scenarios (never reset), so every event gets a
+    distinct, monotonically increasing timestamp. Events whose role is
+    ``recall_context`` are appended as ``tool_result`` records tagged with the
+    recall tool name, so recalled text is never eligible to become a fact. When
+    ``reference`` is true the extractor is scripted with each episode's labeled
+    summary/assertions before consolidation.
+
+    Returns a dict keyed by scenario name; each value is
+    ``{"event_ids": [...], "episode_prompts": {episode_id: prompt}}``.
+    """
     trace = {}
     day = 0
     for scenario in scenarios:
@@ -118,6 +140,7 @@ def _principle(statement):
 
 
 def _note(statement):
+    # kind "event" = a non-fact episodic note; unrelated to the StimulusEvent event_type
     return {"kind": "event", "statement": statement}
 
 
@@ -325,7 +348,8 @@ def run_live(workdir, *, extractor, embedder=None, answerer=None, budget_tokens=
                 records = [{"id": e.provenance.record_id, "text": e.text} for e in memory.recall(query.question, budget_tokens).entries[:3]]
                 raw = answerer.chat("Answer from these memory records. Prefer current facts over historical reports. Plans and attempts do not establish completed actions. If unsupported, answer unknown. Return JSON with answer and evidence_ids.\n" + json.dumps({"query": query.question, "records": records}), max_tokens=512)
                 reported = getattr(answerer, "last_chat_usage", None)
-                if isinstance(reported, dict): usage.append(dict(reported))
+                if isinstance(reported, dict):
+                    usage.append(dict(reported))
                 try:
                     parsed = parse_json_response(raw)
                     answer = parsed["answer"]
@@ -339,26 +363,62 @@ def run_live(workdir, *, extractor, embedder=None, answerer=None, budget_tokens=
                     "expected_present": query.expected.casefold() in answer.casefold() if query.expected else answer.strip().casefold() == "unknown",
                     "forbidden_present": any(x.casefold() in answer.casefold() for x in query.forbidden)})
     costs.update(answer_chat_calls=len(answers), reported_answer_usage=usage)
-    report = {"mode": "live-extraction", "provider": getattr(extractor, "model", type(extractor).__name__), "model": getattr(extractor, "model", None), "embedding": getattr(embedder, "model", None), "answers": answers, "scenarios_count": len(SCENARIOS), "categories": sorted({s.category for s in SCENARIOS}), "metrics": metrics, "restart_recall": restart, "context_departure_recall": departure, "oversized": oversized, "costs": costs, "scenarios": _scenario_rows(memory, SCENARIOS, budget_tokens), "limitations": "Substring matches and valid citation IDs are recorded for review but are not treated as proof of semantic support. Live model quality and provider usage may vary."}
+    report = {
+        "mode": "live-extraction",
+        "provider": getattr(extractor, "model", type(extractor).__name__),
+        "model": getattr(extractor, "model", None),
+        "embedding": getattr(embedder, "model", None),
+        "answers": answers,
+        "scenarios_count": len(SCENARIOS),
+        "categories": sorted({s.category for s in SCENARIOS}),
+        "metrics": metrics,
+        "restart_recall": restart,
+        "context_departure_recall": departure,
+        "oversized": oversized,
+        "costs": costs,
+        "scenarios": _scenario_rows(memory, SCENARIOS, budget_tokens),
+        "limitations": (
+            "Substring matches and valid citation IDs are recorded for review "
+            "but are not treated as proof of semantic support. Live model "
+            "quality and provider usage may vary."
+        ),
+    }
     (workdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workdir", type=Path, required=True); parser.add_argument("--provider", choices=sorted(PROVIDER_REGISTRY)); parser.add_argument("--model")
-    parser.add_argument("--embedding-provider", choices=sorted(PROVIDER_REGISTRY)); parser.add_argument("--embedding-model"); parser.add_argument("--answers", action="store_true")
+    parser.add_argument("--workdir", type=Path, required=True)
+    parser.add_argument("--provider", choices=sorted(PROVIDER_REGISTRY))
+    parser.add_argument("--model")
+    parser.add_argument("--embedding-provider", choices=sorted(PROVIDER_REGISTRY))
+    parser.add_argument("--embedding-model")
+    parser.add_argument("--answers", action="store_true")
     args = parser.parse_args(argv)
-    if bool(args.provider) != bool(args.model) or bool(args.embedding_provider) != bool(args.embedding_model): parser.error("provide both a provider and its model")
-    if (args.answers or args.embedding_provider) and not args.provider: parser.error("live embeddings/answers require a live extraction provider")
-    if not args.provider: report = run_offline(args.workdir)
+    if bool(args.provider) != bool(args.model) or bool(args.embedding_provider) != bool(args.embedding_model):
+        parser.error("provide both a provider and its model")
+    if (args.answers or args.embedding_provider) and not args.provider:
+        parser.error("live embeddings/answers require a live extraction provider")
+    if not args.provider:
+        report = run_offline(args.workdir)
     else:
-        extractor = PROVIDER_REGISTRY[args.provider](model=args.model); embedder = PROVIDER_REGISTRY[args.embedding_provider](model=args.embedding_model) if args.embedding_provider else None
+        extractor = PROVIDER_REGISTRY[args.provider](model=args.model)
+        embedder = PROVIDER_REGISTRY[args.embedding_provider](model=args.embedding_model) if args.embedding_provider else None
         report = run_live(args.workdir, extractor=extractor, embedder=embedder, answerer=extractor if args.answers else None)
     print(json.dumps({k: v for k, v in report.items() if k not in ("results", "scenarios")}, indent=2))
 
 
 def validate_scenarios(scenarios):
+    """Validate the scenario dataset, raising ValueError on the first defect.
+
+    Per scenario: each episode's ``event_indices`` must be non-empty, sorted,
+    and contiguous and in range; the episodes must partition the scenario's
+    events exactly; fact assertions must carry subject/predicate/value and every
+    other assertion must carry a ``statement``; every event role must be
+    ``evidence`` or ``recall_context``; and every transition must be backed by a
+    matching fact assertion (subject, predicate, and current value).
+    """
     for scenario in scenarios:
         facts = []
         covered = []

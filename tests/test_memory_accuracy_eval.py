@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -54,10 +55,6 @@ def test_validator_rejects_noncontiguous_or_out_of_range_episode():
     )
     with pytest.raises(ValueError):
         validate_scenarios((broken,))
-
-
-from datetime import datetime, timezone
-
 
 
 def _drive_all(tmp_path):
