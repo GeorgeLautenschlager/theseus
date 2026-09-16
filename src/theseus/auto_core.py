@@ -131,7 +131,9 @@ class Autocore:
         stimulus_log: StimulusLog | None = None,
     ):
         self.name: str = name
-        self._initialize_home_directory(home_directory)
+        self._initialize_home_directory(
+            home_directory, create_stimulus_log=stimulus_log is None
+        )
         self.stimulus_log: StimulusLog = stimulus_log or StimulusLog(
             str(self.home_directory / "stimulus_log.jsonl")
         )
@@ -281,17 +283,21 @@ class Autocore:
         never sleep at all."""
         return event.actor != self.name
 
-    def _initialize_home_directory(self, home_directory: Path) -> None:
+    def _initialize_home_directory(
+        self, home_directory: Path, *, create_stimulus_log: bool = True
+    ) -> None:
         self.home_directory = home_directory
         self.home_directory.mkdir(parents=True, exist_ok=True)
-        for name in (
-            "stimulus_log.jsonl",
+        names = [
             "CONSTITUTION.md",
             "PERSONA.md",
             "GOALS.md",
             "TASKS.md",
             "CURRENT_TASK.md",
-        ):
+        ]
+        if create_stimulus_log:
+            names.append("stimulus_log.jsonl")
+        for name in names:
             (self.home_directory / name).touch(exist_ok=True)
         self._seed_config("SCHEDULE.md", SCHEDULE_SEED)
         self._seed_config("CADENCE.md", CADENCE_SEED)

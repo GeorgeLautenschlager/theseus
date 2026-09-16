@@ -99,6 +99,31 @@ def test_isolated_agent_completes_real_cognitive_turn(tmp_path, monkeypatch, cap
     assert second.core.stimulus_log.read_all() == []
 
 
+@pytest.mark.parametrize("core", ["auto", "ooda"])
+def test_external_log_is_shared_by_core_memory_and_observer_without_home_log(
+    tmp_path, core
+):
+    memory = MemorySpec(
+        "amem", model=ModelSpec("ollama", "test"),
+        embedding=ModelSpec("ollama", "embed"),
+    )
+    home = tmp_path / "state"
+    external_log = tmp_path / "logs" / "stimulus_log.jsonl"
+    agent = build_agent(spec(core=core, memory=memory), home, log_path=external_log)
+    assert agent.core.stimulus_log.path == external_log
+    assert agent.core.memory.stimulus_log is agent.core.stimulus_log
+    assert agent.observer.stimulus_log is agent.core.stimulus_log
+    assert not (home / "stimulus_log.jsonl").exists()
+
+
+def test_external_log_refuses_to_split_an_existing_home(tmp_path):
+    home = tmp_path / "state"
+    home.mkdir()
+    (home / "stimulus_log.jsonl").write_text("existing history\n")
+    with pytest.raises(ValueError, match="import_stopped_home"):
+        build_agent(spec(), home, log_path=tmp_path / "logs" / "stimulus_log.jsonl")
+
+
 @pytest.mark.parametrize("changes, message", [
     ({"models": ()}, "nonempty tuple"),
     ({"models": (ModelSpec("unknown", "test"),)}, "Unknown provider"),
@@ -236,6 +261,22 @@ def test_generated_agent_boots_as_separate_process(tmp_path):
     assert result.returncode == 0, result.stderr
     assert (home / "CONSTITUTION.md").read_text() == spec().constitution
     assert not (tmp_path / "build/state").exists()
+
+
+def test_generated_launcher_accepts_external_log_path(tmp_path):
+    launcher = assemble(spec(), tmp_path / "build")
+    home = tmp_path / "state"
+    log_path = tmp_path / "logs" / "events.jsonl"
+    result = subprocess.run(
+        [
+            sys.executable, str(launcher), "--home", str(home),
+            "--log-path", str(log_path),
+        ],
+        input="", text=True, capture_output=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert log_path.exists()
+    assert not (home / "stimulus_log.jsonl").exists()
 
 
 def test_headless_auto_runs_on_main_thread_without_chat_tools(tmp_path, monkeypatch):

@@ -123,6 +123,49 @@ The default runtime home is `state/` next to the launcher. Override it explicitl
 poetry run python build/test-agent/agent.py --home /path/to/agent-home
 ```
 
+For a portable deployment, keep private state and the append-only log on separate
+mounts:
+
+```sh
+poetry run python build/test-agent/agent.py \
+  --home /data/state --log-path /data/logs/stimulus_log.jsonl
+```
+
+The same injected log instance is used by the core, observers, context assembly,
+and memory. An external log does not create a second empty log under the home. If
+the home already has history, stop its writer and use `import_stopped_home` to
+move it into the portable layout; the launcher refuses to split existing history.
+
+## Portable deployment definitions
+
+`DeploymentSpec` wraps existing `AgentSpec` values with stable IDs and validates
+pairing, workspace membership, resources, build inputs, platform, and secret
+names. Pairing paths are derived from IDs inside the container and never copied
+from a source host:
+
+```python
+from theseus import DeploymentSpec
+
+DEPLOYMENT = DeploymentSpec(
+    id="flywheel-trial",
+    agents={"fable": FABLE_SPEC, "astra": ASTRA_SPEC},
+    peers={"fable": "astra", "astra": "fable"},
+    workspaces={"website": ("fable", "astra")},
+    platform="linux/amd64",
+)
+```
+
+`DeploymentPaths(root, DEPLOYMENT)` defines `releases/`, private
+`data/agents/<id>/{state,logs}/`, declared `data/workspaces/`, and the separate
+`control/`, `secrets/`, and `snapshots/` trees. `mounts_for(id)` exposes only the
+agent's own writable state/logs, its peer's read-only log directory, and declared
+shared workspaces. Tools keep their current working directory at `/data/state`.
+Durable data outside those mounts is rejected by `validate_managed_mounts`;
+`/tmp` and image-layer writes are ephemeral. Stable `uid`, `gid`, and
+`workspace_gid` values are part of the deployment definition so a privileged
+operator can call `apply_ownership()` when provisioning the directories. Shared
+workspaces use the setgid bit so new files retain the shared group.
+
 **On boot**, the definition reapplies `CONSTITUTION.md`, `PERSONA.md`, and
 `CADENCE.md` in that home. Runtime edits to those three files last until the next
 boot; copy intentional changes back into the definition or its source files.
