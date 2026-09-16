@@ -29,15 +29,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from theseus.assertion_metadata import ACTION_STATUSES, ATTRIBUTIONS, RECONCILIATION_DECISIONS
+from theseus.assertion_metadata import (ACTION_STATUSES, ATTRIBUTIONS, RECONCILIATION_DECISIONS,
+                                        WISDOM_PROMOTION_THRESHOLD)
 from theseus.intelligence_layer import IntelligenceLayer
 from theseus.json_utils import parse_json_response
 from theseus.knowledge_layer import KnowledgeLayer, KnowledgeRecord
 from theseus.layer_store import (LayerHit, append_record, load_lines, atomic_json,
                                  fsync_directory, store_lock, terms, valid_vector)
 from theseus.memory_layer import MemoryLayer, MemoryRecord
-from theseus.memory_prompts import (build_extraction_prompt, build_reconciliation_prompt,
-                                    extraction_json_schema, reconciliation_json_schema)
+from theseus.memory_prompts import (build_extraction_prompt, build_principle_reconciliation_prompt,
+                                    build_reconciliation_prompt, extraction_json_schema,
+                                    reconciliation_json_schema)
 from theseus.stimulus_log import StimulusLog, new_id
 from theseus.tools.recall import RECALL_TOOL_NAME
 from theseus.wisdom_layer import WisdomLayer, WisdomRecord
@@ -499,11 +501,17 @@ class MemoryModule:
         assertions, duplicates = _dedupe_assertions(accepted)
 
         fact_indices = [i for i, (_, c) in enumerate(assertions) if _route_write(c) == "knowledge"]
-        reconciliation_calls, decisions, reconciliation_usage = self._reconcile_facts(
+        fact_calls, fact_decisions, fact_usage = self._reconcile_facts(
             episode.episode_id, assertions, fact_indices)
-        reported_usage.extend(reconciliation_usage)
-        decision_counts: dict[str, int] = {}
+        principle_indices = [i for i, (_, c) in enumerate(assertions) if _route_write(c) == "wisdom"]
+        principle_calls, principle_decisions, principle_usage = self._reconcile_principles(
+            episode.episode_id, assertions, principle_indices)
+        reported_usage.extend(fact_usage)
+        reported_usage.extend(principle_usage)
+        fact_decision_counts: dict[str, int] = {}
+        principle_decision_counts: dict[str, int] = {}
         local_supersessions: dict[str, str] = {}  # id this episode already superseded -> its replacement
+        local_wisdom_records: dict[str, WisdomRecord] = {}  # records created so far this episode, not yet persisted
 
         for i, (rid, candidate) in enumerate(assertions):
             layer = _route_write(candidate)
@@ -517,7 +525,7 @@ class MemoryModule:
                 subject = candidate["subject"].strip()
                 predicate = candidate["predicate"].strip()
                 value = candidate["value"].strip()
-                decision, target_id = decisions.get(i, (None, None))
+                decision, target_id = fact_decisions.get(i, (None, None))
                 if decision is None:
                     # No reconciliation opinion for this candidate (no existing
                     # knowledge for its subject at all, or the call failed/skipped
@@ -534,7 +542,7 @@ class MemoryModule:
                         decision = "replace"
                 if target_id is not None:
                     target_id = local_supersessions.get(target_id, target_id)
-                decision_counts[decision] = decision_counts.get(decision, 0) + 1
+                fact_decision_counts[decision] = fact_decision_counts.get(decision, 0) + 1
                 supersedes = target_id if decision in ("reinforce", "replace") else None
                 contradicts = (target_id,) if decision == "contradiction" and target_id else None
                 record = KnowledgeRecord(rid, ts, subject, predicate, value,
@@ -544,17 +552,57 @@ class MemoryModule:
                 if supersedes is not None:
                     local_supersessions[supersedes] = rid
                 supersessions += int(decision == "replace")
+            elif layer == "wisdom":
+                statement = candidate["statement"].strip()
+                attribution = candidate["attribution"]
+                decision, target_id = principle_decisions.get(i, (None, None))
+                if decision is None:
+                    # No reconciliation opinion — fall back to an exact statement
+                    # match (case/whitespace-insensitive); otherwise write new.
+                    exact = next((r for r in self.wisdom.current()
+                                 if r.statement.strip().casefold() == statement.casefold()), None)
+                    decision, target_id = ("reinforce", exact.id) if exact else ("new", None)
+                if target_id is not None:
+                    target_id = local_supersessions.get(target_id, target_id)
+                # A target chased forward to a record created earlier in this same
+                # episode isn't in self.wisdom yet (writes land during
+                # _recover_pending, after the whole episode is prepared) — look
+                # there first so its accumulated support carries forward too.
+                target_record = (local_wisdom_records.get(target_id) or self.wisdom.get(target_id)
+                                 if target_id else None)
+                if decision == "reinforce" and target_record is not None:
+                    supporting = tuple(sorted(set(target_record.supporting_episode_ids) | {episode.episode_id}))
+                    if supporting == target_record.supporting_episode_ids and attribution == "inference":
+                        # Genuine no-op: this episode already counts as support and
+                        # there's no explicit-attribution promotion to apply —
+                        # writing again would only be a redundant supersession.
+                        continue
+                else:
+                    # "new" and "contradiction" start their own support fresh — an
+                    # independent or conflicting claim isn't evidence for the
+                    # record it relates to; "historical" tracks it too, though it
+                    # never becomes current regardless of status.
+                    supporting = (episode.episode_id,)
+                principle_decision_counts[decision] = principle_decision_counts.get(decision, 0) + 1
+                status = _principle_status(attribution, supporting)
+                vector = self._embed(statement) or []
+                supersedes = target_id if decision == "reinforce" else None
+                contradicts = (target_id,) if decision == "contradiction" and target_id else None
+                record = WisdomRecord(rid, ts, statement, vector, evidence_count=len(supporting),
+                                      source_episode_id=episode.episode_id,
+                                      embedding_model=self._last_embedding_model,
+                                      status=status, supporting_episode_ids=supporting,
+                                      supersedes=supersedes, reconciliation=decision,
+                                      contradicts=contradicts, **metadata)
+                if supersedes is not None:
+                    local_supersessions[supersedes] = rid
+                local_wisdom_records[rid] = record
             else:
                 vector = self._embed(candidate["statement"]) or []
-                if layer == "wisdom":
-                    record = WisdomRecord(rid, ts, candidate["statement"].strip(), vector,
-                                          source_episode_id=episode.episode_id,
-                                          embedding_model=self._last_embedding_model, **metadata)
-                else:
-                    record = MemoryRecord(rid, ts, candidate["statement"].strip(),
-                                          candidate["statement"].strip(), vector,
-                                          source_episode_id=episode.episode_id,
-                                          embedding_model=self._last_embedding_model, **metadata)
+                record = MemoryRecord(rid, ts, candidate["statement"].strip(),
+                                      candidate["statement"].strip(), vector,
+                                      source_episode_id=episode.episode_id,
+                                      embedding_model=self._last_embedding_model, **metadata)
             records[layer].append(record.to_json())
             routed[layer] = routed.get(layer, 0) + 1
         vector = self._embed(summary) or []
@@ -569,15 +617,17 @@ class MemoryModule:
         trace = {"episode_id": episode.episode_id, "candidates_extracted": extracted,
                  "routed": routed, "supersessions": supersessions, "schema_failures": len(dead),
                  "tokens_in": tokens_in, "tokens_out": tokens_out, "wall_time_s": elapsed,
-                 "token_counts_estimated": True, "chat_calls": calls + reconciliation_calls,
+                 "token_counts_estimated": True, "chat_calls": calls + fact_calls + principle_calls,
                  "embedding_calls": self._embedding_calls - before_embeddings}
         trace["oversized_events"] = len(oversized_events)
         trace["extraction_requests"] = len(units)
         trace["duplicate_assertions_dropped"] = duplicates
         trace["reported_chat_usage"] = reported_usage
         trace["reported_embedding_tokens"] = self._embedding_tokens - before_embedding_tokens
-        trace["reconciliation_calls"] = reconciliation_calls
-        trace["reconciliation_decisions"] = decision_counts
+        trace["reconciliation_calls"] = fact_calls + principle_calls
+        trace["reconciliation_decisions"] = fact_decision_counts
+        trace["wisdom_reconciliation_calls"] = principle_calls
+        trace["wisdom_reconciliation_decisions"] = principle_decision_counts
         trace["context_event_ids"] = list(episode.context_event_ids)
         atomic_json(self.memory_dir / "pending.json", {
             "episode_id": episode.episode_id, "start_id": episode.start_id, "end_id": episode.end_id,
@@ -587,6 +637,41 @@ class MemoryModule:
         return ConsolidationResult(episode.episode_id, extracted, routed,
                                    supersessions, len(dead), tokens_in, tokens_out,
                                    time.monotonic() - started)
+
+    def _run_reconciliation(self, episode_id: str, prompt: str) -> tuple[int, dict | None, list[dict]]:
+        """One reconciliation request: try each provider until one returns a
+        parseable `{"decisions": [...]}` response. Shared by fact and
+        principle reconciliation — they differ in how the prompt and target
+        context are built, not in how the call is made or how it degrades.
+
+        Never blocks the episode: a failed, unavailable, or malformed response
+        just means no decisions came back (`parsed is None`), and the caller's
+        own fallback takes over — the same outcome consolidation always had
+        before reconciliation existed. Recorded to `reconciliation_failures.jsonl`
+        for visibility, same as extraction.
+        """
+        calls = 0
+        reported_usage: list[dict] = []
+        for provider in self._model_providers:
+            try:
+                if not getattr(provider, "is_available", lambda: True)():
+                    continue
+                calls += 1
+                raw = provider.chat(prompt, json_schema=reconciliation_json_schema(),
+                                    max_tokens=self._max_output_tokens)
+                usage = getattr(provider, "last_chat_usage", None)
+                if isinstance(usage, dict):
+                    reported_usage.append({"provider": _provider_identity(provider), **usage})
+                candidate_response = parse_json_response(raw)
+                if (not isinstance(candidate_response, dict)
+                    or not isinstance(candidate_response.get("decisions"), list)):
+                    raise ValueError("reconciliation requires a decisions list")
+                return calls, candidate_response, reported_usage
+            except Exception as exc:
+                append_record(self.memory_dir / "reconciliation_failures.jsonl", json.dumps({
+                    "episode_id": episode_id, "provider": _provider_identity(provider), "error": str(exc),
+                }))
+        return calls, None, reported_usage
 
     def _reconcile_facts(
         self, episode_id: str, assertions: list[tuple[str, Any]], fact_indices: list[int],
@@ -604,13 +689,6 @@ class MemoryModule:
         `_reconciliation_context_k` of its current records as context. One
         request covers every fact candidate in the episode that has any
         context to reconcile against.
-
-        Never blocks the episode: a failed, unavailable, or malformed
-        reconciliation response leaves `decisions` empty for the candidates it
-        should have covered, and the caller's own fallback (replace an exact
-        subject+predicate match, otherwise write new) takes over — the same
-        outcome consolidation always had before this step existed. Recorded
-        to `reconciliation_failures.jsonl` for visibility, same as extraction.
         """
         context: dict[int, dict[str, KnowledgeRecord]] = {}
         targets: list[int] = []
@@ -620,58 +698,50 @@ class MemoryModule:
             if existing:
                 context[i] = {record.id: record for record in existing}
                 targets.append(i)
-
-        decisions: dict[int, tuple[str, str | None]] = {}
-        reported_usage: list[dict] = []
         if not targets:
-            return 0, decisions, reported_usage
+            return 0, {}, []
 
         candidate_payload = [assertions[i][1] for i in targets]
         existing_union = {rid: record for i in targets for rid, record in context[i].items()}
         prompt = build_reconciliation_prompt(candidate_payload, list(existing_union.values()))
-        calls = 0
-        parsed = None
-        for provider in self._model_providers:
-            try:
-                if not getattr(provider, "is_available", lambda: True)():
-                    continue
-                calls += 1
-                raw = provider.chat(prompt, json_schema=reconciliation_json_schema(),
-                                    max_tokens=self._max_output_tokens)
-                usage = getattr(provider, "last_chat_usage", None)
-                if isinstance(usage, dict):
-                    reported_usage.append({"provider": _provider_identity(provider), **usage})
-                candidate_response = parse_json_response(raw)
-                if (not isinstance(candidate_response, dict)
-                    or not isinstance(candidate_response.get("decisions"), list)):
-                    raise ValueError("reconciliation requires a decisions list")
-                parsed = candidate_response
-                break
-            except Exception as exc:
-                append_record(self.memory_dir / "reconciliation_failures.jsonl", json.dumps({
-                    "episode_id": episode_id, "provider": _provider_identity(provider), "error": str(exc),
-                }))
-        if parsed is None:
-            return calls, decisions, reported_usage
+        calls, parsed, reported_usage = self._run_reconciliation(episode_id, prompt)
+        decisions = _parse_reconciliation_decisions(parsed, targets, context) if parsed else {}
+        return calls, decisions, reported_usage
 
-        for row in parsed["decisions"]:
-            if not isinstance(row, dict):
-                continue
-            position = row.get("candidate_index")
-            if type(position) is not int or not (0 <= position < len(targets)):
-                continue
-            decision = row.get("decision")
-            if decision not in RECONCILIATION_DECISIONS:
-                continue
-            i = targets[position]
-            target_id = row.get("target_id")
-            if decision in ("new", "coexist", "historical"):
-                # target_id is informational at most for these — "historical" never
-                # supersedes or contradicts anything, it just never becomes current.
-                target_id = None
-            elif not isinstance(target_id, str) or target_id not in context[i]:
-                continue  # a decision needing a real target that doesn't resolve is dropped, falls back
-            decisions[i] = (decision, target_id)
+    def _reconcile_principles(
+        self, episode_id: str, assertions: list[tuple[str, Any]], principle_indices: list[int],
+    ) -> tuple[int, dict[int, tuple[str, str | None]], list[dict]]:
+        """Decide how each principle-kind candidate relates to the agent's
+        existing current principles — reinforcing one with independent
+        support, contradicting one, or filed as historical relative to one —
+        instead of writing every extracted generalization straight to wisdom
+        with no aggregation across episodes.
+
+        Principles have no subject/predicate key, so bounded context is the
+        top `_reconciliation_context_k` current principles by lexical
+        similarity to each candidate's statement, unioned across the
+        episode's principle candidates. No existing wisdom at all means
+        nothing to reconcile against (result is always "new"), so it costs
+        no call.
+        """
+        context: dict[int, dict[str, WisdomRecord]] = {}
+        targets: list[int] = []
+        for i in principle_indices:
+            candidate = assertions[i][1]
+            hits = self.wisdom.search(candidate["statement"], k=self._reconciliation_context_k)
+            existing = [self.wisdom.get(hit.id) for hit in hits]
+            existing = [record for record in existing if record is not None]
+            if existing:
+                context[i] = {record.id: record for record in existing}
+                targets.append(i)
+        if not targets:
+            return 0, {}, []
+
+        candidate_payload = [assertions[i][1] for i in targets]
+        existing_union = {rid: record for i in targets for rid, record in context[i].items()}
+        prompt = build_principle_reconciliation_prompt(candidate_payload, list(existing_union.values()))
+        calls, parsed, reported_usage = self._run_reconciliation(episode_id, prompt)
+        decisions = _parse_reconciliation_decisions(parsed, targets, context) if parsed else {}
         return calls, decisions, reported_usage
 
     def _episode_events(self, episode: Episode) -> list:
@@ -868,6 +938,37 @@ def _dedupe_assertions(candidates: list[tuple[str, Any]]) -> tuple[list[tuple[st
     return kept, dropped
 
 
+def _parse_reconciliation_decisions(
+    parsed: dict, targets: list[int], context: dict[int, dict[str, Any]],
+) -> dict[int, tuple[str, str | None]]:
+    """Turn a raw `{"decisions": [...]}` response into `{assertion_index:
+    (decision, target_id)}`, dropping anything malformed or pointing at a
+    record that was never actually offered as this candidate's context — a
+    hallucinated or out-of-scope target_id is silently rejected rather than
+    trusted, and that candidate falls back to its caller's own default.
+    Shared by fact and principle reconciliation."""
+    decisions: dict[int, tuple[str, str | None]] = {}
+    for row in parsed["decisions"]:
+        if not isinstance(row, dict):
+            continue
+        position = row.get("candidate_index")
+        if type(position) is not int or not (0 <= position < len(targets)):
+            continue
+        decision = row.get("decision")
+        if decision not in RECONCILIATION_DECISIONS:
+            continue
+        i = targets[position]
+        target_id = row.get("target_id")
+        if decision in ("new", "coexist", "historical"):
+            # target_id is informational at most for these — "historical" never
+            # supersedes or contradicts anything, it just never becomes current.
+            target_id = None
+        elif not isinstance(target_id, str) or target_id not in context[i]:
+            continue  # a decision needing a real target that doesn't resolve is dropped, falls back
+        decisions[i] = (decision, target_id)
+    return decisions
+
+
 def _route_write(candidate: dict) -> str:
     """Deterministic write routing from the extraction's own signals. No LLM in
     the loop for v0: facts are checkable claims, principles guide behavior,
@@ -879,6 +980,17 @@ def _route_write(candidate: dict) -> str:
     if kind == "principle":
         return "wisdom"
     return "memory"
+
+
+def _principle_status(attribution: str, supporting_episode_ids: tuple[str, ...]) -> str:
+    """The promotion policy (assertion_metadata.WISDOM_PROMOTION_THRESHOLD): an
+    explicitly attributed preference (told to the agent, or directly observed)
+    is established the moment it is written — no repetition required. An
+    inferred generalization stays provisional until independent episodes have
+    reinforced it enough times."""
+    if attribution != "inference":
+        return "established"
+    return "established" if len(supporting_episode_ids) >= WISDOM_PROMOTION_THRESHOLD else "provisional"
 
 
 def _has_triple(candidate: dict) -> bool:

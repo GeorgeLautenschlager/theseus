@@ -203,6 +203,19 @@ def test_driver_keeps_an_unresolved_contradiction_visible_and_attributed(tmp_pat
     assert current["Beta"].reconciliation == "contradiction"
 
 
+def test_driver_promotes_an_inferred_principle_after_independent_support(tmp_path):
+    extractor = ReferenceExtractor()
+    memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
+    drive_scenarios(memory, log, (_scenario("brevity-pattern"),),
+                    reference=True, extractor=extractor,
+                    start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    current = memory.wisdom.current()
+    assert len(current) == 1
+    assert current[0].status == "established"
+    assert len(current[0].supporting_episode_ids) == 2
+    assert current[0].reconciliation == "reinforce"
+
+
 def test_run_offline_confirms_the_decisive_tail_reaches_extraction(tmp_path):
     """#65: oversized evidence is chunked, not head-truncated, so the decisive
     fact at the end of a huge event reaches the model instead of being cut

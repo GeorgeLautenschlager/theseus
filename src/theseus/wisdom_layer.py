@@ -1,12 +1,20 @@
-"""WisdomLayer — generalized principles, append-only. A v0 stub on purpose.
+"""WisdomLayer — generalized principles, append-only.
 
-Records carry an `evidence_count` (how many distinct episodes supported the
-principle when it was written) and retrieval filters on it: a principle backed
-by five episodes outranks one backed by one, at equal similarity. What this
-layer deliberately does NOT have is promotion or revision logic — nothing here
-decides that a memory *becomes* wisdom over time, and no record is ever edited
-after write. That machinery is a later module; the store just needs to be able
-to hold and serve what consolidation routes here.
+Records carry `status` ("provisional" or "established") and traceable
+`supporting_episode_ids` — see assertion_metadata.WISDOM_PROMOTION_THRESHOLD
+for the promotion policy. `evidence_count` mirrors `len(supporting_episode_ids)`
+for records written under that policy; it is kept as its own field because
+older records (written before per-episode tracking existed) only ever had a
+bare count. As with KnowledgeLayer (#66), this layer does not decide *how* a
+new principle relates to what's already known — that is memory_module's
+reconciliation step, which weighs wording and independence that a similarity
+threshold alone can't. This layer only applies whatever `supersedes` the
+caller names: a record that supersedes nothing stays current alongside
+whatever else is current (an unresolved contradiction, or simply a second,
+unrelated principle), and a record marked `reconciliation="historical"` is
+kept in the append-only file but never enters the current set. No record is
+ever edited after write — a promotion from provisional to established is a
+new record superseding the old one, not a mutation.
 """
 
 from __future__ import annotations
@@ -36,6 +44,11 @@ class WisdomRecord:
     attribution: str | None = None
     reported_by: str | None = None
     action_status: str | None = None
+    status: str | None = None                       # assertion_metadata.WISDOM_STATUSES
+    supporting_episode_ids: tuple[str, ...] = ()
+    supersedes: str | None = None
+    reconciliation: str | None = None                # assertion_metadata.RECONCILIATION_DECISIONS
+    contradicts: tuple[str, ...] | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -51,6 +64,11 @@ class WisdomRecord:
                 "attribution": self.attribution,
                 "reported_by": self.reported_by,
                 "action_status": self.action_status,
+                "status": self.status,
+                "supporting_episode_ids": list(self.supporting_episode_ids),
+                "supersedes": self.supersedes,
+                "reconciliation": self.reconciliation,
+                "contradicts": self.contradicts,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -71,28 +89,66 @@ class WisdomRecord:
             attribution=d.get("attribution"),
             reported_by=d.get("reported_by"),
             action_status=d.get("action_status"),
+            status=d.get("status"),
+            supporting_episode_ids=tuple(d.get("supporting_episode_ids") or ()),
+            supersedes=d.get("supersedes"),
+            reconciliation=d.get("reconciliation"),
+            contradicts=tuple(d["contradicts"]) if d.get("contradicts") is not None else None,
         )
 
     def render(self) -> str:
-        return (f"[{self.id}] {self.statement}"
-                + render_metadata(self.support_event_ids, self.attribution,
-                                  self.reported_by, self.action_status))
+        text = f"[{self.id}] {self.statement}"
+        if self.status == "provisional":
+            text += " (provisional)"
+        text += render_metadata(self.support_event_ids, self.attribution,
+                                self.reported_by, self.action_status)
+        if self.contradicts:
+            text += f" [contradicts {', '.join(self.contradicts)}]"
+        return text
 
 
 class WisdomLayer:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = ensure_store(path)
         self._records: list[WisdomRecord] = []
+        self._by_id: dict[str, WisdomRecord] = {}
+        self._current_ids: set[str] = set()
         for line in load_lines(self.path):
-            self._records.append(WisdomRecord.from_json(line))
+            self._apply(WisdomRecord.from_json(line))
+
+    def _apply(self, record: WisdomRecord) -> None:
+        """Fold one record into the in-memory projection. File order only: a
+        record can supersede nothing but an id already on file by the time it
+        was written, so one forward pass is enough."""
+        self._records.append(record)
+        self._by_id[record.id] = record
+        if record.reconciliation != "historical":
+            self._current_ids.add(record.id)
+        if record.supersedes is not None:
+            self._current_ids.discard(record.supersedes)
 
     def add(self, record: WisdomRecord) -> WisdomRecord:
-        existing = self.get(record.id)
-        if existing is not None:
-            return existing
+        """Append `record`, durably, and apply whatever supersession it names.
+
+        This layer does not decide whether a new principle reinforces,
+        contradicts, or stands independent of an existing one, nor whether it
+        starts current or merely historical — the caller (reconciliation)
+        already decided that. Applying it here is pure bookkeeping: drop the
+        named id from the current set, and skip adding this one if historical.
+        """
+        if record.id in self._by_id:
+            return self._by_id[record.id]
+        if record.supersedes is not None and record.supersedes not in self._by_id:
+            raise ValueError(f"supersedes references unknown record {record.supersedes!r}")
         append_record(self.path, record.to_json())
-        self._records.append(record)
+        self._apply(record)
         return record
+
+    def current(self) -> list[WisdomRecord]:
+        """Current (non-superseded, non-historical) records. More than one
+        can coexist — independent principles, or an unresolved contradiction
+        that stays visible rather than picking a winner."""
+        return sorted((self._by_id[rid] for rid in self._current_ids), key=lambda r: r.ts)
 
     def query(
         self,
@@ -102,11 +158,11 @@ class WisdomLayer:
         embedding_model: str | None = None,
         embeddings: dict[str, list[float]] | None = None,
     ) -> list[LayerHit]:
-        """Top-k by cosine among records with evidence_count >= min_evidence."""
+        """Top-k by cosine among current records with evidence_count >= min_evidence."""
         if not valid_vector(embedding):
             return []
         overrides = embeddings or {}
-        eligible = [r for r in self._records if r.evidence_count >= min_evidence
+        eligible = [r for r in self.current() if r.evidence_count >= min_evidence
                     and valid_vector(overrides.get(r.id, r.embedding), len(embedding))
                     and (r.id in overrides or embedding_model is None or r.embedding_model == embedding_model)]
         if not eligible:
@@ -127,12 +183,12 @@ class WisdomLayer:
         ]
 
     def search(self, query: str, k: int = 5) -> list[LayerHit]:
-        scored = [(lexical_score(query, r.statement), r) for r in self._records]
+        scored = [(lexical_score(query, r.statement), r) for r in self.current()]
         scored.sort(key=lambda pair: (pair[0], pair[1].evidence_count, pair[1].ts), reverse=True)
         return [LayerHit(r.id, r.render(), score) for score, r in scored if score > 0][:k]
 
     def get(self, record_id: str) -> WisdomRecord | None:
-        return next((r for r in self._records if r.id == record_id), None)
+        return self._by_id.get(record_id)
 
     def read_all(self) -> list[WisdomRecord]:
         return list(self._records)

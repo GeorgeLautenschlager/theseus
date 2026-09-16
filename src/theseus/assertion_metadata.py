@@ -21,6 +21,17 @@ RECONCILIATION_DECISIONS = frozenset({
     "new", "reinforce", "replace", "coexist", "contradiction", "historical",
 })
 
+# Promotion policy for inferred principles (see memory_module._reconcile_principles):
+# an explicitly attributed preference (attribution != "inference" — the agent was
+# told, or directly observed, not guessing) is established the moment it is
+# written, no repetition required. A principle the agent itself inferred stays
+# "provisional" — visibly unconfirmed — until independent evidence from at least
+# this many distinct episodes has reinforced it. Retries of the same episode,
+# repeated recall, and duplicate extraction within one episode never advance this:
+# only a new episode id added to `supporting_episode_ids` counts.
+WISDOM_STATUSES = frozenset({"provisional", "established"})
+WISDOM_PROMOTION_THRESHOLD = 2
+
 
 def render_metadata(
     support_event_ids: tuple[str, ...] | None,
