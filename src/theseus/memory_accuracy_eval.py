@@ -2,7 +2,67 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
 from dataclasses import dataclass
+
+from theseus.memory_module import Episode, MemoryModule
+from theseus.stimulus_log import StimulusLog
+from theseus.tools.recall import RECALL_TOOL_NAME
+
+
+class ReferenceExtractor:
+    model = "ReferenceExtractor"
+
+    def __init__(self):
+        self.response = ""
+        self.last_prompt = None
+
+    def chat(self, prompt, **kwargs):
+        self.last_prompt = prompt
+        return self.response
+
+
+def build_memory(workdir, *, extractor, embedder):
+    log = StimulusLog(Path(workdir) / "stimulus.jsonl")
+    memory = MemoryModule(
+        Path(workdir) / "memory", log,
+        model_providers=[extractor],
+        embedding_providers=[embedder] if embedder else [],
+    )
+    return memory, log
+
+
+def drive_scenarios(memory, log, scenarios, *, reference, extractor, start):
+    trace = {}
+    day = 0
+    for scenario in scenarios:
+        ids = []
+        for actor, event_type, content, role in scenario.events:
+            timestamp = start + timedelta(days=day)
+            day += 1
+            if role == "recall_context":
+                content = {**content, "tool": RECALL_TOOL_NAME}
+                event = log.append(actor, "tool_result", content, ts=timestamp)
+            else:
+                event = log.append(actor, event_type, content, ts=timestamp)
+            ids.append(event.id)
+        prompts = {}
+        for index, episode_spec in enumerate(scenario.episodes):
+            episode_id = f"{scenario.name}-ep{index}"
+            if reference:
+                extractor.response = json.dumps({
+                    "summary": episode_spec.summary,
+                    "assertions": [dict(assertion) for assertion in episode_spec.assertions],
+                })
+            memory.consolidate(Episode(
+                episode_id, ids[episode_spec.event_indices[0]],
+                ids[episode_spec.event_indices[-1]],
+            ))
+            prompts[episode_id] = getattr(extractor, "last_prompt", None)
+        trace[scenario.name] = {"event_ids": ids, "episode_prompts": prompts}
+    return trace
 
 
 @dataclass(frozen=True, slots=True)

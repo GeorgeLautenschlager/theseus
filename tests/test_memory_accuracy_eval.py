@@ -45,3 +45,36 @@ def test_validator_rejects_noncontiguous_or_out_of_range_episode():
     )
     with pytest.raises(ValueError):
         validate_scenarios((broken,))
+
+
+from datetime import datetime, timezone
+
+from theseus.memory_accuracy_eval import ReferenceExtractor, build_memory, drive_scenarios
+
+
+def _scenario(name):
+    return next(s for s in SCENARIOS if s.name == name)
+
+
+def test_driver_applies_correction_across_episodes(tmp_path):
+    extractor = ReferenceExtractor()
+    memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
+    drive_scenarios(memory, log, (_scenario("atlas-deadline"),),
+                    reference=True, extractor=extractor,
+                    start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    current = memory.knowledge.current("Atlas", "prototype deadline")
+    assert current and current[0].value == "Monday"
+    assert all(r.value != "Friday" for r in memory.knowledge.current())
+
+
+def test_driver_never_promotes_recall_context_to_a_fact(tmp_path):
+    extractor = ReferenceExtractor()
+    memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
+    trace = drive_scenarios(memory, log, (_scenario("raven-code"),),
+                            reference=True, extractor=extractor,
+                            start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    values = [r.value for r in memory.knowledge.current()]
+    assert "RAVEN-42" in values
+    assert "QUAIL-7" not in values
+    prompt = next(iter(trace["raven-code"]["episode_prompts"].values()))
+    assert "QUAIL-7" in prompt
