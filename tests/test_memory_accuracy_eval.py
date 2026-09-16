@@ -18,6 +18,8 @@ from theseus.memory_accuracy_eval import (
     measure_unsupported_present,
     validate_scenarios,
     run_offline,
+    run_live,
+    main,
 )
 
 
@@ -139,3 +141,27 @@ def test_run_offline_refuses_a_nonempty_workdir(tmp_path):
     run_offline(tmp_path)
     with pytest.raises(ValueError, match="empty workdir"):
         run_offline(tmp_path)
+
+
+class _ScriptedProvider:
+    model = "scripted-live"
+    last_chat_usage = {"total_tokens": 7}
+
+    def chat(self, prompt, **kwargs):
+        if "assertions" in prompt or "consolidation" in prompt:
+            return json.dumps({"summary": "ok", "assertions": [{"kind": "fact", "subject": "Atlas", "predicate": "phase", "value": "production", "statement": "Atlas phase: production."}]})
+        return json.dumps({"answer": "production", "evidence_ids": ["invented-id"]})
+
+
+def test_run_live_stamps_mode_and_rejects_unknown_citations(tmp_path):
+    report = run_live(tmp_path, extractor=_ScriptedProvider(), answerer=_ScriptedProvider())
+    assert report["mode"] == "live-extraction"
+    assert report["costs"]["answer_chat_calls"] > 0
+    assert report["costs"]["reported_answer_usage"]
+    assert any(not answer["valid_citations"] for answer in report["answers"])
+    assert "not treated as proof" in report["limitations"]
+
+
+def test_main_offline_writes_a_report(tmp_path, capsys):
+    main(["--workdir", str(tmp_path / "run")])
+    assert json.loads((tmp_path / "run" / "report.json").read_text())["mode"] == "reference-extraction-offline"

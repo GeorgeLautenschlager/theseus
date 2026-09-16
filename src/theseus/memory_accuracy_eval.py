@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass
+
+from theseus.json_utils import parse_json_response
+from theseus.model_providers import PROVIDER_REGISTRY
 
 from theseus.memory_module import Episode, MemoryModule
 from theseus.layer_store import load_lines
@@ -230,6 +234,42 @@ def measure_unsupported_present(memory, scenarios):
     return {"violations": len(failures), "total": total, "failures": failures}
 
 
+def _evaluate(memory, log, scenarios, traces, workdir, *, budget_tokens):
+    metrics = {
+        "correct_updates": measure_correct_updates(memory, scenarios),
+        "supported_retained": measure_supported_retained(memory, scenarios, budget_tokens=budget_tokens),
+        "unsupported_present": measure_unsupported_present(memory, scenarios),
+    }
+    restarted = MemoryModule(workdir / "memory", log, model_providers=memory._model_providers, embedding_providers=[])
+    restart_recall = measure_supported_retained(restarted, scenarios, budget_tokens=budget_tokens)
+    for i in range(30):
+        log.append("agent", "decision", {"text": f"Routine housekeeping {i}"})
+    departed = MemoryModule(workdir / "memory", log, model_providers=memory._model_providers, embedding_providers=[])
+    context_departure_recall = measure_supported_retained(departed, scenarios, budget_tokens=budget_tokens)
+    prompt = next(iter(traces["atlas-token"]["episode_prompts"].values()))
+    oversized = {"decisive_tail_in_budget": bool(prompt) and "ZULU-9" in prompt,
+                 "full_event_searchable": any("ZULU-9" in record.content for record in memory.memory.read_all())}
+    trace_rows = [json.loads(line) for line in load_lines(workdir / "memory" / "traces" / "consolidation.jsonl")]
+    costs = {"extraction_chat_calls": sum(t["chat_calls"] for t in trace_rows), "answer_chat_calls": 0,
+             "embedding_calls_at_consolidation": sum(t["embedding_calls"] for t in trace_rows),
+             "embedding_calls_at_recall": memory._embedding_calls,
+             "tokens_in_estimated": sum(t["tokens_in"] for t in trace_rows),
+             "tokens_out_estimated": sum(t["tokens_out"] for t in trace_rows),
+             "reported_chat_usage": [u for t in trace_rows for u in t["reported_chat_usage"]]}
+    return metrics, restart_recall, context_departure_recall, oversized, costs
+
+
+def _scenario_rows(memory, scenarios, budget_tokens):
+    rows = []
+    for scenario in scenarios:
+        keys = {(t.subject.casefold(), t.predicate.casefold()) for t in scenario.transitions}
+        current = [f"{r.subject} {r.predicate}: {r.value}" for r in memory.knowledge.current()
+                   if (r.subject.casefold(), r.predicate.casefold()) in keys]
+        recall = {q.question: [e.text for e in memory.recall(q.question, budget_tokens).entries[:3]] for q in scenario.queries}
+        rows.append({"name": scenario.name, "category": scenario.category, "current_knowledge": current, "recall": recall})
+    return rows
+
+
 def run_offline(workdir, *, budget_tokens=2000) -> dict:
     workdir = Path(workdir)
     if workdir.exists() and any(workdir.iterdir()):
@@ -243,51 +283,9 @@ def run_offline(workdir, *, budget_tokens=2000) -> dict:
         memory, log, SCENARIOS, reference=True, extractor=extractor,
         start=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
-    metrics = {
-        "correct_updates": measure_correct_updates(memory, SCENARIOS),
-        "supported_retained": measure_supported_retained(
-            memory, SCENARIOS, budget_tokens=budget_tokens),
-        "unsupported_present": measure_unsupported_present(memory, SCENARIOS),
-    }
-
-    restarted = MemoryModule(workdir / "memory", log,
-                             model_providers=[extractor], embedding_providers=[])
-    restart_recall = measure_supported_retained(
-        restarted, SCENARIOS, budget_tokens=budget_tokens)
-    for i in range(30):
-        log.append("agent", "decision", {"text": f"Routine housekeeping {i}"})
-    departed = MemoryModule(workdir / "memory", log,
-                            model_providers=[extractor], embedding_providers=[])
-    context_departure_recall = measure_supported_retained(
-        departed, SCENARIOS, budget_tokens=budget_tokens)
-
-    prompt = next(iter(traces["atlas-token"]["episode_prompts"].values()))
-    oversized = {
-        "decisive_tail_in_budget": bool(prompt) and "ZULU-9" in prompt,
-        "full_event_searchable": any(
-            "ZULU-9" in record.content for record in memory.memory.read_all()),
-    }
-    trace_rows = [json.loads(line) for line in load_lines(
-        workdir / "memory" / "traces" / "consolidation.jsonl")]
-    costs = {
-        "extraction_chat_calls": sum(t["chat_calls"] for t in trace_rows),
-        "answer_chat_calls": 0,
-        "embedding_calls_at_consolidation": sum(t["embedding_calls"] for t in trace_rows),
-        "embedding_calls_at_recall": memory._embedding_calls,
-        "tokens_in_estimated": sum(t["tokens_in"] for t in trace_rows),
-        "tokens_out_estimated": sum(t["tokens_out"] for t in trace_rows),
-        "reported_chat_usage": [u for t in trace_rows for u in t["reported_chat_usage"]],
-    }
-    scenarios = []
-    for scenario in SCENARIOS:
-        transitions = {(t.subject.casefold(), t.predicate.casefold()) for t in scenario.transitions}
-        current = [f"{r.subject} {r.predicate}: {r.value}"
-                   for r in memory.knowledge.current()
-                   if (r.subject.casefold(), r.predicate.casefold()) in transitions]
-        recall = {q.question: [entry.text for entry in memory.recall(
-            q.question, budget_tokens).entries[:3]] for q in scenario.queries}
-        scenarios.append({"name": scenario.name, "category": scenario.category,
-                          "current_knowledge": current, "recall": recall})
+    metrics, restart_recall, context_departure_recall, oversized, costs = _evaluate(
+        memory, log, SCENARIOS, traces, workdir, budget_tokens=budget_tokens)
+    scenarios = _scenario_rows(memory, SCENARIOS, budget_tokens)
 
     report = {
         "mode": "reference-extraction-offline", "provider": None,
@@ -308,6 +306,54 @@ def run_offline(workdir, *, budget_tokens=2000) -> dict:
     }
     (workdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
+
+
+def run_live(workdir, *, extractor, embedder=None, answerer=None, budget_tokens=2000) -> dict:
+    workdir = Path(workdir)
+    if workdir.exists() and any(workdir.iterdir()):
+        raise ValueError("use an empty workdir so trials cannot reuse earlier memories")
+    workdir.mkdir(parents=True, exist_ok=True)
+    validate_scenarios(SCENARIOS)
+    memory, log = build_memory(workdir, extractor=extractor, embedder=embedder)
+    traces = drive_scenarios(memory, log, SCENARIOS, reference=False, extractor=extractor,
+                             start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    metrics, restart, departure, oversized, costs = _evaluate(memory, log, SCENARIOS, traces, workdir, budget_tokens=budget_tokens)
+    answers, usage = [], []
+    if answerer is not None:
+        for scenario in SCENARIOS:
+            for query in scenario.queries:
+                records = [{"id": e.provenance.record_id, "text": e.text} for e in memory.recall(query.question, budget_tokens).entries[:3]]
+                raw = answerer.chat("Answer from these memory records. Prefer current facts over historical reports. Plans and attempts do not establish completed actions. If unsupported, answer unknown. Return JSON with answer and evidence_ids.\n" + json.dumps({"query": query.question, "records": records}), max_tokens=512)
+                reported = getattr(answerer, "last_chat_usage", None)
+                if isinstance(reported, dict): usage.append(dict(reported))
+                try:
+                    parsed = parse_json_response(raw)
+                    answer = parsed["answer"]
+                    cited = parsed.get("evidence_ids", [])
+                    valid = isinstance(answer, str) and isinstance(cited, list) and all(i in {r["id"] for r in records} for i in cited)
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    answer, valid = "<invalid JSON answer>", False
+                answers.append({"scenario": scenario.name, "question": query.question, "answer": answer, "valid_citations": valid,
+                    "expected_present": query.expected.casefold() in answer.casefold() if query.expected else answer.strip().casefold() == "unknown",
+                    "forbidden_present": any(x.casefold() in answer.casefold() for x in query.forbidden)})
+    costs.update(answer_chat_calls=len(answers), reported_answer_usage=usage)
+    report = {"mode": "live-extraction", "provider": getattr(extractor, "model", type(extractor).__name__), "model": getattr(extractor, "model", None), "embedding": getattr(embedder, "model", None), "answers": answers, "scenarios_count": len(SCENARIOS), "categories": sorted({s.category for s in SCENARIOS}), "metrics": metrics, "restart_recall": restart, "context_departure_recall": departure, "oversized": oversized, "costs": costs, "scenarios": _scenario_rows(memory, SCENARIOS, budget_tokens), "limitations": "Substring matches and valid citation IDs are recorded for review but are not treated as proof of semantic support. Live model quality and provider usage may vary."}
+    (workdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workdir", type=Path, required=True); parser.add_argument("--provider", choices=sorted(PROVIDER_REGISTRY)); parser.add_argument("--model")
+    parser.add_argument("--embedding-provider", choices=sorted(PROVIDER_REGISTRY)); parser.add_argument("--embedding-model"); parser.add_argument("--answers", action="store_true")
+    args = parser.parse_args(argv)
+    if bool(args.provider) != bool(args.model) or bool(args.embedding_provider) != bool(args.embedding_model): parser.error("provide both a provider and its model")
+    if (args.answers or args.embedding_provider) and not args.provider: parser.error("live embeddings/answers require a live extraction provider")
+    if not args.provider: report = run_offline(args.workdir)
+    else:
+        extractor = PROVIDER_REGISTRY[args.provider](model=args.model); embedder = PROVIDER_REGISTRY[args.embedding_provider](model=args.embedding_model) if args.embedding_provider else None
+        report = run_live(args.workdir, extractor=extractor, embedder=embedder, answerer=extractor if args.answers else None)
+    print(json.dumps({k: v for k, v in report.items() if k not in ("results", "scenarios")}, indent=2))
 
 
 def validate_scenarios(scenarios):
@@ -336,3 +382,7 @@ def validate_scenarios(scenarios):
         for transition in scenario.transitions:
             if not any(f["subject"].casefold() == transition.subject.casefold() and f["predicate"].casefold() == transition.predicate.casefold() and f["value"] == transition.current_value for f in facts):
                 raise ValueError(f"{scenario.name}: transition lacks supporting fact")
+
+
+if __name__ == "__main__":
+    main()
