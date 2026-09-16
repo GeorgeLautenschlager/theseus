@@ -39,9 +39,15 @@ class Extractor:
             "summary": "Client deadline is Friday; Beta owns delivery.",
             "assertions": [
                 {"kind": "fact", "subject": "Client", "predicate": "deadline", "value": "Friday",
-                 "statement": "Client deadline is Friday."},
-                {"kind": "event", "statement": "Beta accepted the client delivery task."},
-                {"kind": "principle", "statement": "Confirm client deadlines."},
+                 "statement": "Client deadline is Friday.", "support_event_ids": ["<EVIDENCE_ID>"],
+                 "attribution": "partner_report", "reported_by": "human",
+                 "action_status": "not_applicable"},
+                {"kind": "event", "statement": "Beta accepted the client delivery task.",
+                 "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "partner_report",
+                 "reported_by": "human", "action_status": "intention"},
+                {"kind": "principle", "statement": "Confirm client deadlines.",
+                 "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "inference",
+                 "action_status": "not_applicable"},
             ],
         })
         self.prompts = []
@@ -49,7 +55,9 @@ class Extractor:
     def chat(self, prompt, **kwargs):
         self.calls += 1
         self.prompts.append(prompt)
-        return self.response
+        evidence = prompt.split("<evidence>\n", 1)[1].split("\n</evidence>", 1)[0]
+        event_id = json.loads(evidence.splitlines()[0])["id"]
+        return self.response.replace("<EVIDENCE_ID>", event_id)
 
 
 def setup(tmp_path, embedder=None, extractor=None):
@@ -117,6 +125,13 @@ def test_interrupted_commit_recovers_without_reextracting_or_duplicating(tmp_pat
     assert reopened.consolidate(episode).skipped
     assert chat.calls == 1
     assert [len(reopened.knowledge), len(reopened.memory), len(reopened.wisdom)] == [1, 2, 1]
+    for record in (reopened.knowledge.current()[0], *reopened.memory.read_all(),
+                   reopened.wisdom.read_all()[0]):
+        assert record.support_event_ids == (episode.start_id,)
+    assert reopened.knowledge.current()[0].attribution == "partner_report"
+    assert reopened.knowledge.current()[0].reported_by == "human"
+    assert reopened.memory.read_all()[0].action_status == "intention"
+    assert reopened.wisdom.read_all()[0].attribution == "inference"
     assert len(load_lines(module.memory_dir / "consolidation_ledger.jsonl")) == 1
     assert len(load_lines(module.memory_dir / "traces" / "consolidation.jsonl")) == 1
     assert not (module.memory_dir / "pending.json").exists()
@@ -208,19 +223,38 @@ def test_restart_keeps_failed_episode_boundaries_even_after_more_events(tmp_path
     assert restarted.pending_events == 1
 
 
+# Direct-observation/inference attribution only, so validity doesn't depend on
+# which actor produced the (tool-authored) oversized event.
+_CHUNK_TEST_RESPONSE = json.dumps({
+    "summary": "A large tool output was consolidated.",
+    "assertions": [
+        {"kind": "fact", "subject": "Output", "predicate": "marker", "value": "END_MARKER",
+         "statement": "The tool output contains an END_MARKER.", "support_event_ids": ["<EVIDENCE_ID>"],
+         "attribution": "direct_observation", "action_status": "confirmed_outcome"},
+        {"kind": "event", "statement": "The tool produced a large output.",
+         "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "direct_observation",
+         "action_status": "not_applicable"},
+        {"kind": "principle", "statement": "Watch for decisive markers in tool output.",
+         "support_event_ids": ["<EVIDENCE_ID>"], "attribution": "inference",
+         "action_status": "not_applicable"},
+    ],
+})
+
+
 def test_oversized_event_is_chunked_and_decisive_ending_reaches_extraction(tmp_path):
     """An event too large for one request is split into several bounded chunks
     that together cover it completely, so the decisive marker at its very end
     reaches extraction instead of being cut away by a prefix truncation — and
     identical assertions the same canned response yields per chunk collapse
     into one via dedup."""
-    module, log, _, chat = setup(tmp_path)
+    module, log, _, chat = setup(tmp_path, extractor=Extractor(_CHUNK_TEST_RESPONSE))
     event = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
     result = module.consolidate(Episode("big", event.id, event.id))
     assert len(chat.prompts) > 1
     assert all(len(p) <= module._max_input_chars for p in chat.prompts)
     assert all(event.id in p for p in chat.prompts)  # original event id carried through every chunk
     assert "END_MARKER" in chat.prompts[-1]
+    assert result.schema_failures == 0
     assert result.extracted == 3  # repeated per-chunk assertions deduped, not multiplied
     assert "END_MARKER" in module.memory.read_all()[-1].content
     assert "END_MARKER" in module.recall("END_MARKER", 2000).entries[0].text
@@ -245,6 +279,47 @@ def test_mixed_short_and_long_events_pack_short_ones_whole_and_chunk_the_long_on
     chunk_prompts = [p for p in chat.prompts if big.id in p]
     assert chunk_prompts and all(len(p) <= module._max_input_chars for p in chunk_prompts)
     assert "END_MARKER" in chunk_prompts[-1]
+
+
+def test_assertion_cannot_cite_support_from_an_event_its_own_request_never_saw(tmp_path):
+    """support_event_ids is validated against what THIS request was given, not
+    the whole episode: an oversized event pulled out of the shared pack means
+    the pack's own request never saw it, so a pack-unit assertion citing that
+    event's (real, in-episode) id is dead-lettered — while the same id cited by
+    that event's own chunk requests, which did see it, validates fine."""
+
+    class CrossCitingExtractor:
+        def __init__(self, oversized_event_id):
+            self.oversized_event_id = oversized_event_id
+            self.calls = 0
+            self.prompts = []
+
+        def chat(self, prompt, **kwargs):
+            self.calls += 1
+            self.prompts.append(prompt)
+            evidence = prompt.split("<evidence>\n", 1)[1].split("\n</evidence>", 1)[0]
+            this_id = json.loads(evidence.splitlines()[0])["id"]
+            return json.dumps({
+                "summary": "s",
+                "assertions": [{"kind": "event", "statement": "cross-cited claim",
+                               "support_event_ids": [self.oversized_event_id],
+                               "attribution": "direct_observation", "action_status": "not_applicable"}],
+            })
+
+    module, log, _, _ = setup(tmp_path)
+    first = log.append("human", "chat_message", {"message": "short one"})
+    big = log.append("tool", "tool_result", {"output": "large " * 20000 + "END_MARKER"})
+    chat = CrossCitingExtractor(big.id)
+    module._model_providers = [chat]
+
+    result = module.consolidate(Episode("cross", first.id, big.id))
+    assert chat.calls > 1  # a pack call plus at least one chunk call
+    assert result.schema_failures == 1  # the pack-unit occurrence, citing an id it never saw
+    dead = json.loads((module.memory_dir / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert "unknown support event" in dead["reason"]
+    # every chunk-unit occurrence legitimately self-cites the same id and is
+    # identical, so dedup collapses them to the one accepted record.
+    assert result.routed.get("memory", 0) == 2  # the accepted assertion + the episode summary
 
 
 def test_failed_chunk_extraction_leaves_episode_pending_and_writes_nothing(tmp_path):

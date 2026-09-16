@@ -23,6 +23,7 @@ from typing import Any
 
 import numpy as np
 
+from theseus.assertion_metadata import render_metadata
 from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines, lexical_score, valid_vector, terms
 
 
@@ -35,6 +36,10 @@ class MemoryRecord:
     embedding: list[float] = field(default_factory=list)
     source_episode_id: str = ""
     embedding_model: str = ""
+    support_event_ids: tuple[str, ...] | None = None
+    attribution: str | None = None
+    reported_by: str | None = None
+    action_status: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -46,6 +51,10 @@ class MemoryRecord:
                 "embedding": self.embedding,
                 "source_episode_id": self.source_episode_id,
                 "embedding_model": self.embedding_model,
+                "support_event_ids": self.support_event_ids,
+                "attribution": self.attribution,
+                "reported_by": self.reported_by,
+                "action_status": self.action_status,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -62,13 +71,19 @@ class MemoryRecord:
             embedding=d.get("embedding", []),
             source_episode_id=d.get("source_episode_id", ""),
             embedding_model=d.get("embedding_model", ""),
+            support_event_ids=tuple(d["support_event_ids"]) if d.get("support_event_ids") is not None else None,
+            attribution=d.get("attribution"),
+            reported_by=d.get("reported_by"),
+            action_status=d.get("action_status"),
         )
 
     def render(self) -> str:
         """What an agent reads back. `content` is provenance (raw evidence);
         rendering it would echo log text the agent may already hold — same
         discipline as MemoryNote.render."""
-        return f"[{self.id}] Episode {self.ts.isoformat()}: {self.summary}"
+        return (f"[{self.id}] Episode {self.ts.isoformat()}: {self.summary}"
+                + render_metadata(self.support_event_ids, self.attribution,
+                                  self.reported_by, self.action_status))
 
 
 def _recency_weight(ts: datetime, now: datetime, half_life_days: float) -> float:
