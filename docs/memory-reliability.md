@@ -127,3 +127,37 @@ The offline tests additionally exercise interrupted writes, failed extraction,
 embedding outages/model changes, competing module instances, and real assembled
 Auto formation plus recall after restart when the clue is absent from both
 partners' context windows. No live inference was used for this validation.
+
+### Multi-event consolidation accuracy eval
+
+`src/theseus/memory_accuracy_eval.py` is a second, parallel evaluation focused on
+**knowledge transitions across multi-event episodes** (the older
+`memory_experiment_eval.py` keeps the single-event raw-lexical retrieval control).
+It consolidates labeled multi-event scenarios — plans followed by failure or
+success, alternate-wording corrections, coexisting preferences, historical
+reports, decisive evidence at the end of an oversized event, recall repetition,
+split action/result pairs, and repeated or contradictory principles — and reports
+three metrics **separately**: correct knowledge updates, supported-claim
+retention, and unsupported claims. It also verifies recall after a cold restart
+and after the source events leave the live context window.
+
+Run it offline (deterministic, no live endpoint — reference extractions, part of
+the offline suite):
+
+```bash
+env -u VIRTUAL_ENV poetry run python -m theseus.memory_accuracy_eval --workdir /tmp/acc-run
+```
+
+Run it live (explicitly selected, never part of CI):
+
+```bash
+env -u VIRTUAL_ENV poetry run python -m theseus.memory_accuracy_eval \
+  --workdir /tmp/acc-live --provider PROVIDER --model MODEL \
+  [--embedding-provider PROVIDER --embedding-model MODEL] [--answers]
+```
+
+The offline oversized-tail scenario reports `decisive_tail_in_budget: false` — the
+decisive fact at the end of an oversized event is dropped from the extraction
+budget under the current head-first packing; that is the baseline the budget work
+(#65) will flip. Substring matches and valid citation IDs are recorded for review
+but are **not** treated as proof of semantic support.
