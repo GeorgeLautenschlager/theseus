@@ -17,6 +17,7 @@ from theseus.memory_accuracy_eval import (
     measure_supported_retained,
     measure_unsupported_present,
     validate_scenarios,
+    run_offline,
 )
 
 
@@ -111,3 +112,30 @@ def test_driver_never_promotes_recall_context_to_a_fact(tmp_path):
     assert "QUAIL-7" not in values
     prompt = next(iter(trace["raven-code"]["episode_prompts"].values()))
     assert "QUAIL-7" in prompt
+
+
+def test_run_offline_reports_separated_metrics_and_survives_restart(tmp_path):
+    report = run_offline(tmp_path)
+    assert report["mode"] == "reference-extraction-offline"
+    metrics = report["metrics"]
+    assert metrics["correct_updates"]["passed"] == metrics["correct_updates"]["total"] > 0
+    assert metrics["supported_retained"]["passed"] == metrics["supported_retained"]["total"] > 0
+    assert metrics["unsupported_present"]["violations"] == 0
+    assert report["restart_recall"]["passed"] == report["restart_recall"]["total"] > 0
+    assert report["context_departure_recall"]["passed"] == report["context_departure_recall"]["total"] > 0
+    assert report["provider"] is None
+    assert report["costs"]["answer_chat_calls"] == 0
+    assert report["costs"]["embedding_calls_at_consolidation"] == 0
+    assert json.loads((tmp_path / "report.json").read_text())["mode"] == report["mode"]
+
+
+def test_run_offline_detects_the_dropped_decisive_tail(tmp_path):
+    oversized = run_offline(tmp_path)["oversized"]
+    assert oversized["decisive_tail_in_budget"] is False
+    assert oversized["full_event_searchable"] is True
+
+
+def test_run_offline_refuses_a_nonempty_workdir(tmp_path):
+    run_offline(tmp_path)
+    with pytest.raises(ValueError, match="empty workdir"):
+        run_offline(tmp_path)

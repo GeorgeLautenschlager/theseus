@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass
 
 from theseus.memory_module import Episode, MemoryModule
+from theseus.layer_store import load_lines
 from theseus.stimulus_log import StimulusLog
 from theseus.tools.recall import RECALL_TOOL_NAME
 
@@ -227,6 +228,86 @@ def measure_unsupported_present(memory, scenarios):
             if any(fragment.casefold() in value for value in current_values):
                 failures.append({"scenario": scenario.name, "fragment": fragment})
     return {"violations": len(failures), "total": total, "failures": failures}
+
+
+def run_offline(workdir, *, budget_tokens=2000) -> dict:
+    workdir = Path(workdir)
+    if workdir.exists() and any(workdir.iterdir()):
+        raise ValueError("use an empty workdir so trials cannot reuse earlier memories")
+    workdir.mkdir(parents=True, exist_ok=True)
+    validate_scenarios(SCENARIOS)
+
+    extractor = ReferenceExtractor()
+    memory, log = build_memory(workdir, extractor=extractor, embedder=None)
+    traces = drive_scenarios(
+        memory, log, SCENARIOS, reference=True, extractor=extractor,
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    metrics = {
+        "correct_updates": measure_correct_updates(memory, SCENARIOS),
+        "supported_retained": measure_supported_retained(
+            memory, SCENARIOS, budget_tokens=budget_tokens),
+        "unsupported_present": measure_unsupported_present(memory, SCENARIOS),
+    }
+
+    restarted = MemoryModule(workdir / "memory", log,
+                             model_providers=[extractor], embedding_providers=[])
+    restart_recall = measure_supported_retained(
+        restarted, SCENARIOS, budget_tokens=budget_tokens)
+    for i in range(30):
+        log.append("agent", "decision", {"text": f"Routine housekeeping {i}"})
+    departed = MemoryModule(workdir / "memory", log,
+                            model_providers=[extractor], embedding_providers=[])
+    context_departure_recall = measure_supported_retained(
+        departed, SCENARIOS, budget_tokens=budget_tokens)
+
+    prompt = next(iter(traces["atlas-token"]["episode_prompts"].values()))
+    oversized = {
+        "decisive_tail_in_budget": bool(prompt) and "ZULU-9" in prompt,
+        "full_event_searchable": any(
+            "ZULU-9" in record.content for record in memory.memory.read_all()),
+    }
+    trace_rows = [json.loads(line) for line in load_lines(
+        workdir / "memory" / "traces" / "consolidation.jsonl")]
+    costs = {
+        "extraction_chat_calls": sum(t["chat_calls"] for t in trace_rows),
+        "answer_chat_calls": 0,
+        "embedding_calls_at_consolidation": sum(t["embedding_calls"] for t in trace_rows),
+        "embedding_calls_at_recall": memory._embedding_calls,
+        "tokens_in_estimated": sum(t["tokens_in"] for t in trace_rows),
+        "tokens_out_estimated": sum(t["tokens_out"] for t in trace_rows),
+        "reported_chat_usage": [u for t in trace_rows for u in t["reported_chat_usage"]],
+    }
+    scenarios = []
+    for scenario in SCENARIOS:
+        transitions = {(t.subject.casefold(), t.predicate.casefold()) for t in scenario.transitions}
+        current = [f"{r.subject} {r.predicate}: {r.value}"
+                   for r in memory.knowledge.current()
+                   if (r.subject.casefold(), r.predicate.casefold()) in transitions]
+        recall = {q.question: [entry.text for entry in memory.recall(
+            q.question, budget_tokens).entries[:3]] for q in scenario.queries}
+        scenarios.append({"name": scenario.name, "category": scenario.category,
+                          "current_knowledge": current, "recall": recall})
+
+    report = {
+        "mode": "reference-extraction-offline", "provider": None,
+        "model": "ReferenceExtractor", "embedding": None,
+        "scenarios_count": len(SCENARIOS),
+        "categories": sorted({s.category for s in SCENARIOS}),
+        "metrics": metrics, "restart_recall": restart_recall,
+        "context_departure_recall": context_departure_recall,
+        "oversized": oversized, "costs": costs,
+        "limitations": (
+            "Reference extractions are labels not model output; exact-text checks are "
+            "retrieval diagnostics not semantic correctness; the oversized-tail scenario "
+            "shows the decisive fact is dropped from the extraction budget under the current "
+            "head-first packing (see #65) and the reference label includes it only because it "
+            "is scripted; reported usage may omit failed requests and provider retries; live "
+            "semantic accuracy requires run_live with an explicit model."),
+        "scenarios": scenarios,
+    }
+    (workdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
 
 
 def validate_scenarios(scenarios):
