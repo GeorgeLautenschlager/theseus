@@ -173,6 +173,62 @@ SCENARIOS = (
 )
 
 
+def measure_correct_updates(memory, scenarios):
+    failures = []
+    total = passed = 0
+    for scenario in scenarios:
+        for transition in scenario.transitions:
+            total += 1
+            current = memory.knowledge.current(transition.subject, transition.predicate)
+            values = [record.value for record in current]
+            expected = transition.current_value.casefold()
+            superseded = {value.casefold() for value in transition.superseded_values}
+            if values and values[0].casefold() == expected and not superseded.intersection(value.casefold() for value in values):
+                passed += 1
+            else:
+                failures.append({
+                    "scenario": scenario.name,
+                    "subject": transition.subject,
+                    "predicate": transition.predicate,
+                    "expected": transition.current_value,
+                    "found": values,
+                })
+    return {"passed": passed, "total": total, "failures": failures}
+
+
+def measure_supported_retained(memory, scenarios, *, budget_tokens=2000):
+    failures = []
+    total = passed = 0
+    for scenario in scenarios:
+        text = " ".join(entry.text for query in scenario.queries
+                          for entry in memory.recall(query.question, budget_tokens).entries)
+        text += " " + " ".join(record.value for record in memory.knowledge.current())
+        folded = text.casefold()
+        for fragment in scenario.supported:
+            total += 1
+            if fragment.casefold() in folded:
+                passed += 1
+            else:
+                failures.append({"scenario": scenario.name, "fragment": fragment})
+    return {"passed": passed, "total": total, "failures": failures}
+
+
+def measure_unsupported_present(memory, scenarios):
+    failures = []
+    total = 0
+    for scenario in scenarios:
+        subjects = {transition.subject.casefold() for transition in scenario.transitions}
+        records = memory.knowledge.current()
+        if subjects:
+            records = [record for record in records if record.subject.casefold() in subjects]
+        current_values = [record.value.casefold() for record in records]
+        for fragment in scenario.unsupported:
+            total += 1
+            if any(fragment.casefold() in value for value in current_values):
+                failures.append({"scenario": scenario.name, "fragment": fragment})
+    return {"violations": len(failures), "total": total, "failures": failures}
+
+
 def validate_scenarios(scenarios):
     for scenario in scenarios:
         facts = []

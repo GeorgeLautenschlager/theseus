@@ -10,6 +10,12 @@ from theseus.memory_accuracy_eval import (
     EpisodeSpec,
     Scenario,
     Transition,
+    ReferenceExtractor,
+    build_memory,
+    drive_scenarios,
+    measure_correct_updates,
+    measure_supported_retained,
+    measure_unsupported_present,
     validate_scenarios,
 )
 
@@ -49,7 +55,34 @@ def test_validator_rejects_noncontiguous_or_out_of_range_episode():
 
 from datetime import datetime, timezone
 
-from theseus.memory_accuracy_eval import ReferenceExtractor, build_memory, drive_scenarios
+
+
+def _drive_all(tmp_path):
+    extractor = ReferenceExtractor()
+    memory, log = build_memory(tmp_path, extractor=extractor, embedder=None)
+    drive_scenarios(memory, log, SCENARIOS, reference=True, extractor=extractor,
+                    start=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    return memory, log
+
+
+def test_metrics_all_pass_on_the_reference_run(tmp_path):
+    memory, _ = _drive_all(tmp_path)
+    updates = measure_correct_updates(memory, SCENARIOS)
+    retained = measure_supported_retained(memory, SCENARIOS, budget_tokens=2000)
+    unsupported = measure_unsupported_present(memory, SCENARIOS)
+    assert updates["total"] > 0 and updates["passed"] == updates["total"]
+    assert retained["total"] > 0 and retained["passed"] == retained["total"]
+    assert unsupported["total"] > 0 and unsupported["violations"] == 0
+
+
+def test_unsupported_metric_flags_a_leaked_current_fact(tmp_path):
+    from theseus.knowledge_layer import KnowledgeRecord
+    memory, _ = _drive_all(tmp_path)
+    memory.knowledge.add(KnowledgeRecord(
+        "leak", datetime(2030, 1, 1, tzinfo=timezone.utc), "Atlas", "phase", "pilot"))
+    unsupported = measure_unsupported_present(memory, SCENARIOS)
+    assert unsupported["violations"] >= 1
+    assert any("pilot" in v["fragment"] for v in unsupported["failures"])
 
 
 def _scenario(name):
