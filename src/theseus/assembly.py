@@ -264,7 +264,9 @@ class AssembledAgent:
                     break
 
 
-def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
+def build_agent(
+    spec: AgentSpec, home: Path, log_path: Path | None = None
+) -> AssembledAgent:
     """Compose without starting loops, listeners, or making model requests.
 
     Identity and cadence are assembler-owned and reapplied on boot. Everything
@@ -272,6 +274,16 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
     """
     spec.validate()
     home = Path(home).resolve()
+    if log_path is None:
+        resolved_log_path = home / "stimulus_log.jsonl"
+    else:
+        resolved_log_path = Path(log_path).resolve()
+        legacy_log = home / "stimulus_log.jsonl"
+        if legacy_log.exists() and legacy_log.stat().st_size:
+            raise ValueError(
+                "home already contains a stimulus log; use import_stopped_home "
+                "before selecting an external log path"
+            )
     # Construct OODA providers before touching the home (e.g. missing API keys).
     providers = [_provider(model) for model in spec.models] if spec.core == "ooda" else []
     home.mkdir(parents=True, exist_ok=True)
@@ -280,17 +292,16 @@ def build_agent(spec: AgentSpec, home: Path) -> AssembledAgent:
                           ("CADENCE.md", spec.cadence_text())):
         _atomic_write(home / name, content)
     tools = {name: tool for name, tool in all_tools(cwd=home).items() if name in spec.tools}
-    log_path = home / "stimulus_log.jsonl"
     if spec.pairing is not None:
         peer_path = Path(spec.pairing.peer_log_path)
         if not peer_path.is_absolute():
             peer_path = home / peer_path
         log = PairedStimulusLog(
-            log_path, peer_path, peer_name=spec.pairing.peer_name,
+            resolved_log_path, peer_path, peer_name=spec.pairing.peer_name,
             peer_context_fraction=spec.pairing.peer_context_fraction,
         )
     else:
-        log = StimulusLog(log_path)
+        log = StimulusLog(resolved_log_path)
     if spec.core == "auto":
         core = Autocore(name=spec.name, home_directory=home, tools=tools, stimulus_log=log)
         core.context_assembler.window_size = spec.window_size
@@ -410,6 +421,10 @@ def assemble(spec: AgentSpec, output: Path) -> Path:
 def run_agent(spec: AgentSpec, default_home: Path) -> None:
     parser = argparse.ArgumentParser(description=f"Run {spec.name}")
     parser.add_argument("--home", type=Path, default=default_home)
+    parser.add_argument(
+        "--log-path", type=Path,
+        help="Stimulus log location (default: <home>/stimulus_log.jsonl)",
+    )
     parser.add_argument("--check", action="store_true", help="Validate without creating state or starting the agent")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
@@ -417,7 +432,10 @@ def run_agent(spec: AgentSpec, default_home: Path) -> None:
     if args.check:
         print(f"{spec.name}: configuration valid")
         return
-    build_agent(spec, args.home).run()
+    from theseus.deployment_store import runtime_lock
+
+    with runtime_lock(args.home):
+        build_agent(spec, args.home, log_path=args.log_path).run()
 
 
 def main() -> None:
@@ -432,3 +450,7 @@ def main() -> None:
         print(assemble(spec, args.output))
     except (ValueError, TypeError, OSError, ImportError, AttributeError, SyntaxError) as exc:
         parser.exit(1, f"assemble: {exc}\n")
+
+
+# Re-export the deployment vocabulary beside AgentSpec for definition authors.
+from theseus.deployment import DeploymentSpec, ResourceSpec  # noqa: E402

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from theseus.assembly import AgentSpec, InterfaceSpec, MemorySpec, ModelSpec, PairingSpec, build_agent
+from theseus.assembly import (
+    AgentSpec, DeploymentSpec, InterfaceSpec, MemorySpec, ModelSpec, PairingSpec,
+    ResourceSpec, build_agent,
+)
+from theseus.deployment_store import ContainerMount, DeploymentPaths, import_stopped_home
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_reports import (
@@ -63,6 +67,11 @@ from theseus.tools import (
 
 __all__ = [
     "AgentSpec",
+    "DeploymentSpec",
+    "ResourceSpec",
+    "DeploymentPaths",
+    "ContainerMount",
+    "import_stopped_home",
     "InterfaceSpec",
     "MemorySpec",
     "ModelSpec",
