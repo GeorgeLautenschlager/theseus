@@ -166,6 +166,58 @@ Durable data outside those mounts is rejected by `validate_managed_mounts`;
 operator can call `apply_ownership()` when provisioning the directories. Shared
 workspaces use the setgid bit so new files retain the shared group.
 
+## Docker Compose bundles
+
+Compose assembly is optional. The ordinary `SPEC` to `agent.py` command remains
+the default. A managed definition exports `DEPLOYMENT`, then selects the Compose
+target explicitly:
+
+```sh
+poetry run python -m theseus.assemble deployment.py \
+  --target compose --output build/flywheel
+```
+
+The complete bundle contains `compose.yaml`, `Dockerfile`, `deployment.json`,
+one launcher per agent, `requirements.lock`, the exact Theseus runtime source,
+declared custom build inputs, `.dockerignore`, `secrets.example`, and operating
+instructions. Assembly executes trusted definition code but makes no network
+calls, creates no runtime state, and starts no agent. It stages and validates the
+whole bundle before publication. A manifest protects every generated file from
+being overwritten after manual edits; unrelated state and credential files in an
+existing generated directory are retained.
+
+Managed v1 agents must use Auto with Telegram or a headless interface. Terminal,
+web, and OODA definitions still work with ordinary Python assembly and are
+rejected only for the managed target. Telegram token names and hosted-provider
+key names must appear in `DeploymentSpec.secrets`. Values are never serialized.
+At runtime the generated entrypoint reads each named `/run/secrets/<name>` file
+into the provider's existing environment variable without printing its value.
+
+The base runtime contains Python and Theseus. A `coding-browser` runtime requires
+an explicit base image and an `installed_tools` tuple; the Docker build verifies
+each declared executable. Custom Python components must be relative regular files
+listed in `build_inputs`. Missing files, symlinks, parent traversal, and `.env`
+inputs are rejected. The Docker context allowlist excludes the surrounding
+checkout, live state, credentials, and unrelated files.
+
+Building is a separate operation and does not start Compose or the cognitive loop:
+
+```sh
+poetry run python -m theseus.build_deployment build/flywheel
+# or, after installation:
+theseus-build build/flywheel
+```
+
+The build pulls and identifies the declared base, builds the image, and writes
+`deployment.lock.json` with the resolved specification hash, Theseus version and
+commit, platform, exact base and runtime image content IDs/digests, custom input
+hashes, and the image reference/archive name used by later R2 export. Reassembly
+removes a stale generated lock so every release must be built and identified
+again. Compose runs with init, fixed non-root UID/GID, CPU and memory limits,
+read-only image filesystems, an ephemeral `/tmp`, no Docker socket, and only the
+stable mounts declared by the deployment. Telegram/headless services publish no
+application ports.
+
 **On boot**, the definition reapplies `CONSTITUTION.md`, `PERSONA.md`, and
 `CADENCE.md` in that home. Runtime edits to those three files last until the next
 boot; copy intentional changes back into the definition or its source files.
