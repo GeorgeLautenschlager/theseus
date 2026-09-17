@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -64,11 +65,17 @@ class TelegramBotAPI:
         *,
         client: Any | None = None,
         request_timeout: float = 30.0,
+        base_url: str | None = None,
     ) -> None:
         if not isinstance(bot_token, str) or not bot_token.strip():
             raise ValueError("Telegram bot token must be nonempty")
         bot_token = bot_token.strip()
-        self.__base_url = f"https://api.telegram.org/bot{bot_token}"
+        api_root = base_url or os.environ.get(
+            "TELEGRAM_API_BASE_URL", "https://api.telegram.org"
+        )
+        if not isinstance(api_root, str) or not api_root.strip():
+            raise ValueError("Telegram API base URL must be nonempty")
+        self.__base_url = f"{api_root.rstrip('/')}/bot{bot_token}"
         self._log_redaction = _BotTokenRedaction(bot_token)
         # httpx logs complete request URLs at INFO, and httpcore does so at DEBUG. Bot API
         # authentication lives in the URL path, so ordinary application logging would

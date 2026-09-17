@@ -1,10 +1,15 @@
-.PHONY: test debug release
+.PHONY: test debug container-acceptance release
 
 test:
 	poetry run pytest -q $(or $(TESTS),tests/) $(ARGS)
 
 debug:
 	poetry run pytest -s $(or $(TESTS),tests/) $(ARGS)
+
+# Opt-in locally because this builds/runs real containers. Release invokes it as
+# part of the verification gate unless all tests are explicitly skipped.
+container-acceptance:
+	THESEUS_RUN_CONTAINER_ACCEPTANCE=1 poetry run pytest -q tests/test_container_acceptance.py
 
 # Cut a release: verify, bump the version, commit, tag, and push (current branch + tag).
 # Run it from an up-to-date main.
@@ -15,7 +20,7 @@ release:
 	@echo "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$' || { echo "VERSION must be X.Y.Z (got '$(VERSION)')"; exit 1; }
 	@test -z "$$(git status --porcelain)" || { echo "Working tree is dirty -- commit or stash first."; exit 1; }
 	@if git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null; then echo "Tag v$(VERSION) already exists."; exit 1; fi
-	@if [ -z "$(SKIP_TESTS)" ]; then poetry run pytest -q tests/ --ignore=tests/test_fact_retention.py; else echo "Skipping tests (SKIP_TESTS set)."; fi
+	@if [ -z "$(SKIP_TESTS)" ]; then poetry run pytest -q tests/ --ignore=tests/test_fact_retention.py && $(MAKE) container-acceptance; else echo "Skipping tests (SKIP_TESTS set)."; fi
 	poetry version $(VERSION)
 	git add pyproject.toml
 	git commit -m "Release $(VERSION)"

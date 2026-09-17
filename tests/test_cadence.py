@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, time
+import json
 
 from theseus.cadence import DEFAULT_TICK_SECONDS, Cadence, CadenceRule
 from theseus.model_providers import PROVIDER_REGISTRY
+from theseus.model_providers.fixture_provider import FixtureProvider
 from theseus.model_providers.claude_provider import ClaudeProvider
 from theseus.model_providers.llama_cpp_provider import LlamaCppProvider
 from theseus.model_providers.lm_studio_provider import LmStudioProvider
@@ -125,12 +127,29 @@ def test_lint_flags_rule_looking_lines_only():
 def test_provider_registry_maps_short_names():
     assert PROVIDER_REGISTRY == {
         "claude": ClaudeProvider,
+        "fixture": FixtureProvider,
         "llama_cpp": LlamaCppProvider,
         "lm_studio": LmStudioProvider,
         "ollama": OllamaProvider,
         "openrouter": OpenRouterProvider,
         "unsloth": UnslothProvider,
     }
+
+
+def test_fixture_provider_is_explicit_network_free_and_auditable(tmp_path, monkeypatch):
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("THESEUS_FIXTURE_PROVIDER_LOG", str(log))
+    disabled = FixtureProvider("acceptance")
+    assert disabled.is_available() is False
+
+    monkeypatch.setenv("THESEUS_ENABLE_FIXTURE_PROVIDER", "1")
+    provider = FixtureProvider("acceptance")
+    assert provider.is_available() is True
+    assert provider.complete_with_tools([]).tool_calls == ()
+    assert provider.embed("test") == [1.0, 0.0]
+    assert [json.loads(line)["method"] for line in log.read_text().splitlines()] == [
+        "complete_with_tools", "embed"
+    ]
 
 
 class TestContextDeclaration:

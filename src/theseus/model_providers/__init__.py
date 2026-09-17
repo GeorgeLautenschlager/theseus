@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from theseus.model_providers.claude_provider import ClaudeProvider
+from theseus.model_providers.fixture_provider import FixtureProvider
 from theseus.model_providers.llama_cpp_provider import LlamaCppProvider
 from theseus.model_providers.lm_studio_provider import LmStudioProvider
 from theseus.model_providers.model_provider import ModelProvider
@@ -13,6 +14,7 @@ from theseus.model_providers.unsloth_provider import UnslothProvider
 # provider's own defaults and environment variables.
 PROVIDER_REGISTRY: dict[str, type[ModelProvider]] = {
     "claude": ClaudeProvider,
+    "fixture": FixtureProvider,
     "llama_cpp": LlamaCppProvider,
     "lm_studio": LmStudioProvider,
     "ollama": OllamaProvider,
@@ -22,6 +24,7 @@ PROVIDER_REGISTRY: dict[str, type[ModelProvider]] = {
 
 __all__ = [
     "ClaudeProvider",
+    "FixtureProvider",
     "LlamaCppProvider",
     "LmStudioProvider",
     "ModelProvider",
