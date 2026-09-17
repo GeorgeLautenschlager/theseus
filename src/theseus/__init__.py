@@ -23,7 +23,12 @@ from theseus.deployment_snapshot import (
     validate_state_copy,
 )
 from theseus.backup_store import LocalObjectStore, ObjectInfo, ObjectStore, S3ObjectStore
-from theseus.remote_backup import BackupResult, DownloadedBackup, RemoteBackups
+from theseus.remote_backup import (
+    BackupResult,
+    DownloadedBackup,
+    ReleaseArtifacts,
+    RemoteBackups,
+)
 from theseus.host_provisioner import (
     DigitalOceanAPI,
     HostProfile,
@@ -32,6 +37,17 @@ from theseus.host_provisioner import (
     ProvisionPreview,
     ProvisionResult,
     cloud_init,
+)
+from theseus.migration import (
+    HostInspection,
+    HostUnreachable,
+    LocalMigrationSource,
+    LocalMigrationTarget,
+    MigrationCoordinator,
+    MigrationResult,
+    SSHMigrationTarget,
+    SnapshotEvidence,
+    UnknownActivation,
 )
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
@@ -120,6 +136,7 @@ __all__ = [
     "S3ObjectStore",
     "BackupResult",
     "DownloadedBackup",
+    "ReleaseArtifacts",
     "RemoteBackups",
     "DigitalOceanAPI",
     "HostProfile",
@@ -128,6 +145,15 @@ __all__ = [
     "ProvisionPreview",
     "ProvisionResult",
     "cloud_init",
+    "HostInspection",
+    "HostUnreachable",
+    "LocalMigrationSource",
+    "LocalMigrationTarget",
+    "MigrationCoordinator",
+    "MigrationResult",
+    "SSHMigrationTarget",
+    "SnapshotEvidence",
+    "UnknownActivation",
     "InterfaceSpec",
     "MemorySpec",
     "ModelSpec",

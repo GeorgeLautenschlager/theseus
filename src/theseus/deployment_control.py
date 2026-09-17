@@ -18,6 +18,7 @@ ACTIVATION_FILE = "activation.json"
 OPERATION_FILE = "operation.json"
 OPERATION_LOCK = "operation.lock"
 LIFECYCLE_STATUS = "lifecycle-status.json"
+MIGRATION_FILE = "migration.json"
 ACTIVATION_STATES = ("active", "suspended", "retired")
 OPERATION_KINDS = ("start", "stop", "backup", "restore", "migration")
 TERMINAL_PHASES = ("completed", "failed")
@@ -306,6 +307,9 @@ class DeploymentController:
             "activation": asdict(activation) if activation is not None else None,
             "operation": asdict(operation) if operation is not None else None,
             "running_services": list(self.running_services()),
+            "lifecycle": {
+                agent_id: self._lifecycle(agent_id) for agent_id in self.agent_ids
+            },
         }
 
     def interrupted_operation(self) -> OperationRecord | None:
@@ -343,6 +347,7 @@ class DeploymentController:
 
     def start(self, services: Sequence[str] = ()) -> OperationRecord:
         with operation_lock(self.control_dir):
+            self._require_migration_start_permission()
             interrupted = self.interrupted_operation()
             if interrupted is not None:
                 raise RuntimeError(
@@ -376,6 +381,61 @@ class DeploymentController:
                     operation.operation_id, "failed", detail=f"{type(exc).__name__}: {exc}"
                 )
                 raise
+
+    def resume_start(self) -> OperationRecord:
+        """Reconcile an interrupted target start after durable migration intent."""
+        with operation_lock(self.control_dir):
+            migration = self._require_migration_start_permission()
+            if migration is None or migration.get("host_role") != "target":
+                raise PermissionError("start recovery requires target migration intent")
+            operation = self.interrupted_operation()
+            if operation is None or operation.kind != "start":
+                raise RuntimeError("there is no interrupted start to resume")
+            if operation.phase not in ("started", "preflight", "starting"):
+                raise RuntimeError(
+                    f"interrupted start phase {operation.phase!r} cannot be resumed"
+                )
+            current = self.activation.read()
+            if current is not None and current.state == "retired":
+                raise PermissionError("retired deployments require an explicit recovery procedure")
+            missing = tuple(
+                agent_id
+                for agent_id in self.agent_ids
+                if agent_id not in self.running_services()
+            )
+            try:
+                for service in missing:
+                    self._preflight_service(service)
+                self.activation.set("active", reason=f"resume start {operation.operation_id}")
+                self.journal.transition(operation.operation_id, "starting")
+                self._compose("up", "-d", *missing)
+                return self.journal.transition(operation.operation_id, "completed")
+            except Exception as exc:
+                try:
+                    self.activation.set("suspended", reason="resumed start failed")
+                except Exception:
+                    pass
+                self.journal.transition(
+                    operation.operation_id, "failed", detail=f"{type(exc).__name__}: {exc}"
+                )
+                raise
+
+    def _require_migration_start_permission(self) -> dict[str, Any] | None:
+        migration_path = self.control_dir / MIGRATION_FILE
+        if not migration_path.is_file():
+            return None
+        migration = json.loads(migration_path.read_text(encoding="utf-8"))
+        role = migration.get("host_role")
+        phase = migration.get("phase")
+        if role == "source" and phase not in ("source-recovery-intent", "recovered"):
+            raise PermissionError(f"source start is blocked by migration phase {phase!r}")
+        if role == "target" and phase not in (
+            "target-activation-intent",
+            "target-starting",
+            "completed",
+        ):
+            raise PermissionError(f"target start is blocked by migration phase {phase!r}")
+        return migration
 
     def stop(self, *, timeout_seconds: int = 30) -> OperationRecord:
         if type(timeout_seconds) is not int or timeout_seconds <= 0:
