@@ -67,3 +67,5 @@ its own `memory/`; the peer window does not import durable memories.
 
 See [memory reliability](memory-reliability.md) for scheduling, recovery, observed
 benchmark misses, and the live-model validation still needed for the experiment.
+For the real container release gate, backup/migration verification, and operator
+runbook, see [paired deployment acceptance](container-acceptance.md).

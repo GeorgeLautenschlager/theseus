@@ -12,9 +12,10 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Iterator, Protocol, Sequence
 
 
 _FINAL_INBOX_STATES = ("processed", "ignored")
@@ -127,13 +128,18 @@ class DeliveryJournal:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=30.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA busy_timeout=30000")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def preflight(self) -> None:
         """Validate local SQLite state without mutating queue state or dispatching."""

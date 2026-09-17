@@ -262,3 +262,5 @@ agent.core.orient_and_wait()
 
 `tests/test_assembly.py` exercises the full observer → core → reply path with an
 offline fake provider, as well as generated-process boot and state preservation.
+The real paired-container release gate and complete operator workflow are in
+[paired deployment acceptance](container-acceptance.md).

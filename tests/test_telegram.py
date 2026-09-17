@@ -76,6 +76,15 @@ def observer(tmp_path, api, callback=lambda: None, *, users=(10,), chats=(20,)):
     )
 
 
+def test_delivery_journal_closes_short_lived_sqlite_connections(tmp_path):
+    path = tmp_path / "delivery.sqlite3"
+    journal = DeliveryJournal(path)
+    journal.store_incoming("telegram", [("1", update(1))], now=1.0)
+
+    assert not path.with_name(path.name + "-wal").exists()
+    assert not path.with_name(path.name + "-shm").exists()
+
+
 def test_stop_during_poll_persists_returned_batch_without_polling_again(tmp_path):
     entered = threading.Event()
     release = threading.Event()
@@ -241,6 +250,24 @@ def test_bot_token_is_redacted_from_http_client_logs(caplog):
         )
     assert token not in caplog.text
     assert "<telegram-token>" in caplog.text
+
+
+def test_api_base_url_can_target_an_explicit_fixture(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True, "result": []}
+
+    class Client:
+        def post(self, url, **kwargs):
+            assert url == "http://telegram-fixture:8080/bottest-token/getUpdates"
+            return Response()
+
+    monkeypatch.setenv("TELEGRAM_API_BASE_URL", "http://telegram-fixture:8080/")
+    assert TelegramBotAPI("test-token", client=Client()).get_updates(
+        offset=None, timeout=1
+    ) == []
 
 
 def telegram_spec():
