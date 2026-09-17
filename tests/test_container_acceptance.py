@@ -419,10 +419,23 @@ def test_root_owned_activation_is_readable_but_not_writable_by_non_root_agent(tm
     _prepare(paths, "http://127.0.0.1:9")
     controller = _controller(paths.root, bundle, project)
 
+    def root_activation(state: str) -> None:
+        script = f"""
+from pathlib import Path
+from theseus.deployment_control import ActivationStore
+ActivationStore(Path('/host/control'), 'paired-acceptance').set(
+    {state!r}, reason='root acceptance operator'
+)
+"""
+        _run([
+            "docker", "run", "--rm", "--user", "0:0",
+            "-v", f"{paths.root}:/host", "--entrypoint", "python",
+            image_tag, "-c", script,
+        ])
+
     root_setup = f"""
 import os
 from pathlib import Path
-from theseus.deployment_control import ActivationStore
 root = Path('/host')
 for agent_id in {AGENTS!r}:
     for path in (root / 'data' / 'agents' / agent_id, root / 'data' / 'agents' / agent_id / 'state', root / 'data' / 'agents' / agent_id / 'logs'):
@@ -437,7 +450,6 @@ for secret in (root / 'secrets').iterdir():
 control = root / 'control'
 os.chown(control, 0, {agent_gid})
 control.chmod(0o2750)
-ActivationStore(control, 'paired-acceptance').set('active', reason='root acceptance operator')
     """
 
     try:
@@ -446,6 +458,7 @@ ActivationStore(control, 'paired-acceptance').set('active', reason='root accepta
             "-v", f"{paths.root}:/host", "--entrypoint", "python",
             image_tag, "-c", root_setup,
         ])
+        root_activation("active")
         for agent_id in AGENTS:
             controller._preflight_service(agent_id)
         assert paths.control.stat().st_mode & 0o7777 == 0o2750
@@ -470,7 +483,27 @@ except OSError:
     pass
 else:
     raise AssertionError('agent modified host activation state')
+replacement = Path('/tmp/replacement-activation.json')
+replacement.write_text('{{}}')
+try:
+    replacement.replace(path)
+except OSError:
+    pass
+else:
+    raise AssertionError('agent replaced host activation state')
 """
+        for agent_id in AGENTS:
+            controller._compose("exec", "-T", agent_id, "python", "-c", probe)
+
+        controller._compose("stop", "--timeout", "10")
+        _wait("stopped root-operated agents", lambda: controller.running_services() == ())
+        root_activation("suspended")
+        root_activation("active")
+        controller._compose("up", "-d")
+        _wait(
+            "agents after root activation replacement",
+            lambda: set(controller.running_services()) == set(AGENTS),
+        )
         for agent_id in AGENTS:
             controller._compose("exec", "-T", agent_id, "python", "-c", probe)
     finally:
