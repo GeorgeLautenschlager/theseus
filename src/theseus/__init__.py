@@ -6,6 +6,16 @@ from theseus.assembly import (
 )
 from theseus.deployment_store import ContainerMount, DeploymentPaths, import_stopped_home
 from theseus.deployment_bundle import assemble_compose, build_bundle
+from theseus.deployment_control import (
+    ActivationRecord,
+    ActivationStore,
+    DeploymentController,
+    LifecycleRecord,
+    LifecycleStatusStore,
+    OperationJournal,
+    OperationRecord,
+    operation_lock,
+)
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_reports import (
@@ -75,6 +85,14 @@ __all__ = [
     "import_stopped_home",
     "assemble_compose",
     "build_bundle",
+    "ActivationRecord",
+    "ActivationStore",
+    "DeploymentController",
+    "LifecycleRecord",
+    "LifecycleStatusStore",
+    "OperationJournal",
+    "OperationRecord",
+    "operation_lock",
     "InterfaceSpec",
     "MemorySpec",
     "ModelSpec",

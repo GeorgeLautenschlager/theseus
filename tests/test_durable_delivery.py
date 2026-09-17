@@ -59,6 +59,27 @@ def test_outbox_is_committed_before_sender_sees_it_and_records_receipt(tmp_path)
     assert delivered.delivered_at is not None
 
 
+def test_shutdown_finishes_current_send_but_starts_no_next_delivery(tmp_path):
+    journal = DeliveryJournal(tmp_path / "delivery.sqlite3")
+    holder = {}
+
+    class StopAfterFirst:
+        calls = []
+
+        def send(self, item):
+            self.calls.append(item)
+            holder["outbox"].request_stop()
+            return DeliveryOutcome.delivered("receipt")
+
+    sender = StopAfterFirst()
+    outbox = DurableOutbox(journal, "example", sender)
+    holder["outbox"] = outbox
+    items = outbox.enqueue("destination", [{"part": 1}, {"part": 2}])
+    assert outbox.drain() == 1
+    assert len(sender.calls) == 1
+    assert [item.status for item in outbox.group(items[0].group_id)] == ["delivered", "pending"]
+
+
 def test_rate_limit_defers_head_without_overtaking(tmp_path):
     clock = Clock()
     sender = Sender([

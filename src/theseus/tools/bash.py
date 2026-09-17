@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,8 @@ class BashTool:
 
     def __init__(self, cwd: str | Path | None = None) -> None:
         self.cwd = Path(cwd) if cwd else Path.cwd()
+        self._groups: set[int] = set()
+        self._groups_lock = threading.Lock()
 
     def execute(self, command: str, timeout: int | None = None) -> ToolResult:
         seconds = timeout if timeout and timeout > 0 else DEFAULT_TIMEOUT
@@ -46,6 +49,9 @@ class BashTool:
             text=True,
             start_new_session=True,
         )
+        group = proc.pid
+        with self._groups_lock:
+            self._groups.add(group)
         try:
             output, _ = proc.communicate(timeout=seconds)
             exit_code = proc.returncode
@@ -55,6 +61,8 @@ class BashTool:
             output, _ = proc.communicate()
             exit_code = None
             timed_out = True
+        finally:
+            self._discard_finished_group(group)
 
         clamped = truncate(output or "", max_lines=MAX_LINES, max_bytes=MAX_BYTES, keep="tail")
         body = clamped.text
@@ -81,3 +89,36 @@ class BashTool:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             proc.kill()
+
+    def has_live_children(self) -> bool:
+        """Whether a command process group still exists, including detached children."""
+        with self._groups_lock:
+            for group in tuple(self._groups):
+                try:
+                    os.killpg(group, 0)
+                except ProcessLookupError:
+                    self._groups.discard(group)
+                except PermissionError:
+                    pass
+            return bool(self._groups)
+
+    def terminate_children(self) -> None:
+        """Force remaining managed process groups down after a drain deadline."""
+        with self._groups_lock:
+            groups = tuple(self._groups)
+        for group in groups:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        with self._groups_lock:
+            self._groups.clear()
+
+    def _discard_finished_group(self, group: int) -> None:
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            with self._groups_lock:
+                self._groups.discard(group)
+        except PermissionError:
+            pass

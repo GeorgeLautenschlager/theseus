@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import logging
+import threading
 
 import pytest
 
@@ -73,6 +74,35 @@ def observer(tmp_path, api, callback=lambda: None, *, users=(10,), chats=(20,)):
         DurableInbox(journal, TELEGRAM_TRANSPORT),
         allowed_user_ids=users, allowed_chat_ids=chats, poll_timeout_seconds=1,
     )
+
+
+def test_stop_during_poll_persists_returned_batch_without_polling_again(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    callbacks = []
+
+    class BlockingAPI:
+        calls = 0
+
+        def get_updates(self, *, offset, timeout):
+            self.calls += 1
+            entered.set()
+            assert release.wait(2)
+            return [update()]
+
+    api = BlockingAPI()
+    telegram = observer(tmp_path, api, lambda: callbacks.append(True))
+    thread = threading.Thread(target=telegram.poll_once)
+    thread.start()
+    assert entered.wait(1)
+    telegram.stop()
+    release.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert telegram.inbox.get("42").state == "processed"
+    assert callbacks == [True]
+    assert telegram.poll_once() == 0
+    assert api.calls == 1
 
 
 def test_update_is_persisted_and_processed_before_next_poll_acknowledges_it(tmp_path):
