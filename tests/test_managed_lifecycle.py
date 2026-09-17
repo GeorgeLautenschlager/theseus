@@ -12,6 +12,7 @@ from theseus.deployment_control import (
     ActivationStore,
     DeploymentController,
     LifecycleStatusStore,
+    _atomic_json,
     OperationJournal,
 )
 
@@ -271,3 +272,18 @@ def test_preflight_reads_local_state_without_selecting_model(tmp_path):
     agent = build_agent(managed_spec(), tmp_path / "state")
     agent.core._select_model_provider = lambda: pytest.fail("preflight selected a model")
     assert agent.preflight()["ready"] is True
+
+
+def test_activation_replacements_remain_group_read_only(tmp_path):
+    control = tmp_path / "control"
+    control.mkdir()
+    store = ActivationStore(control, "deployment")
+
+    store.set("active")
+    assert store.path.stat().st_mode & 0o777 == 0o640
+    store.set("suspended")
+    assert store.path.stat().st_mode & 0o777 == 0o640
+
+    private = control / "private.json"
+    _atomic_json(private, {"secret": True})
+    assert private.stat().st_mode & 0o777 == 0o600

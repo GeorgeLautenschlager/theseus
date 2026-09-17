@@ -28,7 +28,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _atomic_json(path: Path, value: dict[str, Any]) -> None:
+def _atomic_json(path: Path, value: dict[str, Any], *, mode: int = 0o600) -> None:
+    """Replace a JSON file durably with an explicit, stable access mode.
+
+    Host journals and receipts remain private by default.  The activation store is
+    the one intentional exception: agents need group-read access to it, while the
+    host remains its only writer.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
@@ -40,6 +46,7 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        temporary.chmod(mode)
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
@@ -102,7 +109,7 @@ class ActivationStore:
             updated_at=_now(),
             reason=reason,
         )
-        _atomic_json(self.path, asdict(record))
+        _atomic_json(self.path, asdict(record), mode=0o640)
         return record
 
 

@@ -204,6 +204,7 @@ def test_user_data_bootstraps_without_tokens_or_activation(tmp_path):
     assert "docker-compose-v2" in user_data
     assert f"@{COMMIT}" in user_data
     assert "/srv/theseus/flywheel/data/agents/fable/state" in user_data
+    assert "install -d -o root -g 10001 -m 2750 /srv/theseus/flywheel/control" in user_data
     assert "activation.json" not in user_data
     assert SECRET_VALUE not in user_data
     assert "DIGITALOCEAN_TOKEN" not in user_data

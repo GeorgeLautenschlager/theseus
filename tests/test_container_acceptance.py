@@ -65,7 +65,12 @@ def _wait(message: str, predicate, timeout: float = 30.0) -> None:
     raise AssertionError(f"timed out waiting for {message}")
 
 
-def _spec() -> DeploymentSpec:
+def _spec(
+    *,
+    uid: int | None = None,
+    gid: int | None = None,
+    workspace_gid: int | None = None,
+) -> DeploymentSpec:
     def agent(name: str) -> AgentSpec:
         return AgentSpec(
             name=name,
@@ -93,9 +98,9 @@ def _spec() -> DeploymentSpec:
             "THESEUS_ENABLE_FIXTURE_PROVIDER",
             "THESEUS_FIXTURE_PROVIDER_LOG",
         ),
-        uid=os.getuid(),
-        gid=os.getgid(),
-        workspace_gid=os.getgid() + 10000,
+        uid=os.getuid() if uid is None else uid,
+        gid=os.getgid() if gid is None else gid,
+        workspace_gid=os.getgid() + 10000 if workspace_gid is None else workspace_gid,
     )
 
 
@@ -395,6 +400,99 @@ Path('/workspaces/website/astra.txt').write_text('shared artifact')
         )
         _down(bundle, source.root, source_project)
         _down(target_bundle, target.root, target_project)
+        subprocess.run(
+            ["docker", "image", "rm", image_tag],
+            text=True,
+            capture_output=True,
+        )
+
+
+def test_root_owned_activation_is_readable_but_not_writable_by_non_root_agent(tmp_path):
+    suffix = uuid4().hex[:8]
+    project = f"theseus-root-control-{suffix}"
+    agent_uid = 21001
+    agent_gid = 21001
+    spec = _spec(uid=agent_uid, gid=agent_gid, workspace_gid=21002)
+    bundle = assemble_compose(spec, tmp_path / "root-bundle", definition_root=tmp_path)
+    image_tag = json.loads(build_bundle(bundle).read_text())["images"][0]["tag"]
+    paths = DeploymentPaths(tmp_path / "root-host", spec)
+    _prepare(paths, "http://127.0.0.1:9")
+    controller = _controller(paths.root, bundle, project)
+
+    root_setup = f"""
+import os
+from pathlib import Path
+from theseus.deployment_control import ActivationStore
+root = Path('/host')
+for agent_id in {AGENTS!r}:
+    for path in (root / 'data' / 'agents' / agent_id, root / 'data' / 'agents' / agent_id / 'state', root / 'data' / 'agents' / agent_id / 'logs'):
+        os.chown(path, {agent_uid}, {agent_gid})
+        path.chmod(0o750)
+workspace = root / 'data' / 'workspaces' / 'website'
+os.chown(workspace, {agent_uid}, 21002)
+workspace.chmod(0o2770)
+for secret in (root / 'secrets').iterdir():
+    os.chown(secret, {agent_uid}, {agent_gid})
+    secret.chmod(0o600)
+control = root / 'control'
+os.chown(control, 0, {agent_gid})
+control.chmod(0o2750)
+ActivationStore(control, 'paired-acceptance').set('active', reason='root acceptance operator')
+    """
+
+    try:
+        _run([
+            "docker", "run", "--rm", "--user", "0:0",
+            "-v", f"{paths.root}:/host", "--entrypoint", "python",
+            image_tag, "-c", root_setup,
+        ])
+        for agent_id in AGENTS:
+            controller._preflight_service(agent_id)
+        assert paths.control.stat().st_mode & 0o7777 == 0o2750
+
+        controller._compose("up", "-d")
+        _wait(
+            "non-root agents with root-owned activation",
+            lambda: set(controller.running_services()) == set(AGENTS),
+        )
+        probe = f"""
+import stat
+from pathlib import Path
+path = Path('/run/theseus-control/activation.json')
+assert path.read_text()
+metadata = path.stat()
+assert metadata.st_uid == 0
+assert metadata.st_gid == {agent_gid}
+assert stat.S_IMODE(metadata.st_mode) == 0o640
+try:
+    path.write_text('{{}}')
+except OSError:
+    pass
+else:
+    raise AssertionError('agent modified host activation state')
+"""
+        for agent_id in AGENTS:
+            controller._compose("exec", "-T", agent_id, "python", "-c", probe)
+    finally:
+        _down(bundle, paths.root, project)
+        cleanup = f"""
+import os
+from pathlib import Path
+root = Path('/host')
+for directory, names, files in os.walk(root, topdown=False):
+    for name in names + files:
+        os.chown(Path(directory) / name, {os.getuid()}, {os.getgid()})
+    os.chown(directory, {os.getuid()}, {os.getgid()})
+"""
+        subprocess.run(
+            [
+                "docker", "run", "--rm", "--user", "0:0",
+                "-v", f"{paths.root}:/host", "--entrypoint", "python",
+                image_tag, "-c", cleanup,
+            ],
+            text=True,
+            capture_output=True,
+        )
         subprocess.run(
             ["docker", "image", "rm", image_tag],
             text=True,

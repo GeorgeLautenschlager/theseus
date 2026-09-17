@@ -87,6 +87,8 @@ class DeploymentPaths:
         provisioning process to have permission to change numeric ownership.
         """
         self.spec.validate()
+        os.chown(self.control, os.geteuid(), self.spec.gid)
+        self.control.chmod(0o2750)
         for agent_id in self.spec.agents:
             for path in (self.agent_root(agent_id), self.state(agent_id), self.logs(agent_id)):
                 os.chown(path, self.spec.uid, self.spec.gid)

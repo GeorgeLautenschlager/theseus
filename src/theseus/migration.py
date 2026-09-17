@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import tempfile
 from typing import Any, Callable, Mapping, Protocol, Sequence
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from theseus.deployment_control import DeploymentController, _atomic_json
 from theseus.deployment_snapshot import MANIFEST_FILE, DeploymentSnapshots, SnapshotResult
@@ -148,12 +148,136 @@ class LocalMigrationSource:
     def record(self, state: Mapping[str, Any]) -> None:
         _atomic_json(self.journal_path, {**dict(state), "host_role": "source"})
 
+    def _migration_state(self) -> dict[str, Any]:
+        state = _read_object(self.journal_path)
+        if (
+            state.get("host_role") != "source"
+            or state.get("deployment_id") != self.controller.deployment_id
+            or not isinstance(state.get("migration_id"), str)
+        ):
+            raise ValueError("source migration journal identity is invalid")
+        return state
+
+    def _stop_path(self, migration_id: str) -> Path:
+        try:
+            valid = isinstance(migration_id, str) and len(migration_id) == 32
+            UUID(hex=migration_id)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("migration ID is invalid") from exc
+        if not valid:
+            raise ValueError("migration ID is invalid")
+        return self.controller.control_dir / f"migration-stop-{migration_id}.json"
+
+    def _capture_path(self, migration_id: str) -> Path:
+        self._stop_path(migration_id)  # Apply the same durable-artifact ID validation.
+        return self.controller.control_dir / f"migration-capture-{migration_id}.json"
+
+    def _validate_clean_stop(self, evidence: Mapping[str, Any]) -> None:
+        if (
+            evidence.get("state") != "verified"
+            or evidence.get("deployment_id") != self.controller.deployment_id
+            or not isinstance(evidence.get("migration_id"), str)
+        ):
+            raise UnknownActivation("source clean-stop evidence is not verified")
+        services = evidence.get("services")
+        expected_runs = evidence.get("expected_runs")
+        if (
+            not isinstance(services, list)
+            or set(services) != set(self.agent_ids)
+            or not isinstance(expected_runs, dict)
+            or set(expected_runs) != set(services)
+        ):
+            raise UnknownActivation("source clean-stop evidence is incomplete")
+        for service in services:
+            lifecycle = self.controller._lifecycle(service)
+            if (
+                lifecycle is None
+                or lifecycle.get("run_id") != expected_runs.get(service)
+                or lifecycle.get("state") != "stopped"
+                or lifecycle.get("clean") is not True
+            ):
+                raise UnknownActivation(
+                    f"source clean stop is unconfirmed for {service}"
+                )
+        inspection = self.inspect()
+        if inspection.activation != "suspended" or inspection.running_services:
+            raise UnknownActivation("source suspension is unconfirmed")
+
+    def _finish_stop_evidence(self, evidence: dict[str, Any]) -> None:
+        operation = self.controller.journal.read()
+        if (
+            operation is None
+            or operation.kind != "stop"
+            or set(operation.prior_running_services) != set(evidence["services"])
+        ):
+            raise UnknownActivation("source stop operation did not complete cleanly")
+        if operation.finished and operation.phase != "completed":
+            raise UnknownActivation("source stop operation did not complete cleanly")
+        verified = {
+            **evidence,
+            "state": "verified",
+            "stop_operation_id": operation.operation_id,
+            "verified_at": _now(),
+        }
+        self._validate_clean_stop(verified)
+        if operation.phase != "completed":
+            self.controller.journal.transition(operation.operation_id, "completed")
+        _atomic_json(self._stop_path(evidence["migration_id"]), verified)
+
     def stop(self, prior: Sequence[str], *, timeout_seconds: int) -> None:
+        state = self._migration_state()
+        migration_id = state["migration_id"]
+        if state.get("phase") != "source-stop-intent":
+            raise RuntimeError("source stop requires durable migration stop intent")
+        if set(prior) != set(self.agent_ids) or set(
+            state.get("source_prior_services", ())
+        ) != set(prior):
+            raise UnknownActivation("migration cutover does not cover every source agent")
         inspection = self.inspect()
         if inspection.activation == "retired":
             raise RuntimeError("source is already retired")
-        if not inspection.running_services and inspection.activation == "suspended":
-            return
+        stop_path = self._stop_path(migration_id)
+        if stop_path.is_symlink():
+            raise ValueError("source clean-stop evidence cannot be a symlink")
+        evidence = _read_object(stop_path) if stop_path.is_file() else None
+        if evidence is not None:
+            services = evidence.get("services")
+            if (
+                evidence.get("migration_id") != migration_id
+                or evidence.get("deployment_id") != self.controller.deployment_id
+                or not isinstance(services, list)
+                or set(services) != set(prior)
+            ):
+                raise ValueError("source clean-stop evidence does not match migration")
+            if evidence.get("state") == "verified":
+                self._validate_clean_stop(evidence)
+                return
+            if evidence.get("state") != "stopping":
+                raise ValueError("source clean-stop evidence has an invalid state")
+        else:
+            expected_runs = {}
+            for service in prior:
+                lifecycle = self.controller._lifecycle(service)
+                if (
+                    lifecycle is None
+                    or lifecycle.get("state") != "running"
+                    or lifecycle.get("clean") is not None
+                ):
+                    raise UnknownActivation(
+                        f"source running lifecycle is unconfirmed for {service}"
+                    )
+                expected_runs[service] = lifecycle["run_id"]
+            if set(inspection.running_services) != set(prior):
+                raise UnknownActivation("source containers do not match cutover intent")
+            evidence = {
+                "state": "stopping",
+                "migration_id": migration_id,
+                "deployment_id": self.controller.deployment_id,
+                "services": list(prior),
+                "expected_runs": expected_runs,
+                "created_at": _now(),
+            }
+            _atomic_json(stop_path, evidence)
         interrupted = self.controller.interrupted_operation()
         if interrupted is not None:
             if interrupted.kind != "stop":
@@ -168,36 +292,65 @@ class LocalMigrationSource:
                 )
             if self.controller.running_services():
                 raise RuntimeError("source still has running services after stop recovery")
-            for service in interrupted.prior_running_services:
-                lifecycle = self.controller._lifecycle(service)
-                if (
-                    lifecycle is None
-                    or lifecycle.get("state") != "stopped"
-                    or lifecycle.get("clean") is not True
-                ):
-                    raise UnknownActivation(
-                        f"source clean stop is unconfirmed for {service}"
-                    )
-            activation = self.controller.activation.read()
-            if activation is None or activation.state != "suspended":
-                raise UnknownActivation("source suspension is unconfirmed")
-            self.controller.journal.transition(interrupted.operation_id, "completed")
-            return
-        self.controller.stop(timeout_seconds=timeout_seconds)
+        elif not inspection.running_services and inspection.activation == "suspended":
+            # Absence of containers is not clean-stop proof.  Only a completed stop
+            # operation plus the exact run acknowledgements recorded above can recover.
+            pass
+        else:
+            self.controller.stop(timeout_seconds=timeout_seconds)
+        self._finish_stop_evidence(evidence)
+
+    def _stop_evidence(self, migration_id: str) -> tuple[dict[str, Any], str]:
+        path = self._stop_path(migration_id)
+        if not path.is_file() or path.is_symlink():
+            raise UnknownActivation("final capture requires verified clean-stop evidence")
+        evidence = _read_object(path)
+        if evidence.get("migration_id") != migration_id:
+            raise ValueError("source clean-stop evidence belongs to another migration")
+        self._validate_clean_stop(evidence)
+        return evidence, _sha256_file(path)
+
+    def _snapshot_evidence(
+        self, path: Path, migration_id: str, stop_sha256: str
+    ) -> SnapshotEvidence:
+        snapshots_root = (self.controller.root / "snapshots").resolve()
+        if path.is_symlink() or not path.is_dir() or path.parent.resolve() != snapshots_root:
+            raise ValueError("final snapshot path is outside the snapshot store")
+        manifest = _read_object(path / MANIFEST_FILE)
+        context = manifest.get("capture_context")
+        expected = {
+            "kind": "migration-final",
+            "migration_id": migration_id,
+            "stop_evidence_sha256": stop_sha256,
+        }
+        if context != expected:
+            raise ValueError("final snapshot evidence does not match migration stop")
+        if (
+            manifest.get("snapshot_id") != path.name
+            or manifest.get("deployment_id") != self.controller.deployment_id
+        ):
+            raise ValueError("final snapshot identity does not match deployment")
+        result = SnapshotResult(manifest["snapshot_id"], path, manifest)
+        return SnapshotEvidence(
+            result, _sha256_file(path / MANIFEST_FILE), manifest["archive"]["sha256"]
+        )
 
     def _existing_capture(self, migration_id: str, started_at: str) -> SnapshotEvidence | None:
-        receipt = self.controller.control_dir / f"migration-capture-{migration_id}.json"
+        del started_at  # Timestamps are not final-snapshot identity.
+        _, stop_sha256 = self._stop_evidence(migration_id)
+        receipt = self._capture_path(migration_id)
         if receipt.is_file() and not receipt.is_symlink():
             value = _read_object(receipt)
-            path = Path(value["path"])
-            manifest = _read_object(path / MANIFEST_FILE)
-            result = SnapshotResult(value["snapshot_id"], path, manifest)
-            return SnapshotEvidence(
-                result,
-                _sha256_file(path / MANIFEST_FILE),
-                manifest["archive"]["sha256"],
-            )
+            if (
+                value.get("migration_id") != migration_id
+                or value.get("stop_evidence_sha256") != stop_sha256
+                or not isinstance(value.get("snapshot_id"), str)
+            ):
+                raise ValueError("final snapshot receipt does not match migration stop")
+            path = self.controller.root / "snapshots" / value["snapshot_id"]
+            return self._snapshot_evidence(path, migration_id, stop_sha256)
         candidates = []
+        mismatched = []
         snapshots_root = self.controller.root / "snapshots"
         if snapshots_root.is_dir():
             for path in snapshots_root.iterdir():
@@ -205,23 +358,36 @@ class LocalMigrationSource:
                 if not path.is_dir() or path.is_symlink() or not manifest_path.is_file():
                     continue
                 manifest = _read_object(manifest_path)
+                context = manifest.get("capture_context")
                 if (
-                    manifest.get("deployment_id") == self.controller.deployment_id
-                    and manifest.get("captured_at", "") >= started_at
+                    isinstance(context, dict)
+                    and context.get("migration_id") == migration_id
                 ):
-                    candidates.append((path, manifest))
+                    if (
+                        context.get("kind") != "migration-final"
+                        or context.get("stop_evidence_sha256") != stop_sha256
+                    ):
+                        mismatched.append(path)
+                    elif manifest.get("deployment_id") == self.controller.deployment_id:
+                        candidates.append((path, manifest))
+                    else:
+                        mismatched.append(path)
+        if mismatched:
+            raise ValueError("final snapshot evidence does not match migration stop")
         if len(candidates) > 1:
             raise RuntimeError("multiple final snapshot candidates require operator resolution")
         if not candidates:
             return None
         path, manifest = candidates[0]
-        result = SnapshotResult(manifest["snapshot_id"], path, manifest)
-        evidence = SnapshotEvidence(
-            result, _sha256_file(path / MANIFEST_FILE), manifest["archive"]["sha256"]
-        )
+        evidence = self._snapshot_evidence(path, migration_id, stop_sha256)
         _atomic_json(
             receipt,
-            {"snapshot_id": result.snapshot_id, "path": str(path), "reconciled": True},
+            {
+                "migration_id": migration_id,
+                "snapshot_id": evidence.result.snapshot_id,
+                "stop_evidence_sha256": stop_sha256,
+                "reconciled": True,
+            },
         )
         return evidence
 
@@ -232,15 +398,25 @@ class LocalMigrationSource:
         inspection = self.inspect()
         if inspection.activation != "suspended" or inspection.running_services:
             raise RuntimeError("source must be suspended and stopped for final capture")
-        result = self.snapshots.create(leave_stopped=True)
+        _, stop_sha256 = self._stop_evidence(migration_id)
+        context = {
+            "kind": "migration-final",
+            "migration_id": migration_id,
+            "stop_evidence_sha256": stop_sha256,
+        }
+        result = self.snapshots.create(leave_stopped=True, capture_context=context)
         evidence = SnapshotEvidence(
             result,
             _sha256_file(result.path / MANIFEST_FILE),
             result.manifest["archive"]["sha256"],
         )
         _atomic_json(
-            self.controller.control_dir / f"migration-capture-{migration_id}.json",
-            {"snapshot_id": result.snapshot_id, "path": str(result.path)},
+            self._capture_path(migration_id),
+            {
+                "migration_id": migration_id,
+                "snapshot_id": result.snapshot_id,
+                "stop_evidence_sha256": stop_sha256,
+            },
         )
         return evidence
 
@@ -449,7 +625,8 @@ class SSHMigrationTarget:
                 stream.write("\n")
             self._upload(temporary, remote)
             self._run(
-                f"sudo install -d -m 0750 {shlex.quote(self.root + '/control')} && "
+                f"sudo install -d -o root -g {self.deployment['gid']} -m 2750 "
+                f"{shlex.quote(self.root + '/control')} && "
                 f"sudo install -m 0600 {shlex.quote(remote)} "
                 f"{shlex.quote(self.root + '/control/' + MIGRATION_FILE)} && "
                 f"rm -f {shlex.quote(remote)}"

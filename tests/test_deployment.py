@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import fcntl
+import os
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -104,6 +105,8 @@ def test_layout_applies_stable_private_and_shared_ownership(tmp_path, monkeypatc
     ownership = []
     monkeypatch.setattr("theseus.deployment_store.os.chown", lambda path, uid, gid: ownership.append((Path(path), uid, gid)))
     paths.apply_ownership()
+    assert (paths.control, os.geteuid(), 12002) in ownership
+    assert paths.control.stat().st_mode & 0o7777 == 0o2750
     assert (paths.state("fable"), 12001, 12002) in ownership
     assert (paths.workspace("website"), 12001, 12003) in ownership
     assert paths.workspace("website").stat().st_mode & 0o2000

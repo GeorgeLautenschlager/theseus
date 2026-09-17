@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import shutil
+import subprocess
 
 import pytest
 
-from theseus.deployment_snapshot import SnapshotResult
+from theseus.backup_store import LocalObjectStore
+from theseus.deployment_control import DeploymentController, LifecycleStatusStore
+from theseus.deployment_snapshot import DeploymentSnapshots, SnapshotResult
 from theseus.migration import (
     HostInspection,
     HostUnreachable,
     MigrationCoordinator,
+    LocalMigrationSource,
     SnapshotEvidence,
     UnknownActivation,
 )
-from theseus.remote_backup import DownloadedBackup, ReleaseArtifacts
-from test_deployment_snapshot import manager
+from theseus.remote_backup import DownloadedBackup, ReleaseArtifacts, RemoteBackups
+from test_deployment_snapshot import Compose, manager
 
 
 AGENTS = ("astra", "fable")
@@ -453,3 +458,179 @@ def test_interrupted_target_start_resumes_only_from_durable_activation_intent(tm
     assert completed.phase == "completed"
     assert controller.activation.read().state == "active"
     assert compose.running == set(AGENTS)
+
+
+def _local_source(tmp_path):
+    snapshots, compose, root, bundle = manager(tmp_path)
+    backups = RemoteBackups(LocalObjectStore(tmp_path / "objects"), bundle)
+    source = LocalMigrationSource(snapshots.controller, snapshots, backups)
+    migration_id = "1" * 32
+    state = {
+        "migration_id": migration_id,
+        "deployment_id": "flywheel",
+        "phase": "source-stop-intent",
+        "source_prior_services": list(AGENTS),
+    }
+    source.record(state)
+    return source, snapshots, compose, root, bundle, migration_id
+
+
+def _restore_workspace(tmp_path, bundle, snapshot):
+    target = tmp_path / "restored-host"
+    (target / "control").mkdir(parents=True)
+    (target / "secrets").mkdir()
+    (target / "secrets" / "TELEGRAM_TOKEN").write_text("target-secret")
+    controller = DeploymentController(
+        root=target,
+        deployment_id="flywheel",
+        agent_ids=AGENTS,
+        compose_file=bundle / "compose.yaml",
+        run=Compose(target, ()),
+    )
+    DeploymentSnapshots(controller, bundle).restore(snapshot)
+    return target / "data" / "workspaces" / "website" / "index.html"
+
+
+def test_final_capture_ignores_newer_ordinary_backup_and_restores_latest_change(tmp_path):
+    source, snapshots, _, root, bundle, migration_id = _local_source(tmp_path)
+    started_at = datetime.now(timezone.utc).isoformat()
+    ordinary = snapshots.create()
+    # The fake Compose adapter does not launch agent processes, so model the fresh
+    # lifecycle records a real resumed container writes.
+    for agent_id in AGENTS:
+        LifecycleStatusStore(
+            root / "data" / "agents" / agent_id / "logs" / "lifecycle-status.json",
+            agent_id,
+        ).running()
+    latest = root / "data" / "workspaces" / "website" / "index.html"
+    latest.write_text("latest migration state\n")
+
+    source.stop(AGENTS, timeout_seconds=5)
+    final = source.capture(migration_id, started_at)
+
+    assert final.result.snapshot_id != ordinary.snapshot_id
+    restored = _restore_workspace(tmp_path, bundle, final.result.path)
+    assert restored.read_text() == "latest migration state\n"
+
+
+def test_final_capture_recovers_after_snapshot_before_receipt(tmp_path, monkeypatch):
+    source, _, _, root, bundle, migration_id = _local_source(tmp_path)
+    source.stop(AGENTS, timeout_seconds=5)
+    latest = root / "data" / "workspaces" / "website" / "index.html"
+    latest.write_text("captured before controller interruption\n")
+
+    from theseus import migration as migration_module
+
+    atomic_json = migration_module._atomic_json
+    interrupted = False
+
+    def lose_receipt(path, value, **kwargs):
+        nonlocal interrupted
+        if path.name.startswith("migration-capture-") and not interrupted:
+            interrupted = True
+            raise TimeoutError("controller died before recording capture receipt")
+        return atomic_json(path, value, **kwargs)
+
+    monkeypatch.setattr(migration_module, "_atomic_json", lose_receipt)
+    with pytest.raises(TimeoutError, match="before recording"):
+        source.capture(migration_id, "2000-01-01T00:00:00+00:00")
+    recovered = source.capture(migration_id, "2000-01-01T00:00:00+00:00")
+
+    final_snapshots = [
+        path
+        for path in (root / "snapshots").iterdir()
+        if path.is_dir()
+        and json.loads((path / "manifest.json").read_text()).get(
+            "capture_context", {}
+        ).get("migration_id")
+        == migration_id
+    ]
+    assert final_snapshots == [recovered.result.path]
+    restored = _restore_workspace(tmp_path, bundle, recovered.result.path)
+    assert restored.read_text() == "captured before controller interruption\n"
+
+
+@pytest.mark.parametrize("problem", ["ambiguous", "mismatched"])
+def test_final_capture_reconciliation_rejects_untrustworthy_evidence(tmp_path, problem):
+    source, _, _, root, _, migration_id = _local_source(tmp_path)
+    source.stop(AGENTS, timeout_seconds=5)
+    captured = source.capture(migration_id, "2000-01-01T00:00:00+00:00")
+    (source.controller.control_dir / f"migration-capture-{migration_id}.json").unlink()
+
+    if problem == "ambiguous":
+        duplicate = root / "snapshots" / ("2" * 32)
+        shutil.copytree(captured.result.path, duplicate)
+        manifest_path = duplicate / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["snapshot_id"] = duplicate.name
+        manifest_path.write_text(json.dumps(manifest))
+        expected = "multiple final snapshot candidates"
+    else:
+        manifest_path = captured.result.path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["capture_context"]["stop_evidence_sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest))
+        expected = "does not match migration stop"
+
+    with pytest.raises((RuntimeError, ValueError), match=expected):
+        source.capture(migration_id, "2000-01-01T00:00:00+00:00")
+
+
+def test_failed_force_killed_stop_cannot_be_retried_as_clean(tmp_path):
+    source, _, compose, _, _, _ = _local_source(tmp_path)
+    original = source.controller._run
+
+    def force_kill(command, **kwargs):
+        if "stop" in command:
+            index = command.index("--timeout") + 2
+            compose.running.difference_update(command[index:])
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return original(command, **kwargs)
+
+    source.controller._run = force_kill
+    with pytest.raises(RuntimeError, match="not a clean drain"):
+        source.stop(AGENTS, timeout_seconds=5)
+    with pytest.raises(UnknownActivation, match="did not complete cleanly"):
+        source.stop(AGENTS, timeout_seconds=5)
+    with pytest.raises(UnknownActivation, match="clean-stop evidence"):
+        source.capture("1" * 32, "2000-01-01T00:00:00+00:00")
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["missing", "stale"])
+def test_verified_stop_rejects_missing_or_stale_agent_acknowledgement(tmp_path, stale):
+    source, _, _, root, _, _ = _local_source(tmp_path)
+    source.stop(AGENTS, timeout_seconds=5)
+    status = root / "data" / "agents" / AGENTS[0] / "logs" / "lifecycle-status.json"
+    if stale:
+        store = LifecycleStatusStore(status, AGENTS[0])
+        store.stopped(store.running().run_id, clean=True)
+    else:
+        status.unlink()
+
+    with pytest.raises(UnknownActivation, match=AGENTS[0]):
+        source.stop(AGENTS, timeout_seconds=5)
+
+
+def test_interrupted_genuinely_clean_stop_is_idempotently_verified_on_retry(tmp_path):
+    source, _, _, _, _, migration_id = _local_source(tmp_path)
+    original = source.controller._run
+    interrupted = False
+
+    def lose_completion(command, **kwargs):
+        nonlocal interrupted
+        result = original(command, **kwargs)
+        if "stop" in command and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("controller died after clean container stop")
+        return result
+
+    source.controller._run = lose_completion
+    with pytest.raises(KeyboardInterrupt, match="clean container stop"):
+        source.stop(AGENTS, timeout_seconds=5)
+
+    source.stop(AGENTS, timeout_seconds=5)
+    evidence = json.loads(
+        (source.controller.control_dir / f"migration-stop-{migration_id}.json").read_text()
+    )
+    assert evidence["state"] == "verified"
+    assert source.controller.journal.read().phase == "completed"

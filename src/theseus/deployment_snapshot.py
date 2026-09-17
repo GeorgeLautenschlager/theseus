@@ -13,7 +13,7 @@ import sqlite3
 import stat
 import tarfile
 import tempfile
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 from uuid import UUID, uuid4
 
 from theseus.deployment_bundle import LOCK_FILE
@@ -255,7 +255,11 @@ class DeploymentSnapshots:
         return value
 
     def create(
-        self, *, leave_stopped: bool = False, timeout_seconds: int = 30
+        self,
+        *,
+        leave_stopped: bool = False,
+        timeout_seconds: int = 30,
+        capture_context: Mapping[str, Any] | None = None,
     ) -> SnapshotResult:
         root = self.controller.root.resolve()
         data = root / "data"
@@ -311,6 +315,8 @@ class DeploymentSnapshots:
                     "consistency": CONSISTENCY,
                     "prior_running_services": list(prior),
                 }
+                if capture_context is not None:
+                    capture["capture_context"] = dict(capture_context)
                 _atomic_json(staging / CAPTURE_FILE, capture)
                 _fsync_tree(staging)
                 os.replace(staging, destination)
@@ -346,6 +352,7 @@ class DeploymentSnapshots:
                     prior=prior,
                     files=files,
                     archive=archive,
+                    capture_context=capture_context,
                 )
                 _atomic_json(destination / MANIFEST_FILE, manifest)
                 _fsync_tree(destination)
@@ -485,8 +492,9 @@ class DeploymentSnapshots:
         prior: tuple[str, ...],
         files: list[dict[str, Any]],
         archive: Path,
+        capture_context: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
-        return {
+        manifest = {
             "snapshot_format_version": SNAPSHOT_FORMAT_VERSION,
             "state_schema_version": STATE_SCHEMA_VERSION,
             "snapshot_id": snapshot_id,
@@ -510,6 +518,9 @@ class DeploymentSnapshots:
                 "sha256": _sha256_file(archive),
             },
         }
+        if capture_context is not None:
+            manifest["capture_context"] = dict(capture_context)
+        return manifest
 
     def _validate_manifest_identity(self, manifest: dict[str, Any]) -> None:
         required = {

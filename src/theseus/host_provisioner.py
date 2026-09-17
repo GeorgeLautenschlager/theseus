@@ -367,7 +367,7 @@ def cloud_init(
         for kind in ("state", "logs")
     ]
     shared_dirs = [f"{root}/data/workspaces/{name}" for name in workspaces]
-    base_dirs = [f"{root}/{name}" for name in ("releases", "control", "secrets", "snapshots")]
+    base_dirs = [f"{root}/{name}" for name in ("releases", "secrets", "snapshots")]
     script = [
         "#!/bin/bash", "set -euo pipefail",
         "systemctl enable --now docker",
@@ -377,6 +377,8 @@ def cloud_init(
         "python3 -m venv /opt/theseus-operator",
         f"/opt/theseus-operator/bin/pip install --no-cache-dir {shlex.quote(f'git+{operator_repository}@{operator_ref}')}",
         *[f"install -d -m 0750 {shlex.quote(path)}" for path in base_dirs],
+        # setgid keeps atomically replaced activation files in the runtime group.
+        f"install -d -o root -g {gid} -m 2750 {shlex.quote(root + '/control')}",
         *[f"install -d -o {uid} -g {gid} -m 0750 {shlex.quote(path)}" for path in private_dirs],
         *[f"install -d -o {uid} -g {workspace_gid} -m 2770 {shlex.quote(path)}" for path in shared_dirs],
         "touch /var/lib/theseus-bootstrap-complete",
