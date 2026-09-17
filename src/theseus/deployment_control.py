@@ -387,36 +387,64 @@ class DeploymentController:
                     f"inspect interrupted operation {interrupted.operation_id} before stopping"
                 )
             prior = self.running_services()
-            expected_runs = {service: self._lifecycle(service) for service in prior}
             operation = self.journal.begin("stop", prior)
             try:
                 activation = self.activation.read()
                 if activation is None or activation.state != "retired":
                     self.activation.set("suspended", reason=f"stop {operation.operation_id}")
                 self.journal.transition(operation.operation_id, "stopping")
-                self._compose("stop", "--timeout", str(timeout_seconds), *prior)
-                problems = []
-                for service in prior:
-                    before = expected_runs[service]
-                    after = self._lifecycle(service)
-                    if (
-                        before is None
-                        or before.get("state") != "running"
-                        or before.get("clean") is not None
-                        or after is None
-                        or before.get("run_id") != after.get("run_id")
-                    ):
-                        problems.append(f"{service}: stale or missing lifecycle acknowledgement")
-                    elif after.get("state") != "stopped" or after.get("clean") is not True:
-                        problems.append(f"{service}: shutdown was not a clean drain")
-                if problems:
-                    raise RuntimeError("; ".join(problems))
+                self.clean_stop_services(prior, timeout_seconds=timeout_seconds)
                 return self.journal.transition(operation.operation_id, "completed")
             except Exception as exc:
                 self.journal.transition(
                     operation.operation_id, "failed", detail=f"{type(exc).__name__}: {exc}"
                 )
                 raise
+
+    def clean_stop_services(
+        self, services: Sequence[str], *, timeout_seconds: int = 30
+    ) -> None:
+        """Drain selected services and require fresh clean acknowledgements.
+
+        The caller owns the deployment operation lock and activation transition.
+        This split lets backup use one journal entry for its whole stop/copy/resume
+        transaction rather than nesting a separate stop operation.
+        """
+        if type(timeout_seconds) is not int or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be a positive integer")
+        selected = tuple(services)
+        unknown = sorted(set(selected) - set(self.agent_ids))
+        if unknown:
+            raise ValueError(f"unknown deployment services: {', '.join(unknown)}")
+        if not selected:
+            return
+        expected_runs = {service: self._lifecycle(service) for service in selected}
+        self._compose("stop", "--timeout", str(timeout_seconds), *selected)
+        problems = []
+        for service in selected:
+            before = expected_runs[service]
+            after = self._lifecycle(service)
+            if (
+                before is None
+                or before.get("state") != "running"
+                or before.get("clean") is not None
+                or after is None
+                or before.get("run_id") != after.get("run_id")
+            ):
+                problems.append(f"{service}: stale or missing lifecycle acknowledgement")
+            elif after.get("state") != "stopped" or after.get("clean") is not True:
+                problems.append(f"{service}: shutdown was not a clean drain")
+        if problems:
+            raise RuntimeError("; ".join(problems))
+
+    def resume_services(self, services: Sequence[str]) -> None:
+        """Resume exactly the selected services after an immutable local capture."""
+        selected = tuple(services)
+        unknown = sorted(set(selected) - set(self.agent_ids))
+        if unknown:
+            raise ValueError(f"unknown deployment services: {', '.join(unknown)}")
+        if selected:
+            self._compose("up", "-d", *selected)
 
     def retire(self, *, reason: str) -> ActivationRecord:
         with operation_lock(self.control_dir):

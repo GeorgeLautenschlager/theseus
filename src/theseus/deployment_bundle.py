@@ -478,7 +478,8 @@ def assemble_compose(
               f"2. Provision `/srv/theseus/{spec.id}` with `DeploymentPaths.prepare()` and `apply_ownership()`.\n"
               "3. Write each required secret value to the correspondingly named file under `secrets/`.\n"
               "4. Run `theseus-deployment . start`; set `THESEUS_DEPLOYMENT_ROOT` if the host root differs.\n"
-              "5. Use `theseus-deployment . stop` for a bounded clean drain before maintenance.\n\n"
+              "5. Use `theseus-deployment . stop` for a bounded clean drain before maintenance.\n"
+              "6. Use `theseus-deployment . backup` for a consistent full local snapshot.\n\n"
               "State, logs, shared workspaces, control files, snapshots, and secrets remain outside this release.\n",
         )
         for agent_id in sorted(spec.agents):
