@@ -22,6 +22,8 @@ from theseus.deployment_snapshot import (
     inventory,
     validate_state_copy,
 )
+from theseus.backup_store import LocalObjectStore, ObjectInfo, ObjectStore, S3ObjectStore
+from theseus.remote_backup import BackupResult, DownloadedBackup, RemoteBackups
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_reports import (
@@ -103,6 +105,13 @@ __all__ = [
     "SnapshotResult",
     "inventory",
     "validate_state_copy",
+    "ObjectInfo",
+    "ObjectStore",
+    "LocalObjectStore",
+    "S3ObjectStore",
+    "BackupResult",
+    "DownloadedBackup",
+    "RemoteBackups",
     "InterfaceSpec",
     "MemorySpec",
     "ModelSpec",
