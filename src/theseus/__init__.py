@@ -24,6 +24,15 @@ from theseus.deployment_snapshot import (
 )
 from theseus.backup_store import LocalObjectStore, ObjectInfo, ObjectStore, S3ObjectStore
 from theseus.remote_backup import BackupResult, DownloadedBackup, RemoteBackups
+from theseus.host_provisioner import (
+    DigitalOceanAPI,
+    HostProfile,
+    HostProvisioner,
+    OpenSSH,
+    ProvisionPreview,
+    ProvisionResult,
+    cloud_init,
+)
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_reports import (
@@ -112,6 +121,13 @@ __all__ = [
     "BackupResult",
     "DownloadedBackup",
     "RemoteBackups",
+    "DigitalOceanAPI",
+    "HostProfile",
+    "HostProvisioner",
+    "OpenSSH",
+    "ProvisionPreview",
+    "ProvisionResult",
+    "cloud_init",
     "InterfaceSpec",
     "MemorySpec",
     "ModelSpec",
