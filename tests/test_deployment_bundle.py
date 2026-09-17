@@ -62,6 +62,10 @@ def test_compose_bundle_is_complete_deterministic_and_contains_no_state(tmp_path
     assert not (output / "state").exists()
     compose = (output / "compose.yaml").read_text()
     assert "init: true" in compose
+    assert "stop_grace_period: 35s" in compose
+    assert "--managed" in compose
+    assert "/run/theseus-control/activation.json" in compose
+    assert "/data/logs/lifecycle-status.json" in compose
     assert "read_only: true" in compose
     assert "user: \"10001:10001\"" in compose
     assert "cpus: \"0.5\"" in compose

@@ -164,12 +164,25 @@ class Autocore:
         self._wake: threading.Event = threading.Event()
         self._wake_trigger: StimulusEvent | str | None = None
         self._wake_lock: threading.Lock = threading.Lock()
+        self._shutdown_requested = threading.Event()
         self.stimulus_log.subscribe(self._on_stimulus)
 
     def loop(self) -> None:
-        while True:
+        while not self._shutdown_requested.is_set():
             self.step()
+            if self._shutdown_requested.is_set():
+                break
             self._sleep()
+
+    def request_shutdown(self) -> None:
+        """Request a stop after the current complete cognitive step."""
+        self._shutdown_requested.set()
+        # Interrupt cadence sleep. The loop checks shutdown before another step.
+        self._wake.set()
+
+    @property
+    def shutdown_requested(self) -> bool:
+        return self._shutdown_requested.is_set()
 
     def step(self) -> None:
         """Run one autonomous turn without sleeping, for scheduled/embedded agents."""

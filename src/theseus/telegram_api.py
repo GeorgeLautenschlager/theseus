@@ -78,6 +78,15 @@ class TelegramBotAPI:
         self._client = client
         self._request_timeout = request_timeout
 
+    def close(self) -> None:
+        """Close an injected persistent client and remove token-bearing filters."""
+        if self._client is not None:
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                close()
+        logging.getLogger("httpx").removeFilter(self._log_redaction)
+        logging.getLogger("httpcore").removeFilter(self._log_redaction)
+
     def get_updates(self, *, offset: int | None, timeout: int) -> list[dict[str, Any]]:
         data: dict[str, Any] = {
             "timeout": timeout,

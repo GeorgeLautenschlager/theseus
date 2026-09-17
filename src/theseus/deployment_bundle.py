@@ -271,6 +271,7 @@ def _compose(spec: DeploymentSpec, image_tag: str) -> str:
             f"        THESEUS_WORKSPACE_GID: {spec.workspace_gid}",
             f"    platform: {spec.platform}",
             "    init: true",
+            "    stop_grace_period: 35s",
             "    read_only: true",
             "    working_dir: /data/state",
             f"    user: {json.dumps(f'{spec.uid}:{spec.gid}')}",
@@ -293,6 +294,17 @@ def _compose(spec: DeploymentSpec, image_tag: str) -> str:
             "      - /data/state",
             "      - --log-path",
             "      - /data/logs/stimulus_log.jsonl",
+            "      - --managed",
+            "      - --deployment-id",
+            f"      - {spec.id}",
+            "      - --agent-id",
+            f"      - {agent_id}",
+            "      - --control-path",
+            "      - /run/theseus-control/activation.json",
+            "      - --status-path",
+            "      - /data/logs/lifecycle-status.json",
+            "      - --shutdown-timeout",
+            "      - \"30\"",
             "    volumes:",
         ])
         lines.extend(f"      - {json.dumps(mount)}" for mount in _mount_lines(spec, agent_id))
@@ -465,7 +477,8 @@ def assemble_compose(
               "1. Run `python -m theseus.build_deployment .`.\n"
               f"2. Provision `/srv/theseus/{spec.id}` with `DeploymentPaths.prepare()` and `apply_ownership()`.\n"
               "3. Write each required secret value to the correspondingly named file under `secrets/`.\n"
-              "4. Set `THESEUS_DEPLOYMENT_ROOT` if the host root differs, then run `docker compose up -d`.\n\n"
+              "4. Run `theseus-deployment . start`; set `THESEUS_DEPLOYMENT_ROOT` if the host root differs.\n"
+              "5. Use `theseus-deployment . stop` for a bounded clean drain before maintenance.\n\n"
               "State, logs, shared workspaces, control files, snapshots, and secrets remain outside this release.\n",
         )
         for agent_id in sorted(spec.agents):

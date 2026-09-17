@@ -135,6 +135,18 @@ class DeliveryJournal:
         connection.execute("PRAGMA busy_timeout=30000")
         return connection
 
+    def preflight(self) -> None:
+        """Validate local SQLite state without mutating queue state or dispatching."""
+        with self._lock, self._connect() as connection:
+            result = connection.execute("PRAGMA quick_check").fetchone()[0]
+            if result != "ok":
+                raise ValueError(f"delivery journal integrity check failed: {result}")
+            # Decode every pending payload now, before readiness is reported.
+            for table in ("delivery_inbox", "delivery_outbox"):
+                rows = connection.execute(f"SELECT payload FROM {table}").fetchall()
+                for row in rows:
+                    json.loads(row[0])
+
     @staticmethod
     def _json(payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -402,6 +414,11 @@ class DurableOutbox:
             raise ValueError("min_group_interval_seconds cannot be negative")
         self.min_group_interval_seconds = min_group_interval_seconds
         self._drain_lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def request_stop(self) -> None:
+        """Stop beginning delivery attempts; already-running sends finish."""
+        self._stop.set()
 
     def enqueue(
         self,
@@ -424,7 +441,7 @@ class DurableOutbox:
         """Attempt due parts oldest-first, stopping at the first deferred retry."""
         attempted = 0
         with self._drain_lock:
-            while attempted < limit:
+            while attempted < limit and not self._stop.is_set():
                 item = self.journal.next_outbox(self.transport)
                 if item is None or item.available_at > self._now():
                     break

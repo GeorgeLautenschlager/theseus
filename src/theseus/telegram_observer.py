@@ -64,9 +64,13 @@ class TelegramObserver:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.outbox is not None:
+            self.outbox.request_stop()
 
     def poll_once(self) -> int:
         """Recover local work, then make one long-poll request and durably ingest it."""
+        if self._stop.is_set():
+            return 0
         self.recover_pending()
         updates = self.api.get_updates(
             offset=self._offset, timeout=self.poll_timeout_seconds
@@ -88,6 +92,8 @@ class TelegramObserver:
         # make the next request until this returns successfully.
         self.inbox.store(rows)
         self._offset = max(ids) + 1
+        # Even when stop arrived during getUpdates, finish projecting the already-returned
+        # durable batch. The core's own stop gate ensures these wakes cannot start a turn.
         self.recover_pending()
         return len(updates)
 

@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
 from pathlib import Path
 from pprint import pformat
 import runpy
+import signal
 import tempfile
 import threading
+from time import monotonic
 from dataclasses import dataclass, field
 
 from theseus.agentic_memory import AgenticMemory
@@ -238,6 +241,10 @@ class AssembledAgent:
     core: Autocore | OODACore
     observer: TerminalChatObserver | WebChatUIObserver | TelegramObserver | None
     spec: AgentSpec
+    _shutdown_requested: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
+    _shutdown_started_at: float | None = field(default=None, init=False, repr=False)
 
     def run(self) -> None:
         if self.spec.interface.kind == "none":
@@ -262,6 +269,153 @@ class AssembledAgent:
                     self.observer.observe_chat_message()
                 except EOFError:
                     break
+
+    def request_shutdown(self) -> None:
+        """Signal every managed component; never block or perform cleanup here."""
+        # Python signal handlers run on the main thread and may interrupt ordinary
+        # code, so this path intentionally takes no locks and performs no I/O.
+        if self._shutdown_started_at is None:
+            self._shutdown_started_at = monotonic()
+        self._shutdown_requested.set()
+        request = getattr(self.core, "request_shutdown", None)
+        if request is not None:
+            request()
+        if self.observer is not None:
+            stop = getattr(self.observer, "stop", None)
+            if stop is not None:
+                stop()
+
+    def preflight(self) -> dict[str, object]:
+        """Validate local recoverability without polling, dispatch, or model calls."""
+        self.spec.validate()
+        events = self.core.stimulus_log.read_all()
+        if self.observer is not None and hasattr(self.observer, "inbox"):
+            self.observer.inbox.journal.preflight()
+        memory = self.core.memory
+        if isinstance(memory, AgenticMemory):
+            memory.store.read_all()
+        elif isinstance(memory, MemoryModule):
+            # Construction performs deterministic pending-transaction recovery. Reading
+            # the layers here forces malformed persisted records to surface as not ready.
+            memory.knowledge.read_all()
+            memory.wisdom.read_all()
+        return {
+            "name": self.spec.name,
+            "events": len(events),
+            "ready": True,
+        }
+
+    def run_managed(
+        self,
+        *,
+        deployment_id: str,
+        agent_id: str,
+        control_path: Path,
+        status_path: Path,
+        shutdown_timeout_seconds: float = 30.0,
+    ) -> bool:
+        """Run owned workers and acknowledge only a complete bounded drain."""
+        from theseus.deployment_control import ActivationStore, LifecycleStatusStore
+
+        if self.spec.core != "auto" or self.spec.interface.kind not in ("telegram", "none"):
+            raise ValueError("managed lifecycle supports only Auto Telegram/headless agents")
+        if (
+            isinstance(shutdown_timeout_seconds, bool)
+            or not isinstance(shutdown_timeout_seconds, (int, float))
+            or shutdown_timeout_seconds <= 0
+        ):
+            raise ValueError("shutdown timeout must be positive")
+        control_path = Path(control_path)
+        activation = ActivationStore(control_path.parent, deployment_id)
+        if activation.path != control_path:
+            raise ValueError(f"activation path must be {activation.path}")
+        activation.require_active()
+        self.preflight()
+        lifecycle = LifecycleStatusStore(status_path, agent_id)
+        running = lifecycle.running()
+        failures: list[str] = []
+        threads: list[threading.Thread] = []
+
+        if self.spec.interface.kind == "telegram":
+            if self.observer.outbox is not None:
+                self.observer.outbox.recover()
+            self.observer.recover_pending()
+
+        def start_worker(name: str, target) -> None:
+            def owned() -> None:
+                try:
+                    target()
+                except BaseException as exc:
+                    failures.append(f"{name}: {type(exc).__name__}: {exc}")
+                finally:
+                    if not self._shutdown_requested.is_set():
+                        failures.append(f"{name} exited before shutdown")
+                        self.request_shutdown()
+
+            thread = threading.Thread(target=owned, name=name, daemon=True)
+            threads.append(thread)
+            thread.start()
+
+        start_worker("agent-core", self.core.loop)
+        if self.observer is not None:
+            start_worker("agent-observer", self.observer.run)
+
+        self._shutdown_requested.wait()
+        started = self._shutdown_started_at or monotonic()
+        deadline = started + float(shutdown_timeout_seconds)
+        for thread in threads:
+            thread.join(max(0.0, deadline - monotonic()))
+        alive = [thread.name for thread in threads if thread.is_alive()]
+        tools = list({id(tool): tool for tool in self.core.tools.values()}.values())
+        child_tools = [
+            tool for tool in tools
+            if callable(getattr(tool, "has_live_children", None)) and tool.has_live_children()
+        ]
+        clean = not alive and not failures and not child_tools
+        detail_parts = failures + ([f"threads still alive: {', '.join(alive)}"] if alive else [])
+        if child_tools:
+            detail_parts.append("managed tool child processes remained after the deadline")
+        if clean:
+            self._close_resources()
+        else:
+            for tool in child_tools:
+                terminate = getattr(tool, "terminate_children", None)
+                if terminate is not None:
+                    terminate()
+        lifecycle.stopped(
+            running.run_id,
+            clean=clean,
+            detail="; ".join(detail_parts) or None,
+        )
+        return clean
+
+    def _close_resources(self) -> None:
+        seen: set[int] = set()
+        providers = getattr(self.core, "model_providers", {})
+        resources = list(providers.values() if isinstance(providers, dict) else providers)
+        memory = self.core.memory
+        if memory is not None:
+            resources.extend(getattr(memory, "model_providers", getattr(memory, "_model_providers", ())))
+            resources.extend(getattr(memory, "embedding_providers", getattr(memory, "_embedding_providers", ())))
+        resources.extend(self.core.tools.values())
+        if self.observer is not None:
+            api = getattr(self.observer, "api", None)
+            if api is not None:
+                resources.append(api)
+            outbox = getattr(self.observer, "outbox", None)
+            sender = getattr(outbox, "sender", None)
+            if sender is not None:
+                resources.append(sender)
+                sender_api = getattr(sender, "api", None)
+                if sender_api is not None:
+                    resources.append(sender_api)
+        for resource in resources:
+            if id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
 
 
 def build_agent(
@@ -426,6 +580,13 @@ def run_agent(spec: AgentSpec, default_home: Path) -> None:
         help="Stimulus log location (default: <home>/stimulus_log.jsonl)",
     )
     parser.add_argument("--check", action="store_true", help="Validate without creating state or starting the agent")
+    parser.add_argument("--preflight", action="store_true", help="Validate local state without external activity")
+    parser.add_argument("--managed", action="store_true", help="Use the bounded deployment lifecycle")
+    parser.add_argument("--deployment-id")
+    parser.add_argument("--agent-id")
+    parser.add_argument("--control-path", type=Path)
+    parser.add_argument("--status-path", type=Path)
+    parser.add_argument("--shutdown-timeout", type=float, default=30.0)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     spec.validate()
@@ -435,7 +596,42 @@ def run_agent(spec: AgentSpec, default_home: Path) -> None:
     from theseus.deployment_store import runtime_lock
 
     with runtime_lock(args.home):
-        build_agent(spec, args.home, log_path=args.log_path).run()
+        agent = build_agent(spec, args.home, log_path=args.log_path)
+        if args.preflight:
+            print(json.dumps(agent.preflight(), sort_keys=True))
+            return
+        if not args.managed:
+            agent.run()
+            return
+        missing = [
+            name for name, value in (
+                ("--deployment-id", args.deployment_id),
+                ("--agent-id", args.agent_id),
+                ("--control-path", args.control_path),
+                ("--status-path", args.status_path),
+            ) if value is None
+        ]
+        if missing:
+            parser.error(f"--managed requires {', '.join(missing)}")
+
+        previous = signal.getsignal(signal.SIGTERM)
+
+        def request_shutdown(_signum, _frame) -> None:
+            agent.request_shutdown()
+
+        signal.signal(signal.SIGTERM, request_shutdown)
+        try:
+            clean = agent.run_managed(
+                deployment_id=args.deployment_id,
+                agent_id=args.agent_id,
+                control_path=args.control_path,
+                status_path=args.status_path,
+                shutdown_timeout_seconds=args.shutdown_timeout,
+            )
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        if not clean:
+            parser.exit(1, f"{spec.name}: shutdown deadline expired or drain failed\n")
 
 
 def main() -> None:
