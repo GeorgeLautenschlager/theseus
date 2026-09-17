@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 
+from theseus.backup_status import deployment_recovery_status
 from theseus.backup_store import LocalObjectStore, S3ObjectStore
 from theseus.deployment_snapshot import DeploymentSnapshots
 from theseus.manage_deployment import _controller
@@ -35,7 +36,9 @@ def main() -> None:
         description="Upload, inspect, and restore exact Theseus deployment backups"
     )
     parser.add_argument("bundle", type=Path)
-    parser.add_argument("action", choices=("create", "upload", "list", "download", "restore"))
+    parser.add_argument(
+        "action", choices=("create", "upload", "list", "download", "restore", "status")
+    )
     parser.add_argument("--endpoint", help="Cloudflare R2 S3 endpoint URL")
     parser.add_argument("--bucket", help="Cloudflare R2 bucket")
     parser.add_argument("--local-store", type=Path, help="filesystem object store for offline use")
@@ -64,6 +67,9 @@ def main() -> None:
             if not args.snapshot:
                 parser.error("upload requires --snapshot with a local snapshot directory")
             value = asdict(service.upload(Path(args.snapshot)))
+        elif args.action == "status":
+            controller = _controller(args.bundle, args.root)
+            value = deployment_recovery_status(controller, service, args.bundle)
         elif args.action == "list":
             value = [
                 {

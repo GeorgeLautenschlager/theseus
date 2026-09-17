@@ -26,6 +26,7 @@ autobot = "theseus.agents.autobot:main"
 theseus-build = "theseus.build_deployment:main"
 theseus-deployment = "theseus.manage_deployment:main"
 theseus-backup = "theseus.manage_backup:main"
+theseus-backup-schedule = "theseus.manage_backup_schedule:main"
 theseus-host = "theseus.manage_host:main"
 theseus-migrate = "theseus.manage_migration:main"
 
