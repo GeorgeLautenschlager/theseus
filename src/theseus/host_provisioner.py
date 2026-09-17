@@ -849,6 +849,8 @@ class HostProvisioner:
 
     def mark_activated(self) -> ProvisionResult:
         state, preview = self._load_existing_state()
+        if state.get("phase") == "activated" and state.get("activated") is True:
+            return self._result(state, preview)
         if state.get("phase") != "ready":
             raise RuntimeError("only a ready destination can be marked activated")
         self._save(state, "activated", activated=True)

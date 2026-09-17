@@ -33,7 +33,10 @@ def main() -> None:
     parser.add_argument("bundle", type=Path)
     parser.add_argument(
         "action",
-        choices=("start", "stop", "status", "retire", "recovery", "backup", "restore"),
+        choices=(
+            "start", "resume-start", "stop", "status", "retire", "recovery",
+            "backup", "restore",
+        ),
     )
     parser.add_argument("--root", type=Path)
     parser.add_argument("--timeout", type=int, default=30)
@@ -46,6 +49,8 @@ def main() -> None:
         controller = _controller(args.bundle, args.root)
         if args.action == "start":
             value = controller.start(args.services)
+        elif args.action == "resume-start":
+            value = controller.resume_start()
         elif args.action == "stop":
             value = controller.stop(timeout_seconds=args.timeout)
         elif args.action == "retire":

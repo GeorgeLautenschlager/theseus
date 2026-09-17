@@ -118,6 +118,15 @@ class DownloadedBackup:
     manifest: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ReleaseArtifacts:
+    release_id: str
+    bundle_archive: Path
+    bundle_sha256: str
+    image_archives: tuple[Path, ...]
+    image_descriptors: tuple[dict[str, Any], ...]
+
+
 class RemoteBackups:
     """Publish completion manifests last and restore only verified backups."""
 
@@ -326,6 +335,21 @@ class RemoteBackups:
 
     def _status_path(self, snapshot: Path) -> Path:
         return snapshot / REMOTE_STATUS_FILE
+
+    def stage_release(self, directory: Path) -> ReleaseArtifacts:
+        """Export the exact bundle and images before migration downtime begins."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        marker = directory / "preload"
+        bundle = self._release_archive(marker)
+        images = self._image_archives(marker)
+        return ReleaseArtifacts(
+            release_id=self.release_id,
+            bundle_archive=bundle,
+            bundle_sha256=_sha256_file(bundle),
+            image_archives=tuple(path for path, _ in images),
+            image_descriptors=tuple(descriptor for _, descriptor in images),
+        )
 
     def _write_status(self, snapshot: Path, result: BackupResult, state: str) -> None:
         _atomic_json(self._status_path(snapshot), {"state": state, **asdict(result)})
