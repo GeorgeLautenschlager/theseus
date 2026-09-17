@@ -16,6 +16,12 @@ from theseus.deployment_control import (
     OperationRecord,
     operation_lock,
 )
+from theseus.deployment_snapshot import (
+    DeploymentSnapshots,
+    SnapshotResult,
+    inventory,
+    validate_state_copy,
+)
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.command_reports import (
@@ -93,6 +99,10 @@ __all__ = [
     "OperationJournal",
     "OperationRecord",
     "operation_lock",
+    "DeploymentSnapshots",
+    "SnapshotResult",
+    "inventory",
+    "validate_state_copy",
     "InterfaceSpec",
     "MemorySpec",
     "ModelSpec",
