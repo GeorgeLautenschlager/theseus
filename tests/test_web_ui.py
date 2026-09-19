@@ -43,7 +43,7 @@ def test_post_chat_empty_message_ignored():
 
 def test_publish_agent_message_fans_out_and_records():
     ui, _ = _make_ui()
-    listener = ui._add_listener()
+    listener = ui._add_listener(ui._listeners)
     ui.publish_agent_message("hello")
     fragment = listener.get_nowait()
     assert "hello" in fragment

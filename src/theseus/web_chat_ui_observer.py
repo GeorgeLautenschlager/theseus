@@ -24,11 +24,8 @@ from starlette.concurrency import run_in_threadpool
 
 from theseus.web.debug_pagination import most_recent_page, older_batch
 from theseus.web.markdown import render_markdown
+from theseus.web.assets import STATIC_DIR, TEMPLATES_DIR, format_sse_event
 from theseus.web.preview import notification_preview
-
-_WEB_DIR = Path(__file__).parent / "web"
-_TEMPLATES_DIR = _WEB_DIR / "templates"
-_STATIC_DIR = _WEB_DIR / "static"
 
 _SSE_POLL_TIMEOUT_SECONDS = 15
 _DEBUG_PAGE_SIZE = 25
@@ -80,7 +77,7 @@ class WebChatUIObserver:
         self._debug_listeners: list[Queue] = []
         self._debug_last_id: str | None = None
         self._debug_poll_thread: threading.Thread | None = None
-        self._templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+        self._templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
         self._templates.env.filters["pretty_json"] = lambda content: json.dumps(
             content, indent=2, ensure_ascii=False
         )
@@ -172,7 +169,7 @@ class WebChatUIObserver:
                 except Empty:
                     yield ": keep-alive\n\n"
                     continue
-                yield _format_sse_event(fragment)
+                yield format_sse_event(fragment)
         finally:
             with self._lock:
                 if queue in listeners:
@@ -239,7 +236,7 @@ class WebChatUIObserver:
 
     def _build_app(self) -> FastAPI:
         app = FastAPI()
-        app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
         @app.get("/", response_class=HTMLResponse)
         async def index(request: Request):
@@ -295,8 +292,3 @@ class WebChatUIObserver:
         # tab left open.
         uvicorn.run(self.app, host=host, port=port, timeout_graceful_shutdown=3)
 
-
-def _format_sse_event(html_fragment: str) -> str:
-    lines = html_fragment.splitlines() or [""]
-    payload = "\n".join(f"data: {line}" for line in lines)
-    return f"event: message\n{payload}\n\n"
