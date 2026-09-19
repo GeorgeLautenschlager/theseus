@@ -52,8 +52,9 @@ def build_windows_surrogate(
     log = StimulusLog(data_dir / "stimulus_log.jsonl", origin=origin)
     upstream_cursor = AckedCursor(data_dir / "upstream_cursor.json", origin)
     command_cursor = AckedCursor(data_dir / "command_cursor.json", origin)
-    transport = HttpTransport(host_url.rstrip("/") + "/replicate")
-    command_channel = SseCommandChannel(host_url + "/commands/" + origin, command_cursor)
+    base_url = host_url.rstrip("/")
+    transport = HttpTransport(base_url + "/replicate")
+    command_channel = SseCommandChannel(base_url + "/commands/" + origin, command_cursor)
     notifier = ConsoleNotifier() if headless else ToastNotifier()
 
     runtime: SurrogateRuntime  # assigned in step 4; closure reads it at call time
