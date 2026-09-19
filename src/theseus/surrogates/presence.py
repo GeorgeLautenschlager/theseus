@@ -1,13 +1,17 @@
-"""The presence seams between a surrogate and its OS-facing surfaces (issue #95).
+"""A surrogate's presence: the OS-facing surface seams and the command renderer.
 
 A surrogate "shows up" through two OS-facing surfaces: the on-screen chat it speaks
 into and the native notifications it raises. Neither belongs to the runtime — a
 Windows surrogate uses a command-rendered chat window and toast notifications, the
 web observer (#98) implements `ChatSurface` against the browser, and headless/dev
-runs just print. These protocols are the seam that makes those swappable, so the
-runtime is testable on Linux without any Windows or web-framework dependency.
+runs just print. `ChatSurface` and `Notifier` are the seams that make those
+swappable, so the runtime is testable on Linux without any Windows or web-framework
+dependency (issue #95).
 
-Pure interfaces only: no OS imports, no I/O beyond `ConsoleNotifier`'s print.
+`WindowsPresence` (issue #96) is the `CommandExecutor` renderer that drives those
+seams: it turns a `command.say`/`command.notify` into chat + toast output. It holds
+no OS imports of its own — all I/O goes through the injected surfaces (and
+`ConsoleNotifier`'s print) — so this module stays importable and testable anywhere.
 """
 
 from __future__ import annotations
