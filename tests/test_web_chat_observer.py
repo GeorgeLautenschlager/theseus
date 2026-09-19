@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 
 from theseus.stimulus_log import StimulusLog
+from fastapi.testclient import TestClient
+
 from theseus.web_chat_ui_observer import WebChatUIObserver
 
 
@@ -26,3 +28,12 @@ def test_submit_handler_never_blocks_on_the_cognitive_cycle(tmp_path):
 
     gate.set()
     assert ran.wait(2), "cycle never ran on the background thread"
+
+
+def test_debug_older_bad_limit_falls_back_not_500(tmp_path):
+    log = StimulusLog(path=tmp_path / "stimulus_log.jsonl")
+    log.append(actor="user", type="chat_message", content={"message": "hi"})
+    obs = WebChatUIObserver(orient_chat_message_callback=lambda: None, stimulus_log=log)
+    client = TestClient(obs.app)
+    response = client.get("/debug/older", params={"limit": "abc"})
+    assert response.status_code == 200

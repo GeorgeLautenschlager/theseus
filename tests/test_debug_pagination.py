@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from theseus.stimulus_log import StimulusEvent, StimulusLog
-from theseus.web.debug_pagination import most_recent_page, older_batch
+from theseus.web.debug_pagination import most_recent_page, older_batch, parse_int_param
 
 
 def _event(id: str) -> StimulusEvent:
@@ -88,3 +88,17 @@ class TestAgainstRealStimulusLog:
         older, has_more_older = older_batch(events, before_id=page[0].id, limit=25)
         assert has_more_older is False
         assert [e.content["i"] for e in older] == list(range(0, 15))
+
+
+class TestParseIntParam:
+    def test_valid_integer(self):
+        assert parse_int_param("5", 25) == 5
+
+    def test_non_integer_falls_back(self):
+        assert parse_int_param("abc", 25) == 25
+
+    def test_none_falls_back(self):
+        assert parse_int_param(None, 25) == 25
+
+    def test_empty_falls_back(self):
+        assert parse_int_param("", 25) == 25
