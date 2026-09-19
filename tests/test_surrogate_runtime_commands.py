@@ -10,6 +10,8 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timezone
 
+import pytest
+
 from theseus.command_reports import Executed
 from theseus.commands import command_content, command_type
 from theseus.stimulus_log import StimulusEvent, StimulusLog
@@ -17,8 +19,6 @@ from theseus.surrogates.command_channel import MemoryCommandChannel
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.runtime import SurrogateRuntime
 from theseus.surrogates.transport import TransportResult
-
-import pytest
 
 
 class FakeTransport:
@@ -97,7 +97,8 @@ def test_report_drains_upstream(tmp_path) -> None:
     runtime._executor.run(channel)
     runtime._drain_once()
     assert any("command_report.executed" in b for b in transport.sent)
-    assert not any("command.say" in b for b in transport.sent)  # host-origin doesn't replicate
+    # The host-origin command was never on the surrogate's log, so only its report ships.
+    assert not any("command.say" in b for b in transport.sent)
 
 
 def test_start_stop_smoke(tmp_path) -> None:

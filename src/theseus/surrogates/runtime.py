@@ -48,10 +48,10 @@ class SurrogateRuntime:
         log: StimulusLog,
         transport: StimulusTransport,
         upstream_cursor: AckedCursor,
+        *,
         command_channel: CommandChannel | None = None,
         renderer: Renderer | None = None,
         command_cursor: AckedCursor | None = None,
-        *,
         user_actor: str = "user",
         flush_interval_seconds: float = 30.0,
     ) -> None:
