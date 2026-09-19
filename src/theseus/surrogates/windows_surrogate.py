@@ -100,6 +100,9 @@ def main() -> None:
     if args.headless:
         # ponytail: serve on the main thread headlessly; shell mode needs it free for pywebview
         print(f"Surrogate UI: {url}")
+        # Serve-and-return: this blocks until the process is killed, and every runtime
+        # thread is a daemon, so there is no shutdown path here to call runtime.stop() on
+        # (mirrors surrogate_host.main). Graceful headless shutdown is a follow-up.
         app.web_ui.serve(args.ui_host, args.ui_port)
         return
 
@@ -113,6 +116,9 @@ def main() -> None:
     )
     ui_thread.start()
     run_shell(url, on_quit=app.runtime.stop, title="Theseus")  # blocks on the main thread
+    # Belt-and-suspenders: tray Quit already fired on_quit=runtime.stop on the tray thread,
+    # but a window close (no Quit) does not — so stop again here. runtime.stop() is
+    # idempotent and safe to call twice/concurrently (guarded, None-out, idempotent close).
     app.runtime.stop()
 
 

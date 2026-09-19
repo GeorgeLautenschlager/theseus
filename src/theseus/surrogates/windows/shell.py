@@ -39,13 +39,17 @@ def run_shell(
     import webview
 
     def _quit(icon, item) -> None:
-        webview.windows[0].destroy() if webview.windows else None
+        if webview.windows:
+            webview.windows[0].destroy()
         on_quit()
 
     def _toggle(icon, item) -> None:
         if webview.windows:
             window = webview.windows[0]
-            window.show() if window.hidden else window.hide()
+            if window.hidden:
+                window.show()
+            else:
+                window.hide()
 
     def _run_tray() -> None:
         # PIL is pystray's default backend requirement; imported lazily with it
