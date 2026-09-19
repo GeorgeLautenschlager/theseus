@@ -16,3 +16,4 @@ def test_run_shell_signature() -> None:
     assert "url" in params
     assert "on_quit" in params
     assert "title" in params
+    assert "on_focus_change" in params

@@ -53,3 +53,8 @@ def test_publish_agent_message_fans_out_and_records():
 
 def test_is_focused_defaults_true():
     assert SurrogateWebUI(lambda _t: None).is_focused() is True
+
+
+def test_is_focused_uses_provider():
+    assert SurrogateWebUI(lambda _t: None, focus_provider=lambda: False).is_focused() is False
+    assert SurrogateWebUI(lambda _t: None, focus_provider=lambda: True).is_focused() is True

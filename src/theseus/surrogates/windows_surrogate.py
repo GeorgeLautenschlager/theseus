@@ -24,6 +24,26 @@ from theseus.surrogates.web_ui import SurrogateWebUI
 from theseus.surrogates.windows.toast import ToastNotifier
 
 
+class FocusState:
+    """Thread-safe holder for the shell window's focus state (default: focused).
+
+    Written from the pywebview/tray thread via `set`, read from the web request
+    thread via `is_focused`, so the bool is guarded by a lock.
+    """
+
+    def __init__(self) -> None:
+        self._focused = True
+        self._lock = threading.Lock()
+
+    def is_focused(self) -> bool:
+        with self._lock:
+            return self._focused
+
+    def set(self, focused: bool) -> None:
+        with self._lock:
+            self._focused = focused
+
+
 @dataclass(frozen=True)
 class WindowsSurrogateApp:
     """Everything the surrogate assembled, so `main` and tests can reach the parts."""
@@ -33,6 +53,7 @@ class WindowsSurrogateApp:
     notifier: ConsoleNotifier | ToastNotifier
     origin: str
     headless: bool
+    focus_state: FocusState
 
 
 def build_windows_surrogate(
@@ -58,9 +79,11 @@ def build_windows_surrogate(
     notifier = ConsoleNotifier() if headless else ToastNotifier()
 
     runtime: SurrogateRuntime  # assigned in step 4; closure reads it at call time
+    focus_state = FocusState()
     web_ui = SurrogateWebUI(
         submit_user_message=lambda text: runtime.submit_user_message(text),
         stimulus_log=log,
+        focus_provider=focus_state.is_focused,
     )
     renderer = WindowsPresence(web_ui, notifier)
     runtime = SurrogateRuntime(
@@ -77,6 +100,7 @@ def build_windows_surrogate(
         notifier=notifier,
         origin=origin,
         headless=headless,
+        focus_state=focus_state,
     )
 
 
@@ -115,7 +139,12 @@ def main() -> None:
         daemon=True,
     )
     ui_thread.start()
-    run_shell(url, on_quit=app.runtime.stop, title="Theseus")  # blocks on the main thread
+    run_shell(
+        url,
+        on_quit=app.runtime.stop,
+        title="Theseus",
+        on_focus_change=app.focus_state.set,
+    )  # blocks on the main thread
     # Belt-and-suspenders: tray Quit already fired on_quit=runtime.stop on the tray thread,
     # but a window close (no Quit) does not — so stop again here. runtime.stop() is
     # idempotent and safe to call twice/concurrently (guarded, None-out, idempotent close).

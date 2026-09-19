@@ -8,6 +8,7 @@ from theseus.command_reports import Executed, Failed
 from theseus.commands import command_type
 from theseus.stimulus_log import StimulusEvent
 from theseus.surrogates.presence import WindowsPresence
+from theseus.surrogates.web_ui import SurrogateWebUI
 
 
 class FakeChat:
@@ -54,6 +55,21 @@ def test_unfocused_say_also_notifies():
     assert isinstance(outcome, Executed)
     assert chat.published == ["hi"]
     assert notifier.calls == [("New message", "hi")]
+
+
+def test_unfocused_say_toasts_through_real_focus_provider():
+    # Issue #116 item 4: a real SurrogateWebUI with an unfocused provider toasts a say.
+    notifier = FakeNotifier()
+    web_ui = SurrogateWebUI(submit_user_message=lambda _t: None, focus_provider=lambda: False)
+    WindowsPresence(web_ui, notifier)(event("say", {"payload": {"text": "hi"}}))
+    assert notifier.calls == [("New message", "hi")]
+
+
+def test_focused_say_does_not_toast_through_real_focus_provider():
+    notifier = FakeNotifier()
+    web_ui = SurrogateWebUI(submit_user_message=lambda _t: None, focus_provider=lambda: True)
+    WindowsPresence(web_ui, notifier)(event("say", {"payload": {"text": "hi"}}))
+    assert notifier.calls == []
 
 
 def test_notify_calls_notifier():
