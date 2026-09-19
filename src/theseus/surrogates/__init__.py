@@ -7,6 +7,7 @@ from theseus.surrogates.presence import (
 )
 from theseus.surrogates.runtime import SurrogateRuntime
 from theseus.surrogates.web_ui import SurrogateWebUI
+from theseus.surrogates.windows_surrogate import WindowsSurrogateApp, build_windows_surrogate
 
 __all__ = [
     "ChatSurface",
@@ -17,4 +18,6 @@ __all__ = [
     "SurrogateRuntime",
     "SurrogateWebUI",
     "WindowsPresence",
+    "WindowsSurrogateApp",
+    "build_windows_surrogate",
 ]
