@@ -1,5 +1,7 @@
 """Tests for the presence seams (issue #95): ChatSurface, Notifier, ConsoleNotifier."""
 
+from __future__ import annotations
+
 from theseus.surrogates import ChatSurface, ConsoleNotifier, Notifier
 
 
