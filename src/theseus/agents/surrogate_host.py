@@ -47,9 +47,9 @@ def build_surrogate_host(
 ) -> SurrogateHost:
     """Wire the host's HTTP surface. No cognitive core, no model — offline-testable.
 
-    `orient_callback` is invoked with no arguments (by the ingress, after a burst)
-    and by the chat observer (with the incoming message) — `Autocore.wake` accepts
-    both shapes, which is why one callback serves both.
+    `orient_callback` is invoked with no arguments by both the ingress (after a burst)
+    and the chat observer (`orient_chat_message_callback`, `Callable[[], None]`), so one
+    zero-arg callback — e.g. `Autocore.wake`, which tolerates being called bare — serves both.
     """
     observer = WebChatUIObserver(
         stimulus_log=log, orient_chat_message_callback=orient_callback
