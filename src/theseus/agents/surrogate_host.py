@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,7 +42,7 @@ class SurrogateHost:
 def build_surrogate_host(
     log: StimulusLog,
     marks: HighWaterMarks,
-    orient_callback,
+    orient_callback: Callable[[], None],
     *,
     target: str = "windows-desktop",
 ) -> SurrogateHost:
