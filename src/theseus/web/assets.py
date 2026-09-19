@@ -14,6 +14,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 
 def format_sse_event(html_fragment: str) -> str:
+    """Frame one HTML fragment as an SSE `event: message` with `data:` lines."""
     lines = html_fragment.splitlines() or [""]
     payload = "\n".join(f"data: {line}" for line in lines)
     return f"event: message\n{payload}\n\n"

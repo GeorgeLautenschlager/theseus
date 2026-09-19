@@ -12,7 +12,6 @@ import time
 import traceback
 import uuid
 from datetime import datetime
-from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable
 
@@ -22,9 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
+from theseus.web.assets import STATIC_DIR, TEMPLATES_DIR, format_sse_event
 from theseus.web.debug_pagination import most_recent_page, older_batch
 from theseus.web.markdown import render_markdown
-from theseus.web.assets import STATIC_DIR, TEMPLATES_DIR, format_sse_event
 from theseus.web.preview import notification_preview
 
 _SSE_POLL_TIMEOUT_SECONDS = 15

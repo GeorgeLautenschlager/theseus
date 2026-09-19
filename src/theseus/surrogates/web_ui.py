@@ -26,10 +26,10 @@ from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
 from theseus.stimulus_log import StimulusLog
+from theseus.web.assets import STATIC_DIR, TEMPLATES_DIR, format_sse_event
 from theseus.web.debug_pagination import most_recent_page, older_batch
 from theseus.web.markdown import render_markdown
 from theseus.web.preview import notification_preview
-from theseus.web.assets import STATIC_DIR, TEMPLATES_DIR, format_sse_event
 
 _SSE_POLL_TIMEOUT_SECONDS = 15
 _DEBUG_PAGE_SIZE = 25
