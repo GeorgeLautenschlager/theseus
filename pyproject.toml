@@ -23,6 +23,7 @@ dependencies = [
 [project.scripts]
 alty = "theseus.agents.alty_mcgee:main"
 autobot = "theseus.agents.autobot:main"
+surrogate-host = "theseus.agents.surrogate_host:main"
 theseus-build = "theseus.build_deployment:main"
 theseus-deployment = "theseus.manage_deployment:main"
 theseus-backup = "theseus.manage_backup:main"
