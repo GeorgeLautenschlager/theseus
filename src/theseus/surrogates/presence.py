@@ -77,7 +77,7 @@ class WindowsPresence:
                 return Failed(reason="command.say payload missing 'text'")
             self.chat.publish_agent_message(text)
             if not self.chat.is_focused():
-                # ponytail: fixed toast title; a per-message title needs a host contract change
+                # fixed toast title; a per-message title needs a host contract change
                 self.notifier.notify("New message", text)
             return Executed()
         if event.type == command_type("notify"):
