@@ -22,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 alty = "theseus.agents.alty_mcgee:main"
+alty-host = "theseus.agents.alty_mcgee:host_main"
 autobot = "theseus.agents.autobot:main"
 surrogate-host = "theseus.agents.surrogate_host:main"
 windows-surrogate = "theseus.surrogates.windows_surrogate:main"
