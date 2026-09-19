@@ -39,8 +39,8 @@ def test_notify_appends_command(tmp_path):
     assert result.is_error is False
 
 
-def test_ends_turn_flags():
-    log = StimulusLog("/tmp/unused.jsonl", origin="x")
+def test_ends_turn_flags(tmp_path):
+    log = make_log(tmp_path)
     assert SaySurrogate("t", log).ends_turn is True
     assert NotifySurrogate("t", log).ends_turn is False
 
