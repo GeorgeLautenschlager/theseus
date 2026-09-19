@@ -5,6 +5,7 @@ from theseus.surrogates.presence import (
     Notifier,
     WindowsPresence,
 )
+from theseus.surrogates.web_ui import SurrogateWebUI
 
 __all__ = [
     "ChatSurface",
@@ -12,5 +13,6 @@ __all__ = [
     "ConsoleNotifier",
     "MemoryCommandChannel",
     "Notifier",
+    "SurrogateWebUI",
     "WindowsPresence",
 ]
