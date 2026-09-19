@@ -56,6 +56,9 @@ class SurrogateRuntime:
         self._log.append(
             actor=self._user_actor, type="chat_message", content={"message": text}
         )
+        # Explicit ring covers the pre-start / manual-drain path; once start() has
+        # subscribed, the append above also rings via the listener. Both are kept —
+        # the rings coalesce, so the redundancy is free and neither path is left silent.
         self._trigger.request()
 
     def start(self) -> None:
