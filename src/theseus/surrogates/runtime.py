@@ -92,21 +92,14 @@ class SurrogateRuntime:
         self._trigger.request()
 
     def start(self) -> None:
-        """Wire the append listener, the trigger worker, and the periodic flush.
+        """Wire the drain (subscribe + trigger + flush), then start the command loop.
 
         Idempotent: every step is either inherently idempotent (subscribe, trigger
-        start) or guarded, so calling `start` twice does not double the drain.
+        start) or guarded, so calling `start` twice does not double the drain. The drain
+        listener is wired *before* the command thread, so a report the executor appends
+        the instant it starts is rung for a drain rather than waiting on the flush
+        backstop.
         """
-        if self._command_channel is not None and (
-            self._command_thread is None or not self._command_thread.is_alive()
-        ):
-            self._command_thread = threading.Thread(
-                target=self._executor.run,
-                args=(self._command_channel,),
-                name="surrogate-command",
-                daemon=True,
-            )
-            self._command_thread.start()
         if self._unsubscribe is None:
             self._unsubscribe = self._log.subscribe(
                 lambda _event: self._trigger.request()
@@ -118,6 +111,16 @@ class SurrogateRuntime:
                 target=self._flush_loop, name="surrogate-drain-flush", daemon=True
             )
             self._flush_thread.start()
+        if self._command_channel is not None and (
+            self._command_thread is None or not self._command_thread.is_alive()
+        ):
+            self._command_thread = threading.Thread(
+                target=self._executor.run,
+                args=(self._command_channel,),
+                name="surrogate-command",
+                daemon=True,
+            )
+            self._command_thread.start()
 
     def stop(self) -> None:
         """Close the command channel and join the command thread, then tear down the
@@ -125,14 +128,19 @@ class SurrogateRuntime:
 
         Command-first ordering: closing the channel ends `stream()`, so the executor
         finishes its last report and exits while the drain listener is still
-        subscribed — that final `command_report.*` still rings the trigger and ships
-        upstream before the drain stops.
+        subscribed, giving that final `command_report.*` a chance to ring the trigger.
+        Shipping it at shutdown is best-effort, though — `CoalescingTrigger.stop()` drops
+        a request that has not yet started a drain — so anything unshipped rides the
+        drain's at-least-once recovery and ships on the next `start()`.
         """
         if self._command_channel is not None:
             self._command_channel.close()
         if self._command_thread is not None:
             self._command_thread.join(timeout=10.0)
-            self._command_thread = None
+            # Only forget a thread that actually stopped, mirroring CoalescingTrigger:
+            # nulling a still-alive one would let a later start() spawn a second beside it.
+            if not self._command_thread.is_alive():
+                self._command_thread = None
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
