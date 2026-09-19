@@ -26,10 +26,10 @@ from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
 from theseus.stimulus_log import StimulusLog
+from theseus.web.assets import STATIC_DIR, TEMPLATES_DIR, format_sse_event
 from theseus.web.debug_pagination import most_recent_page, older_batch
 from theseus.web.markdown import render_markdown
 from theseus.web.preview import notification_preview
-from theseus.web_chat_ui_observer import _STATIC_DIR, _TEMPLATES_DIR, _format_sse_event
 
 _SSE_POLL_TIMEOUT_SECONDS = 15
 _DEBUG_PAGE_SIZE = 25
@@ -60,7 +60,7 @@ class SurrogateWebUI:
         self._debug_listeners: list[Queue] = []
         self._debug_last_id: str | None = None
         self._debug_poll_thread: threading.Thread | None = None
-        self._templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+        self._templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
         self._templates.env.filters["pretty_json"] = lambda content: json.dumps(
             content, indent=2, ensure_ascii=False
         )
@@ -107,16 +107,14 @@ class SurrogateWebUI:
         self.submit_user_message(message)
         return self._templates.get_template("_chat_submit_fragment.html").render(**entry)
 
-    def _add_listener(self) -> Queue:
-        queue: Queue = Queue()
-        with self._lock:
-            self._listeners.append(queue)
-        return queue
-
-    async def _sse_stream(self, request: Request, listeners: list[Queue]):
+    def _add_listener(self, listeners: list[Queue]) -> Queue:
         queue: Queue = Queue()
         with self._lock:
             listeners.append(queue)
+        return queue
+
+    async def _sse_stream(self, request: Request, listeners: list[Queue]):
+        queue = self._add_listener(listeners)
         try:
             yield "retry: 2000\n\n"
             while True:
@@ -127,7 +125,7 @@ class SurrogateWebUI:
                 except Empty:
                     yield ": keep-alive\n\n"
                     continue
-                yield _format_sse_event(fragment)
+                yield format_sse_event(fragment)
         finally:
             with self._lock:
                 if queue in listeners:
@@ -192,7 +190,7 @@ class SurrogateWebUI:
 
     def _build_app(self) -> FastAPI:
         app = FastAPI()
-        app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
         @app.get("/", response_class=HTMLResponse)
         async def index(request: Request):

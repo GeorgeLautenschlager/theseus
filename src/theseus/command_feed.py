@@ -224,7 +224,7 @@ def _format_sse(event: StimulusEvent) -> str:
     """One SSE frame: `id:` carries the cursor (`seq`), `event:` the log type, `data:`
     the event's JSON — split across multiple `data:` lines, because a raw newline
     inside one `data:` line ends the event early. Same shape as
-    `web_chat_ui_observer._format_sse_event`, plus the `id:` field that replay needs."""
+    `theseus.web.assets.format_sse_event`, plus the `id:` field that replay needs."""
     lines = event.to_json().splitlines() or [""]
     payload = "\n".join(f"data: {line}" for line in lines)
     id_line = "" if event.seq is None else f"id: {event.seq}\n"
