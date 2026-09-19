@@ -34,3 +34,10 @@ def test_chat_submit_reaches_runtime_log(tmp_path: Path) -> None:
 def test_command_half_is_wired(tmp_path: Path) -> None:
     app = build_windows_surrogate("http://host:8800", data_dir=tmp_path, headless=True)
     assert app.runtime._executor is not None
+
+
+def test_focus_state_wired_to_web_ui(tmp_path: Path) -> None:
+    app = build_windows_surrogate("http://host:8800", data_dir=tmp_path, headless=True)
+    assert app.web_ui.is_focused() is True
+    app.focus_state.set(False)
+    assert app.web_ui.is_focused() is False

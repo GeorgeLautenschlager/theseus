@@ -43,17 +43,20 @@ class SurrogateWebUI:
     provides it); the HTTP request returns promptly — the callback owns whatever
     happens next, this class never appends to a log or triggers orient.
 
-    `is_focused` is a best-effort `True` for now; the pywebview shell in #104
-    refines it.
+    `is_focused` answers via the injected `focus_provider` when one was given
+    (the Windows shell feeds the pywebview window's focus state in); default True.
     """
 
     def __init__(
         self,
         submit_user_message: Callable[[str], None],
         stimulus_log: StimulusLog | None = None,
+        *,
+        focus_provider: Callable[[], bool] | None = None,
     ):
         self.submit_user_message = submit_user_message
         self.stimulus_log = stimulus_log
+        self._focus_provider = focus_provider
         self.transcript: list[dict] = []
         self._listeners: list[Queue] = []
         self._lock = threading.Lock()
@@ -87,8 +90,7 @@ class SurrogateWebUI:
             queue.put(fragment)
 
     def is_focused(self) -> bool:
-        # best-effort default; the pywebview shell (#104) refines it
-        return True
+        return self._focus_provider() if self._focus_provider else True
 
     # -- internals -----------------------------------------------------------
 

@@ -10,9 +10,12 @@ Like `toast.py`, both Windows-only dependencies (pywebview, pystray) are importe
 lazily inside `run_shell`, so importing this module requires nothing beyond the
 standard library and unit tests run on Linux with neither dep installed.
 
-Follow-up (documented non-goal here): wiring the window's focus state into
-`SurrogateWebUI.is_focused()` so an unfocused `command.say` also toasts.
-`command.notify` toasts unconditionally, so notifications work now.
+The window's focus/blur events (where pywebview exposes them) are fed to the
+optional `on_focus_change` callback, so an unfocused `command.say` also toasts.
+The subscription is best-effort: pywebview's focus events are version/OS-dependent,
+so if they are unavailable the wiring simply does not subscribe and focus stays at
+the `FocusState` default (focused), a safe fallback.
+`command.notify` toasts unconditionally, so notifications work regardless.
 """
 
 from __future__ import annotations
@@ -25,18 +28,22 @@ def run_shell(
     *,
     on_quit: Callable[[], None] = lambda: None,
     title: str = "Theseus",
+    on_focus_change: Callable[[bool], None] | None = None,
 ) -> None:
     """Open `url` in a pywebview window with a tray icon; block until the app closes.
 
     Called on the MAIN thread by the entry point. Returns when the window is closed
     (or Quit is chosen from the tray, which also stops pywebview).
     """
-    # ponytail: window-focus → is_focused wiring deferred; command.notify already toasts
     import io
     import threading
 
     import pystray
     import webview
+
+    def _focus(focused: bool) -> None:
+        if on_focus_change is not None:
+            on_focus_change(focused)
 
     def _quit(icon, item) -> None:
         if webview.windows:
@@ -67,6 +74,12 @@ def run_shell(
         icon = pystray.Icon("theseus", Image.open(io.BytesIO(png)), title, menu)
         icon.run()
 
-    webview.create_window(title, url, width=900, height=700, on_top=False)
+    window = webview.create_window(title, url, width=900, height=700, on_top=False)
+    # Best-effort focus wiring: pywebview's focus/blur events are version/OS-dependent,
+    # so only subscribe when they exist; otherwise focus stays at the FocusState default.
+    if on_focus_change is not None and getattr(window.events, "focused", None) is not None:
+        window.events.focused += lambda: _focus(True)
+        if getattr(window.events, "blurred", None) is not None:
+            window.events.blurred += lambda: _focus(False)
     threading.Thread(target=_run_tray, name="surrogate-tray", daemon=True).start()
     webview.start()
