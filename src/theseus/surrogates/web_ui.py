@@ -70,7 +70,7 @@ class SurrogateWebUI:
             queue.put(fragment)
 
     def is_focused(self) -> bool:
-        # ponytail: best-effort default; the pywebview shell (#104) refines it
+        # best-effort default; the pywebview shell (#104) refines it
         return True
 
     # -- internals -----------------------------------------------------------

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from queue import Queue
-
 from fastapi.testclient import TestClient
 
 from theseus.surrogates.presence import ChatSurface
@@ -45,9 +43,7 @@ def test_post_chat_empty_message_ignored():
 
 def test_publish_agent_message_fans_out_and_records():
     ui, _ = _make_ui()
-    listener: Queue = Queue()
-    with ui._lock:
-        ui._listeners.append(listener)
+    listener = ui._add_listener()
     ui.publish_agent_message("hello")
     fragment = listener.get_nowait()
     assert "hello" in fragment
