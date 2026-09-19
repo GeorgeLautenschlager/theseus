@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import argparse
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from theseus.stimulus_log import StimulusLog
@@ -24,7 +24,6 @@ from theseus.surrogates.web_ui import SurrogateWebUI
 from theseus.surrogates.windows.toast import ToastNotifier
 
 
-@dataclass(frozen=True)
 class FocusState:
     """Thread-safe holder for the shell window's focus state (default: focused).
 
@@ -32,8 +31,9 @@ class FocusState:
     thread via `is_focused`, so the bool is guarded by a lock.
     """
 
-    _focused: bool = field(default=True, init=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    def __init__(self) -> None:
+        self._focused = True
+        self._lock = threading.Lock()
 
     def is_focused(self) -> bool:
         with self._lock:
@@ -41,7 +41,7 @@ class FocusState:
 
     def set(self, focused: bool) -> None:
         with self._lock:
-            object.__setattr__(self, "_focused", focused)
+            self._focused = focused
 
 
 @dataclass(frozen=True)
