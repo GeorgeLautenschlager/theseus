@@ -24,6 +24,14 @@ def most_recent_page(
     return page, len(events) > len(page)
 
 
+def parse_int_param(raw: str | None, default: int) -> int:
+    """Parse a query-param integer, falling back to `default` instead of raising."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def older_batch(
     events: list[StimulusEvent], before_id: str, limit: int
 ) -> tuple[list[StimulusEvent], bool]:

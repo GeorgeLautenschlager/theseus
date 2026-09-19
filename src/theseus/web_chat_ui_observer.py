@@ -22,7 +22,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
 from theseus.web.assets import STATIC_DIR, TEMPLATES_DIR, format_sse_event
-from theseus.web.debug_pagination import most_recent_page, older_batch
+from theseus.web.debug_pagination import most_recent_page, older_batch, parse_int_param
 from theseus.web.markdown import render_markdown
 from theseus.web.preview import notification_preview
 
@@ -264,7 +264,7 @@ class WebChatUIObserver:
         @app.get("/debug/older", response_class=HTMLResponse)
         async def debug_older(request: Request):
             before = request.query_params.get("before", "")
-            limit = int(request.query_params.get("limit", _DEBUG_PAGE_SIZE))
+            limit = parse_int_param(request.query_params.get("limit"), _DEBUG_PAGE_SIZE)
             return self._templates.TemplateResponse(
                 request, "_debug_older_fragment.html", self._debug_older_context(before, limit)
             )

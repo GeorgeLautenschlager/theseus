@@ -52,3 +52,11 @@ def test_debug_none_log_empty_view():
     response = client.get("/debug")
     assert response.status_code == 200
     assert response.text
+
+
+def test_debug_older_bad_limit_falls_back_not_500(tmp_path):
+    log = _make_log(tmp_path)
+    ui = SurrogateWebUI(submit_user_message=lambda _t: None, stimulus_log=log)
+    client = TestClient(ui.app)
+    response = client.get("/debug/older", params={"before": "", "limit": "abc"})
+    assert response.status_code == 200
