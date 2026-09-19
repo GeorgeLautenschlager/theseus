@@ -24,6 +24,7 @@ dependencies = [
 alty = "theseus.agents.alty_mcgee:main"
 autobot = "theseus.agents.autobot:main"
 surrogate-host = "theseus.agents.surrogate_host:main"
+windows-surrogate = "theseus.surrogates.windows_surrogate:main"
 theseus-build = "theseus.build_deployment:main"
 theseus-deployment = "theseus.manage_deployment:main"
 theseus-backup = "theseus.manage_backup:main"
@@ -43,6 +44,15 @@ optional = true
 
 [tool.poetry.group.surrogates.dependencies]
 pillow = ">=10"
+
+# Windows app-shell deps (pywebview/tray/toasts); install with `poetry install --with windows`.
+[tool.poetry.group.windows]
+optional = true
+
+[tool.poetry.group.windows.dependencies]
+pywebview = { version = ">=5,<6", markers = "sys_platform == 'win32'" }
+pystray = { version = ">=0.19", markers = "sys_platform == 'win32'" }
+windows-toasts = { version = ">=1", markers = "sys_platform == 'win32'" }
 
 # Heavy eval-only deps (pulls in torch); install with `poetry install --with eval`.
 [tool.poetry.group.eval]
