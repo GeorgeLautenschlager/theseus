@@ -38,10 +38,7 @@ def run_shell(
     import pystray
     import webview
 
-    window_ready = threading.Event()
-
     def _quit(icon, item) -> None:
-        window_ready.set()
         webview.windows[0].destroy() if webview.windows else None
         on_quit()
 
@@ -49,9 +46,6 @@ def run_shell(
         if webview.windows:
             window = webview.windows[0]
             window.show() if window.hidden else window.hide()
-
-    def _ready() -> None:
-        window_ready.set()
 
     def _run_tray() -> None:
         # PIL is pystray's default backend requirement; imported lazily with it
@@ -71,5 +65,4 @@ def run_shell(
 
     webview.create_window(title, url, width=900, height=700, on_top=False)
     threading.Thread(target=_run_tray, name="surrogate-tray", daemon=True).start()
-    webview.start(func=_ready)
-    window_ready.set()
+    webview.start()
