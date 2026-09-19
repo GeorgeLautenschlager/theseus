@@ -1,9 +1,12 @@
 """The surrogate runtime's replication half: own the local log, ship upstream.
 
-This is the drain half only — user stimuli the surrogate appends locally get shipped
-to its host by a `Replicator`, driven by a `CoalescingTrigger`. The command-execution
-half is issue #101 and lives elsewhere. Concrete collaborators (transport, cursor,
-log) are injected; choosing them belongs to the entry point (#105).
+This is the drain half — own-origin events ship to the host by a `Replicator`, driven
+by a `CoalescingTrigger` — plus the command-execution half: host commands arrive over
+an injected `CommandChannel`, render via a `CommandExecutor`, and land one
+`command_report.*` per command in the same log, so the drain ships the reports
+upstream with no new drain code. Each half holds its own `AckedCursor`: the upstream
+cursor is the replication/ack position, the command cursor the execution position.
+Concrete collaborators are injected; choosing them belongs to the entry point (#105).
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ from collections.abc import Callable
 
 from theseus.replication_ingress import CoalescingTrigger
 from theseus.stimulus_log import StimulusLog
+from theseus.surrogates.command_channel import CommandChannel
+from theseus.surrogates.command_executor import CommandExecutor, Renderer
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.replicator import Replicator
 from theseus.surrogates.transport import StimulusTransport
@@ -31,6 +36,11 @@ class SurrogateRuntime:
     `submit_user_message` is called synchronously from the web UI's `POST /chat`
     handler, so it does a local append plus a non-blocking trigger ring and nothing
     more; the network cost is paid by the drain worker.
+
+    When `command_channel`, `renderer`, and `command_cursor` are all provided, a second
+    thread runs `CommandExecutor.run(channel)` — commands render locally and one report
+    event per command lands in the same log, so the drain ships them upstream like any
+    own-origin event. The three are all-or-none: a partial set is a wiring bug.
     """
 
     def __init__(
@@ -39,6 +49,9 @@ class SurrogateRuntime:
         transport: StimulusTransport,
         upstream_cursor: AckedCursor,
         *,
+        command_channel: CommandChannel | None = None,
+        renderer: Renderer | None = None,
+        command_cursor: AckedCursor | None = None,
         user_actor: str = "user",
         flush_interval_seconds: float = 30.0,
     ) -> None:
@@ -50,6 +63,23 @@ class SurrogateRuntime:
         self._unsubscribe: Callable[[], None] | None = None
         self._flush_stop = threading.Event()
         self._flush_thread: threading.Thread | None = None
+        command_parts = (command_channel, renderer, command_cursor)
+        if any(p is not None for p in command_parts) and not all(
+            p is not None for p in command_parts
+        ):
+            raise ValueError(
+                "command_channel, renderer, and command_cursor are all-or-none; "
+                "pass all three or none"
+            )
+        if command_channel is not None:
+            self._executor: CommandExecutor | None = CommandExecutor(
+                log, renderer, command_cursor
+            )
+            self._command_channel: CommandChannel | None = command_channel
+        else:
+            self._executor = None
+            self._command_channel = None
+        self._command_thread: threading.Thread | None = None
 
     def submit_user_message(self, text: str) -> None:
         """Append a user chat message locally and ring the drain; never blocks on I/O."""
@@ -62,10 +92,13 @@ class SurrogateRuntime:
         self._trigger.request()
 
     def start(self) -> None:
-        """Wire the append listener, the trigger worker, and the periodic flush.
+        """Wire the drain (subscribe + trigger + flush), then start the command loop.
 
         Idempotent: every step is either inherently idempotent (subscribe, trigger
-        start) or guarded, so calling `start` twice does not double the drain.
+        start) or guarded, so calling `start` twice does not double the drain. The drain
+        listener is wired *before* the command thread, so a report the executor appends
+        the instant it starts is rung for a drain rather than waiting on the flush
+        backstop.
         """
         if self._unsubscribe is None:
             self._unsubscribe = self._log.subscribe(
@@ -78,9 +111,36 @@ class SurrogateRuntime:
                 target=self._flush_loop, name="surrogate-drain-flush", daemon=True
             )
             self._flush_thread.start()
+        if self._command_channel is not None and (
+            self._command_thread is None or not self._command_thread.is_alive()
+        ):
+            self._command_thread = threading.Thread(
+                target=self._executor.run,
+                args=(self._command_channel,),
+                name="surrogate-command",
+                daemon=True,
+            )
+            self._command_thread.start()
 
     def stop(self) -> None:
-        """Unsubscribe, stop the flush promptly, and stop the trigger."""
+        """Close the command channel and join the command thread, then tear down the
+        drain (unsubscribe → flush → trigger).
+
+        Command-first ordering: closing the channel ends `stream()`, so the executor
+        finishes its last report and exits while the drain listener is still
+        subscribed, giving that final `command_report.*` a chance to ring the trigger.
+        Shipping it at shutdown is best-effort, though — `CoalescingTrigger.stop()` drops
+        a request that has not yet started a drain — so anything unshipped rides the
+        drain's at-least-once recovery and ships on the next `start()`.
+        """
+        if self._command_channel is not None:
+            self._command_channel.close()
+        if self._command_thread is not None:
+            self._command_thread.join(timeout=10.0)
+            # Only forget a thread that actually stopped, mirroring CoalescingTrigger:
+            # nulling a still-alive one would let a later start() spawn a second beside it.
+            if not self._command_thread.is_alive():
+                self._command_thread = None
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
