@@ -1,6 +1,8 @@
 from __future__ import annotations
 from pathlib import Path
 
+import argparse
+
 from theseus.agentic_memory import AgenticMemory
 from theseus.auto_core import Autocore
 from theseus.memory_store import MemoryStore
@@ -13,6 +15,9 @@ from theseus.model_providers.ollama_provider import OllamaProvider
 from theseus.tools.recall import RecallTool
 from theseus.tools.registry import all_tools
 from theseus.tools.terminal_chat import TerminalChat
+from theseus.tools.web_chat import WebChat
+from theseus.agents.surrogate_host import SurrogateHost, build_surrogate_host
+from theseus.high_water import HighWaterMarks
 
 ALTY_CONSTITUTION = """You are the crash test dummy of Theseus Agents.
     You will be instantiated in tests, in development and anywhere else we need a stand-in.
@@ -79,6 +84,48 @@ class AltyMcGee:
         """Run the agent. This is the main entry point for the agent."""
         while True:
             self.chat_observer.observe_chat_message()
+
+    def mount_surrogate_host(self, *, target: str = "windows-desktop") -> SurrogateHost:
+        """Wire Alty as a surrogate host: reuses `build_surrogate_host` (#102) for the
+        HTTP surface and swaps Alty's mouth for web-served tools. No serving here —
+        offline-testable; `run_as_surrogate_host` does the serving."""
+        marks = HighWaterMarks(self.stimulus_log)
+        host = build_surrogate_host(
+            self.stimulus_log, marks, self.core.orient_and_wait, target=target
+        )
+
+        # Web-host mode: no terminal to talk to. Drop the terminal mouth, add the
+        # surrogate voice and a web chat mouth. Mutating `core.tools` is the
+        # established composition pattern (see `surrogate_host.main`).
+        self.core.tools.pop(self.terminal_chat.name, None)
+        self.core.tools[host.say_tool.name] = host.say_tool
+        self.core.tools[host.notify_tool.name] = host.notify_tool
+        web_chat = WebChat(web_observer=host.observer)
+        self.core.tools[web_chat.name] = web_chat
+        return host
+
+    def run_as_surrogate_host(
+        self, *, host: str = "0.0.0.0", port: int = 8000, target: str = "windows-desktop"
+    ) -> None:
+        """Serve Alty as a surrogate host over HTTP. Binds 0.0.0.0 by default so a
+        Tailscale peer (the Windows box) can reach it."""
+        sh = self.mount_surrogate_host(target=target)
+        sh.ingress.start()
+        try:
+            sh.observer.serve(host, port)
+        finally:
+            sh.ingress.stop()
+
+
+def host_main() -> None:
+    parser = argparse.ArgumentParser(description="Run Alty as a surrogate host")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--target", default="windows-desktop", help="Surrogate name commands are addressed to"
+    )
+    args = parser.parse_args()
+    AltyMcGee().run_as_surrogate_host(host=args.host, port=args.port, target=args.target)
 
 
 class AutoAlty:
