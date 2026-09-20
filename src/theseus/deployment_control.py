@@ -4,7 +4,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -196,6 +195,8 @@ class OperationJournal:
 @contextmanager
 def operation_lock(control_dir: Path) -> Iterator[None]:
     """Serialize every state-changing host operation for one deployment."""
+    import fcntl  # Unix-only; imported lazily so `import theseus` works on Windows
+
     control_dir = Path(control_dir)
     control_dir.mkdir(parents=True, exist_ok=True)
     with (control_dir / OPERATION_LOCK).open("a+") as stream:

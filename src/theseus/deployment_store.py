@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -140,6 +139,8 @@ class DeploymentPaths:
 @contextmanager
 def runtime_lock(home: Path, *, blocking: bool = False) -> Iterator[None]:
     """Hold the advisory lock used by launchers and stopped-state imports."""
+    import fcntl  # Unix-only; imported lazily so `import theseus` works on Windows
+
     home = Path(home)
     home.mkdir(parents=True, exist_ok=True)
     with (home / RUNTIME_LOCK).open("a+") as stream:
