@@ -248,7 +248,9 @@ class Autocore:
             except Exception:
                 # A provider failure must end the tick here, not escape step() ->
                 # loop() and kill the daemon thread.
-                logging.getLogger(__name__).exception("Model call failed; ending the tick")
+                logging.getLogger(__name__).exception(
+                    "Model call failed; ending the tick"
+                )
                 self.stimulus_log.append(
                     actor=self.name,
                     type="model_error",
@@ -287,8 +289,8 @@ class Autocore:
         # check schedule and append reminders
         self._append_reminders()
 
-        # The final observe was folded into the per-pass observe above; nothing else
-        # of the old post-turn bookkeeping is dropped.
+        # Context sizing is observed once per pass inside the loop above, so there is
+        # no separate post-turn observe here.
         if self.memory_consolidator is not None:
             try:
                 self.memory_consolidator.tick()

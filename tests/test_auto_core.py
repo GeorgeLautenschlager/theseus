@@ -695,7 +695,8 @@ def test_an_agent_with_no_mouth_logs_the_prose_and_moves_on(tmp_path):
 
 # --- the bounded cognitive loop (issue #123) ---
 #
-# Four behaviours observed live and reproduced by Astra: planning prose published as
+# Behaviours observed live and reproduced by Astra (docstrings below cite Astra's
+# symptom numbers): planning prose published as
 # chat, "look it up -> read it -> reply" split across cadence ticks, a tool exception
 # dropping a later reply, and execution continuing past a terminal call.
 
