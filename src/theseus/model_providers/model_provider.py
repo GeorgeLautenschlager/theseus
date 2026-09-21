@@ -32,6 +32,10 @@ class ModelProvider(ABC):
         """Returns True if this provider is currently reachable."""
         ...
 
+    def _chat_request_options(self) -> dict[str, Any]:
+        """Provider-specific chat options; never applied to embedding requests."""
+        return {}
+
     def chat(
         self,
         prompt: str,
@@ -68,6 +72,7 @@ class ModelProvider(ABC):
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            **self._chat_request_options(),
             **extra_kwargs,
         )
         usage = getattr(response, "usage", None)
@@ -108,6 +113,7 @@ class ModelProvider(ABC):
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            **self._chat_request_options(),
             **extra_kwargs,
         )
         message = response.choices[0].message
