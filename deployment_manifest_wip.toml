@@ -1,0 +1,73 @@
+# Draft operator manifest; the Theseus CLI does not load this format yet.
+# Credential values below are references, not secret values.
+
+[agent]
+id = "TAM"
+name = "Tam"
+
+[models.cognition]
+provider = "openrouter"
+model = "z-ai/glm-5.3-flash"
+availability = "always"
+credentials = "openrouter"
+
+[models.embeddings]
+provider = "openrouter"
+model = "qwen/qwen3-embedding-8b"
+credentials = "openrouter"
+
+[assembly.cognitive_core]
+implementation = "Autocore"
+model = "cognition"
+
+[assembly.stimulus_log]
+implementation = "StimulusLog"
+path = "/root/stimulus_log.jsonl"
+
+[assembly.context_assembler]
+implementation = "ContextAssembler"
+config = "defaults"
+
+[[assembly.memory]]
+implementation = "MemoryModule"
+path = "/root/memory"
+embedding_model = "embeddings"
+
+[assembly.memory.config]
+embedding_model = "embeddings"
+inference_model = "cognition"
+
+[[assembly.interfaces]]
+implementation = "WebChatUIObserver"
+config = "default"
+
+[[assembly.interfaces]]
+implementation = "TelegramObserver"
+
+[assembly.interfaces.config]
+# Environment variable names; the future loader must resolve these references.
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+allowed_user_ids_env = "TELEGRAM_ALLOWED_USER_IDS"
+allowed_chat_ids_env = "TELEGRAM_ALLOWED_CHAT_IDS"
+
+[[assembly.surrogates]]
+implementation = "WindowsSurrogate"
+mode = "host_only"
+config = "default"
+connected_client_required = false
+
+[assembly.tools]
+collections = ["all_tools"]
+include = ["recall", "WebChat"]
+deduplicate = true
+
+[host]
+provider = "digitalocean"
+droplet_name = "tam"
+credentials = "DIGITAL_OCEAN_TOKEN"
+
+[backup]
+provider = "r2"
+credentials = "CLOUDFLARE_R2_TOKEN"
+# Still needed for S3-compatible backups: endpoint, bucket, and an R2
+# credential profile supplying the access-key ID and secret access key.
