@@ -119,6 +119,9 @@ class Autocore:
             "anything this core did not write itself". Pass something narrower (say
             `lambda event: event.type == "chat_message"`) to be woken only by
             conversation.
+        max_passes: how many model passes a single tick may chain while working through
+            tool results, mirroring OODACore.max_loops. A runaway turn stops here
+            instead of thinking forever.
     """
 
     def __init__(
@@ -129,6 +132,7 @@ class Autocore:
         memory: Memory | MemoryModule | None = None,
         wake_on: Callable[[StimulusEvent], bool] | None = None,
         stimulus_log: StimulusLog | None = None,
+        max_passes: int = 10,
     ):
         self.name: str = name
         self._initialize_home_directory(
@@ -161,6 +165,7 @@ class Autocore:
         # read-modify-write of the pair goes through `_wake_lock` — otherwise a wake
         # landing between "read trigger" and "clear flag" would be silently swallowed.
         self._wake_on: Callable[[StimulusEvent], bool] = wake_on or self._is_external
+        self.max_passes: int = max_passes
         self._wake: threading.Event = threading.Event()
         self._wake_trigger: StimulusEvent | str | None = None
         self._wake_lock: threading.Lock = threading.Lock()
@@ -204,50 +209,89 @@ class Autocore:
         # rule's declared window to the assembler on the way through.
         model = self._select_model_provider()
 
-        # assemble system prompt
+        # assemble system prompt — once per tick: it does not change mid-tick. The
+        # stimulus-log half of the prompt is re-assembled every pass below, which is
+        # how the results of each pass's tool calls reach the next one.
         system_prompt = self._assemble_system_prompt()
 
-        # load history from stimulus log, fitted around everything else in the
-        # prompt. Measuring the overhead beats inferring it from the previous turn:
-        # the inferred value is zero on the first turn, which is precisely when a
-        # mis-sized budget overruns.
-        goals_and_tasks = self._current_goals_and_tasks()
-        context = self.context_assembler.assemble_context(
-            overhead_chars=len(system_prompt) + len(goals_and_tasks)
-        )
-        self.loop_memory["window_chars"] = context.window_chars
-
-        # assemble autonomous prompt
-        peer_status = "" if context.peer_available else " status='unavailable'"
-        autonomous_prompt = (
-            f"{goals_and_tasks}"
-            f"<stimulus_log>\n{context.recent_events}\n</stimulus_log>\n\n"
-            + (
-                f"<peer_stimulus_log name={context.peer_name!r}{peer_status}>\n"
-                f"{context.peer_events}\n</peer_stimulus_log>\n\n"
-                if context.peer_name is not None else ""
+        # Bounded cognitive loop (the OODACore.act() pattern): call the model, act,
+        # then — while the turn is still open and no terminal tool ran — feed the
+        # freshly-logged tool results back through a re-assembled context. Without
+        # this, "look something up -> inspect the result -> reply" spanned multiple
+        # cadence ticks with nothing guaranteeing the reply ever happened.
+        passes = 0
+        while True:
+            goals_and_tasks = self._current_goals_and_tasks()
+            context = self.context_assembler.assemble_context(
+                overhead_chars=len(system_prompt) + len(goals_and_tasks)
             )
-        )
+            self.loop_memory["window_chars"] = context.window_chars
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": autonomous_prompt},
-        ]
-        turn = model.complete_with_tools(messages, list(self.tools.values()))
+            # assemble autonomous prompt from this pass's freshly-read history
+            peer_status = "" if context.peer_available else " status='unavailable'"
+            autonomous_prompt = (
+                f"{goals_and_tasks}"
+                f"<stimulus_log>\n{context.recent_events}\n</stimulus_log>\n\n"
+                + (
+                    f"<peer_stimulus_log name={context.peer_name!r}{peer_status}>\n"
+                    f"{context.peer_events}\n</peer_stimulus_log>\n\n"
+                    if context.peer_name is not None else ""
+                )
+            )
 
-        # log the decision and execute whatever it chose, rescuing a reply the
-        # model wrote as prose instead of as a call to its chat tool
-        self._take_action(turn)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": autonomous_prompt},
+            ]
+            try:
+                turn = model.complete_with_tools(messages, list(self.tools.values()))
+            except Exception:
+                # A provider failure must end the tick here, not escape step() ->
+                # loop() and kill the daemon thread.
+                logging.getLogger(__name__).exception("Model call failed; ending the tick")
+                self.stimulus_log.append(
+                    actor=self.name,
+                    type="model_error",
+                    content={"message": "The model call failed; this turn ended early."},
+                )
+                break
+
+            # Close the context-sizing loop per pass, like OODACore: a multi-pass turn
+            # corrects its budget partway through rather than waiting for the next tick.
+            self.context_assembler.observe(
+                prompt_tokens=turn.prompt_tokens,
+                prompt_chars=sum(len(message["content"]) for message in messages),
+                window_chars=self.loop_memory["window_chars"],
+            )
+
+            # log the decision and execute whatever it chose, rescuing a reply the
+            # model wrote as prose instead of as a call to its chat tool. Returns
+            # whether a terminal tool ran.
+            ended = self._take_action(turn)
+
+            if not turn.tool_calls or ended:
+                break
+            passes += 1
+            if passes >= self.max_passes:
+                # Visible in the log so the next tick knows the turn was cut short.
+                self.stimulus_log.append(
+                    actor=self.name,
+                    type="incomplete_turn",
+                    content={
+                        "message": "Stopped: the pass cap was reached with the turn still open.",
+                        "passes": passes,
+                    },
+                )
+                break
 
         # check schedule and append reminders
         self._append_reminders()
 
         # assess context length
-        self.context_assembler.observe(
-            prompt_tokens=turn.prompt_tokens,
-            prompt_chars=sum(len(message["content"]) for message in messages),
-            window_chars=self.loop_memory["window_chars"],
-        )
+        self._append_reminders()
+
+        # The final observe was folded into the per-pass observe above; nothing else
+        # of the old post-turn bookkeeping is dropped.
         if self.memory_consolidator is not None:
             try:
                 self.memory_consolidator.tick()
@@ -413,11 +457,12 @@ class Autocore:
             "---\n\n"
         )
 
-    def _take_action(self, turn: AssistantTurn) -> None:
-        """Commit one decision to the log and carry it out."""
+    def _take_action(self, turn: AssistantTurn) -> bool:
+        """Commit one decision to the log and carry it out. Returns whether a
+        terminal tool ran (i.e. whether this pass ends the tick)."""
         recovered = self._recover_stray_text(turn)
         self._log_decision(recovered or turn, recovered=recovered is not None)
-        self._execute_tool_calls(recovered or turn)
+        return self._execute_tool_calls(recovered or turn)
 
     def _terminal_tool(self) -> Tool | None:
         """The agent's mouth: the tool whose call completes a turn (`WebChat`,
@@ -448,21 +493,43 @@ class Autocore:
         Commentary alongside a real tool call is not a stray reply — the model chose an
         action and narrated it — and neither is empty text, which is how a native
         tool-calling model says "nothing to do this tick".
+
+        The gate (issue #123): prose is only a reply when this tick is answering an
+        outstanding inbound conversation — the wake trigger is a `chat_message`. On a
+        plain cadence tick any text-only turn is internal planning; publishing it was
+        the monologue-leakage symptom. It stays in the log via _log_decision and the
+        loop yields.
         """
         if turn.tool_calls or not (turn.text or "").strip():
             return None
         tool = self._terminal_tool()
         if tool is None:
             return None
+        trigger = self.loop_memory.get("wake_trigger")
+        if not (isinstance(trigger, StimulusEvent) and trigger.type == "chat_message"):
+            # No outstanding conversation: keep the prose internal.
+            return None
         # The mouth takes one string; read its name off the schema rather than assuming
         # "message", so a differently-shaped chat tool still works.
         required = tool.parameters.get("required") or ["message"]
-        call = ToolCall(
-            id=f"recovered-{uuid4().hex}",
-            name=tool.name,
-            arguments={required[0]: turn.text},
+        arguments = {required[0]: turn.text}
+        # Route the reply back the way the conversation came in: forward whatever the
+        # triggering stimulus carries that the mouth's schema actually declares —
+        # Telegram's chat_id / reply_to_message_id. Single-destination mouths declare
+        # no such properties and get nothing extra.
+        properties = tool.parameters.get("properties") or {}
+        for key, value in (trigger.content or {}).items():
+            if key in properties and key != required[0]:
+                arguments[key] = value
+        return replace(
+            turn,
+            text=None,
+            tool_calls=(
+                ToolCall(
+                    id=f"recovered-{uuid4().hex}", name=tool.name, arguments=arguments
+                ),
+            ),
         )
-        return replace(turn, text=None, tool_calls=(call,))
 
     def _log_decision(self, turn: AssistantTurn, recovered: bool = False):
         content: Dict[str, Any] = {
@@ -476,7 +543,13 @@ class Autocore:
             content["text_recovered"] = True
         self.stimulus_log.append(actor=self.name, type="decision", content=content)
 
-    def _execute_tool_calls(self, turn: AssistantTurn):
+    def _execute_tool_calls(self, turn: AssistantTurn) -> bool:
+        """Execute the batch and log every result as a stimulus. Returns whether any
+        executed tool had a truthy `ends_turn` — the flag finally gates the loop.
+        The whole batch always runs: a failure in one call must not skip a later
+        reply, and a terminal call finishing mid-batch is the same deliberate choice
+        OODACore makes."""
+        ends_turn = False
         for call in turn.tool_calls:
           tool = self.tools.get(call.name)
           if tool is None:
@@ -492,7 +565,24 @@ class Autocore:
               )
               continue
 
-          result = tool.execute(**call.arguments)
+          try:
+              result = tool.execute(**call.arguments)
+          except Exception as exc:
+              # Exception boundary (issue #123): log the failure as an error result
+              # the next pass can see and recover from, then keep going — the batch,
+              # and any reply later in it, must survive one tool blowing up.
+              self.stimulus_log.append(
+                  actor=self.name,
+                  type="tool_result",
+                  content={
+                      "tool": call.name,
+                      "arguments": call.arguments,
+                      "output": f"{type(exc).__name__}: {exc}",
+                      "is_error": True,
+                  },
+              )
+              continue
+
           self.stimulus_log.append(
               actor=self.name,
               type="tool_result",
@@ -503,6 +593,9 @@ class Autocore:
                   "is_error": result.is_error,
               },
           )
+          if getattr(tool, "ends_turn", False):
+              ends_turn = True
+        return ends_turn
 
     def _construct_model_providers(self) -> None:
         """Parse CADENCE.md and instantiate one provider per unique (provider, model).
