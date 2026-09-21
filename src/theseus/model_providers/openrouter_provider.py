@@ -20,7 +20,15 @@ class OpenRouterProvider(ModelProvider):
         model: str,
         base_url: str = "https://openrouter.ai/api/v1",
         api_key: str | None = None,
+        reasoning_effort: str | None = None,
     ):
+        if reasoning_effort is None:
+            reasoning_effort = os.environ.get("OPENROUTER_REASONING_EFFORT") or None
+        if reasoning_effort is not None and reasoning_effort not in (
+            "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        ):
+            raise ValueError("Invalid OPENROUTER_REASONING_EFFORT")
+        self.reasoning_effort = reasoning_effort
         if api_key is None:
             api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
@@ -32,6 +40,13 @@ class OpenRouterProvider(ModelProvider):
         # ponytail: flash models answer in ~30s; fail fast on a hung backend instance
         # and retry (the 600s default timeout once sank a whole eval run).
         self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0, max_retries=5)
+
+    def _chat_request_options(self) -> dict:
+        # Omission preserves the model/provider default. Supported efforts are
+        # model-specific and must be selected from OpenRouter's model catalog.
+        if self.reasoning_effort is None:
+            return {}
+        return {"extra_body": {"reasoning": {"effort": self.reasoning_effort}}}
 
     def is_available(self) -> bool:
         try:
