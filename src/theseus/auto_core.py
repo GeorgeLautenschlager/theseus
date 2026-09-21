@@ -287,9 +287,6 @@ class Autocore:
         # check schedule and append reminders
         self._append_reminders()
 
-        # assess context length
-        self._append_reminders()
-
         # The final observe was folded into the per-pass observe above; nothing else
         # of the old post-turn bookkeeping is dropped.
         if self.memory_consolidator is not None:
