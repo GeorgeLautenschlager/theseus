@@ -18,6 +18,7 @@ from theseus.context_assembler import (
 from theseus.model_providers import PROVIDER_REGISTRY
 from theseus.schedule import Schedule
 from theseus.tools.tool import AssistantTurn, ToolCall, ToolResult
+from theseus.stimulus_log import StimulusEvent
 
 
 class FakeUpProvider:
@@ -549,8 +550,9 @@ def test_one_real_turn_fits_the_declared_window(tmp_path, monkeypatch):
             actor="george", type="exchange", content={"message": f"msg {i} " + "x" * 600}
         )
 
-    with pytest.raises(_CapturingProvider.Done):
-        core.loop()
+    # The provider raises mid-call; since issue #123 that failure is caught and ends
+    # the tick gracefully instead of killing the loop thread — so step() returns.
+    core.step()
 
     messages = _CapturingProvider.captured[0]
     prompt_chars = sum(len(m["content"]) for m in messages)
@@ -612,9 +614,20 @@ def decisions(core):
     return [e for e in core.stimulus_log.read_all() if e.type == "decision"]
 
 
+def wake_with_chat(core, content=None):
+    """Make the current tick look like it is answering an inbound message."""
+    event = core.stimulus_log.append(
+        actor="george",
+        type="chat_message",
+        content=content or {"message": "you there?"},
+    )
+    core.loop_memory["wake_trigger"] = event
+
+
 def test_prose_reply_is_delivered_through_the_terminal_tool(tmp_path):
     mouth = Mouth()
     core, _ = with_tools(tmp_path, say=mouth, dig=Hands())
+    wake_with_chat(core)
     turn = AssistantTurn(text="Hey George, I'm here.", tool_calls=())
 
     core._take_action(turn)
@@ -627,6 +640,7 @@ def test_recovered_turn_is_logged_as_the_call_the_model_should_have_made(tmp_pat
     decision, the pattern that caused this is still sitting in the window."""
     mouth = Mouth()
     core, _ = with_tools(tmp_path, say=mouth)
+    wake_with_chat(core)
 
     core._take_action(AssistantTurn(text="delivered anyway", tool_calls=()))
 
@@ -670,9 +684,216 @@ def test_an_agent_with_no_mouth_logs_the_prose_and_moves_on(tmp_path):
     """An agent composed without a chat tool has nowhere to put a stray reply. It must
     keep the text in the log rather than crash the loop."""
     core, _ = with_tools(tmp_path, dig=Hands())
+    wake_with_chat(core)
 
     core._take_action(AssistantTurn(text="nobody is listening", tool_calls=()))
 
     (logged,) = decisions(core)
     assert logged.content["text"] == "nobody is listening"
     assert logged.content["tool_calls"] == []
+
+
+# --- the bounded cognitive loop (issue #123) ---
+#
+# Behaviours observed live and reproduced by Astra (docstrings below cite Astra's
+# symptom numbers): planning prose published as
+# chat, "look it up -> read it -> reply" split across cadence ticks, a tool exception
+# dropping a later reply, and execution continuing past a terminal call.
+
+
+class ScriptedProvider:
+    """Returns turns from a fixed script, one per model call, and counts the calls."""
+
+    def __init__(self, model, script):
+        self.model = model
+        self._script = list(script)
+        self.calls = 0
+
+    def is_available(self):
+        return True
+
+    def complete_with_tools(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        return self._script.pop(0)
+
+
+def scripted_core(tmp_path, monkeypatch, provider, **tools):
+    monkeypatch.setitem(PROVIDER_REGISTRY, "scripted", lambda model: provider)
+    core, _ = make(tmp_path, cadence_text="- default: scripted m1\n")
+    core.tools = tools
+    return core
+
+
+def tool_results(core):
+    return [e for e in core.stimulus_log.read_all() if e.type == "tool_result"]
+
+
+def test_cadence_tick_does_not_publish_planning_prose(tmp_path, monkeypatch):
+    """Symptom 1: internal monologue must not reach the user. A plain cadence tick has
+    no outstanding conversation, so text-only prose is thinking, not a reply."""
+    mouth = Mouth()
+    provider = ScriptedProvider(
+        "m1", [AssistantTurn(text="Let me think about whether to check the queue.", tool_calls=())]
+    )
+    core = scripted_core(tmp_path, monkeypatch, provider, say=mouth)
+
+    core.step()  # no chat_message wake consumed
+
+    assert mouth.said == [], "cadence prose leaked to the user"
+    (logged,) = decisions(core)
+    assert logged.content["text"] == "Let me think about whether to check the queue."
+
+
+def test_reply_on_an_outstanding_telegram_conversation_is_delivered_and_routed(
+    tmp_path, monkeypatch
+):
+    """Symptom 4: recovery must route through the channel the message came in on."""
+
+    class TelegramMouth:
+        name = "telegram_send"
+        ends_turn = True
+        description = "Send a Telegram message."
+        parameters = {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+                "chat_id": {"type": "integer"},
+                "reply_to_message_id": {"type": "integer"},
+            },
+            "required": ["message"],
+        }
+
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, message, chat_id=None, reply_to_message_id=None):
+            self.calls.append(
+                {
+                    "message": message,
+                    "chat_id": chat_id,
+                    "reply_to_message_id": reply_to_message_id,
+                }
+            )
+            return ToolResult("sent")
+
+    mouth = TelegramMouth()
+    provider = ScriptedProvider(
+        "m1", [AssistantTurn(text="Yes, I'm here!", tool_calls=())]
+    )
+    core = scripted_core(tmp_path, monkeypatch, provider, telegram_send=mouth)
+    wake_with_chat(
+        core,
+        content={"message": "you there?", "chat_id": 4242, "reply_to_message_id": 77},
+    )
+
+    core.step()
+
+    assert mouth.calls == [
+        {"message": "Yes, I'm here!", "chat_id": 4242, "reply_to_message_id": 77}
+    ]
+
+
+def test_intermediate_tool_then_reply_completes_in_one_tick(tmp_path, monkeypatch):
+    """Symptom: 'look it up -> inspect -> reply' used to be split across cadence ticks.
+    The loop must feed the tool result back and finish the reply within one step()."""
+    mouth = Mouth()
+    provider = ScriptedProvider(
+        "m1",
+        [
+            AssistantTurn(text=None, tool_calls=(ToolCall(id="1", name="dig", arguments={}),)),
+            AssistantTurn(text="Here's what I found.", tool_calls=()),
+        ],
+    )
+    core = scripted_core(tmp_path, monkeypatch, provider, dig=Hands(), say=mouth)
+    wake_with_chat(core)
+
+    core.step()
+
+    assert provider.calls == 2, "the reply needed a second model pass in the same tick"
+    assert mouth.said == ["Here's what I found."]
+
+
+def test_tool_exception_does_not_drop_a_later_reply_or_kill_the_step(
+    tmp_path, monkeypatch
+):
+    """Symptom: an exception in one tool aborted the batch and escaped step()."""
+
+    class Explodes:
+        name = "explode"
+        description = "Blow up."
+        parameters = {"type": "object", "properties": {}, "required": []}
+
+        def execute(self):
+            raise ValueError("boom")
+
+    mouth = Mouth()
+    provider = ScriptedProvider(
+        "m1",
+        [
+            AssistantTurn(
+                text=None,
+                tool_calls=(
+                    ToolCall(id="1", name="explode", arguments={}),
+                    ToolCall(id="2", name="say", arguments={"message": "still alive"}),
+                ),
+            ),
+        ],
+    )
+    core = scripted_core(tmp_path, monkeypatch, provider, explode=Explodes(), say=mouth)
+    wake_with_chat(core)
+
+    core.step()  # must not raise
+
+    assert mouth.said == ["still alive"], "a tool crash dropped the later reply"
+    errors = [r for r in tool_results(core) if r.content.get("is_error")]
+    assert errors and errors[0].content["tool"] == "explode"
+    assert "boom" in errors[0].content["output"]
+
+
+def test_terminal_tool_ends_the_passes_and_runaway_hits_the_cap(tmp_path, monkeypatch):
+    """Symptom 5: ends_turn must actually gate the loop; a runaway non-terminal
+    model must hit max_passes and stop."""
+    mouth = Mouth()
+    hands = Hands()
+    provider = ScriptedProvider(
+        "m1",
+        [
+            AssistantTurn(text=None, tool_calls=(ToolCall(id="1", name="say", arguments={"message": "done"}),)),
+            AssistantTurn(text=None, tool_calls=(ToolCall(id="2", name="dig", arguments={}),)),
+        ],
+    )
+    core = scripted_core(tmp_path, monkeypatch, provider, say=mouth, dig=hands)
+    core.max_passes = 3
+    wake_with_chat(core)
+
+    core.step()
+    assert provider.calls == 1, "the model was re-invoked after a terminal tool"
+
+    # runaway: nothing terminal, cap at 3
+    runaway = ScriptedProvider(
+        "m1", [AssistantTurn(text=None, tool_calls=(ToolCall(id=str(i), name="dig", arguments={}),)) for i in range(10)]
+    )
+    core2 = scripted_core(tmp_path, monkeypatch, runaway, dig=Hands())
+    core2.max_passes = 3
+    core2.step()
+    assert runaway.calls == 3, "the loop ran past max_passes"
+    caps = [e for e in core2.stimulus_log.read_all() if e.type == "incomplete_turn"]
+    assert caps, "the capped turn left no stimulus noting it was incomplete"
+
+
+def test_provider_failure_ends_the_tick_gracefully(tmp_path, monkeypatch):
+    """Symptom 3, provider half: an exception from complete_with_tools must not escape
+    step() and kill the loop thread."""
+
+    class FlakyProvider(ScriptedProvider):
+        def complete_with_tools(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            raise RuntimeError("provider down")
+
+    provider = FlakyProvider("m1", [])
+    core = scripted_core(tmp_path, monkeypatch, provider, dig=Hands())
+
+    core.step()  # must not raise
+
+    errors = [e for e in core.stimulus_log.read_all() if e.type == "model_error"]
+    assert errors, "the provider failure left no trace in the log"
