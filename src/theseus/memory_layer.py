@@ -17,14 +17,15 @@ from __future__ import annotations
 import json
 import math
 import os
+from array import array
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
 from theseus.assertion_metadata import render_metadata
-from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines, lexical_score, valid_vector, terms
+from theseus.layer_store import LayerHit, append_record, compact_vector, ensure_store, iter_lines, lexical_score, valid_vector, terms
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +34,7 @@ class MemoryRecord:
     ts: datetime
     content: str                      # rendered evidence the episode was formed from
     summary: str                      # LLM one-paragraph rendering — what retrieval embeds and agents read back
-    embedding: list[float] = field(default_factory=list)
+    embedding: Sequence[float] = field(default_factory=list)  # array('d') once loaded
     source_episode_id: str = ""
     embedding_model: str = ""
     support_event_ids: tuple[str, ...] | None = None
@@ -48,7 +49,7 @@ class MemoryRecord:
                 "ts": self.ts.astimezone(timezone.utc).isoformat(),
                 "content": self.content,
                 "summary": self.summary,
-                "embedding": self.embedding,
+                "embedding": list(self.embedding) if isinstance(self.embedding, array) else self.embedding,
                 "source_episode_id": self.source_episode_id,
                 "embedding_model": self.embedding_model,
                 "support_event_ids": self.support_event_ids,
@@ -68,7 +69,7 @@ class MemoryRecord:
             ts=datetime.fromisoformat(d["ts"]),
             content=d["content"],
             summary=d["summary"],
-            embedding=d.get("embedding", []),
+            embedding=compact_vector(d.get("embedding", [])),
             source_episode_id=d.get("source_episode_id", ""),
             embedding_model=d.get("embedding_model", ""),
             support_event_ids=tuple(d["support_event_ids"]) if d.get("support_event_ids") is not None else None,
@@ -95,7 +96,7 @@ class MemoryLayer:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = ensure_store(path)
         self._records: list[MemoryRecord] = []
-        for line in load_lines(self.path):
+        for line in iter_lines(self.path):
             self._records.append(MemoryRecord.from_json(line))
 
     def add(self, record: MemoryRecord) -> MemoryRecord:

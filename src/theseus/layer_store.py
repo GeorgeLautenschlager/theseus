@@ -19,6 +19,8 @@ import os
 import tempfile
 import re
 import math
+from array import array
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,8 +47,20 @@ def lexical_score(query: str, text: str) -> float:
     return len(wanted & terms(text)) / len(wanted) if wanted else 0.0
 
 
+def compact_vector(value):
+    """A stored embedding as packed float64 (`array('d')`) instead of a list of
+    Python floats: exact (JSON round-trips unchanged) and ~4x smaller in memory,
+    which is what keeps a loaded store of thousands of 4096-dim vectors inside a
+    container's memory limit. Anything that is not a list of real numbers comes
+    back unchanged, so `valid_vector` still rejects it."""
+    if isinstance(value, list) and all(
+            isinstance(v, (float, int)) and not isinstance(v, bool) for v in value):
+        return array("d", value)
+    return value
+
+
 def valid_vector(vector, dimension: int | None = None) -> bool:
-    return (isinstance(vector, (list, tuple)) and bool(vector)
+    return (isinstance(vector, (list, tuple, array)) and bool(vector)
             and (dimension is None or len(vector) == dimension)
             and all(isinstance(v, (float, int)) and not isinstance(v, bool)
                     and math.isfinite(v) for v in vector)
@@ -161,23 +175,26 @@ def store_lock(directory: Path):
 def load_lines(path: str | os.PathLike[str]) -> list[str]:
     """All complete lines. A torn final line (crash mid-write) is dropped, never
     raised; a corrupt interior line raises ValueError."""
+    return list(iter_lines(path))
+
+
+def iter_lines(path: str | os.PathLike[str]) -> Iterator[str]:
+    """`load_lines`, streamed: one record in memory at a time instead of the
+    whole file, for stores whose vectors run to tens of megabytes."""
     p = Path(path)
     if not p.exists():
-        return []
+        return
     with open(p, "rb") as f:
-        lines = f.readlines()
-    out: list[str] = []
-    for i, line in enumerate(lines):
-        stripped = line.rstrip(b"\n")
-        if not stripped:
-            continue
-        try:
-            stripped = stripped.decode("utf-8")
-            json.loads(stripped)  # interior corruption check; layers parse for real
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            is_last = i == len(lines) - 1
-            if is_last and not line.endswith(b"\n"):
-                break  # torn final write — recover by dropping it
-            raise ValueError(f"corrupt interior record at line {i}: {exc}") from exc
-        out.append(stripped)
-    return out
+        for i, line in enumerate(f):
+            stripped = line.rstrip(b"\n")
+            if not stripped:
+                continue
+            try:
+                stripped = stripped.decode("utf-8")
+                json.loads(stripped)  # interior corruption check; layers parse for real
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                # Only the file's final line can lack its newline.
+                if not line.endswith(b"\n"):
+                    return  # torn final write — recover by dropping it
+                raise ValueError(f"corrupt interior record at line {i}: {exc}") from exc
+            yield stripped
