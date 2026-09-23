@@ -34,7 +34,7 @@ from theseus.assertion_metadata import (ACTION_STATUSES, ATTRIBUTIONS, RECONCILI
 from theseus.intelligence_layer import IntelligenceLayer
 from theseus.json_utils import parse_json_response
 from theseus.knowledge_layer import KnowledgeLayer, KnowledgeRecord
-from theseus.layer_store import (LayerHit, append_record, load_lines, atomic_json,
+from theseus.layer_store import (LayerHit, append_record, compact_vector, iter_lines, load_lines, atomic_json,
                                  fsync_directory, store_lock, terms, valid_vector)
 from theseus.memory_layer import MemoryLayer, MemoryRecord
 from theseus.memory_prompts import (build_extraction_prompt, build_principle_reconciliation_prompt,
@@ -194,9 +194,9 @@ class MemoryModule:
         self._processed_episodes = {row["episode_id"] for row in ledger}
         self._episode_ranges = {row["episode_id"]: (row.get("start_id"), row.get("end_id")) for row in ledger}
         self._embedding_index = {}
-        for line in load_lines(self.memory_dir / "embeddings.jsonl"):
+        for line in iter_lines(self.memory_dir / "embeddings.jsonl"):
             row = json.loads(line)
-            self._embedding_index[(row["model"], row["layer"], row["id"])] = row["vector"]
+            self._embedding_index[(row["model"], row["layer"], row["id"])] = compact_vector(row["vector"])
 
     def _vectors(self, layer: str) -> dict[str, list[float]]:
         return {rid: vector for (model, name, rid), vector in self._embedding_index.items()

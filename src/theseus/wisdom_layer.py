@@ -21,14 +21,15 @@ from __future__ import annotations
 
 import json
 import os
+from array import array
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
 from theseus.assertion_metadata import render_metadata
-from theseus.layer_store import LayerHit, append_record, ensure_store, load_lines, lexical_score, valid_vector
+from theseus.layer_store import LayerHit, append_record, compact_vector, ensure_store, iter_lines, lexical_score, valid_vector
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +37,7 @@ class WisdomRecord:
     id: str
     ts: datetime
     statement: str
-    embedding: list[float] = field(default_factory=list)
+    embedding: Sequence[float] = field(default_factory=list)  # array('d') once loaded
     evidence_count: int = 1
     source_episode_id: str = ""
     embedding_model: str = ""
@@ -56,7 +57,7 @@ class WisdomRecord:
                 "id": self.id,
                 "ts": self.ts.astimezone(timezone.utc).isoformat(),
                 "statement": self.statement,
-                "embedding": self.embedding,
+                "embedding": list(self.embedding) if isinstance(self.embedding, array) else self.embedding,
                 "evidence_count": self.evidence_count,
                 "source_episode_id": self.source_episode_id,
                 "embedding_model": self.embedding_model,
@@ -81,7 +82,7 @@ class WisdomRecord:
             id=d["id"],
             ts=datetime.fromisoformat(d["ts"]),
             statement=d["statement"],
-            embedding=d.get("embedding", []),
+            embedding=compact_vector(d.get("embedding", [])),
             evidence_count=d.get("evidence_count", 1),
             source_episode_id=d.get("source_episode_id", ""),
             embedding_model=d.get("embedding_model", ""),
@@ -113,7 +114,7 @@ class WisdomLayer:
         self._records: list[WisdomRecord] = []
         self._by_id: dict[str, WisdomRecord] = {}
         self._current_ids: set[str] = set()
-        for line in load_lines(self.path):
+        for line in iter_lines(self.path):
             self._apply(WisdomRecord.from_json(line))
 
     def _apply(self, record: WisdomRecord) -> None:
