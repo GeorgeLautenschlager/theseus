@@ -83,6 +83,13 @@ class PairingSpec:
 
 
 @dataclass(frozen=True)
+class SurrogateSpec:
+    target: str = "windows-desktop"
+    host: str = "127.0.0.1"
+    port: int = 8800
+
+
+@dataclass(frozen=True)
 class AgentSpec:
     name: str
     constitution: str
@@ -94,8 +101,21 @@ class AgentSpec:
     interface: InterfaceSpec = field(default_factory=InterfaceSpec)
     window_size: int = 200
     pairing: PairingSpec | None = None
+    surrogate: SurrogateSpec | None = None
 
     def validate(self) -> None:
+        if self.surrogate is not None:
+            import re
+            if not isinstance(self.surrogate, SurrogateSpec):
+                raise ValueError("surrogate must be a SurrogateSpec")
+            if self.core != "auto" or self.interface.kind not in ("none", "telegram"):
+                raise ValueError("surrogate requires managed Auto Telegram/headless agents")
+            if not isinstance(self.surrogate.target, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", self.surrogate.target):
+                raise ValueError("surrogate target must be a simple origin name")
+            if self.surrogate.host not in ("127.0.0.1", "0.0.0.0"):
+                raise ValueError("surrogate host must be 127.0.0.1 or 0.0.0.0")
+            if type(self.surrogate.port) is not int or not 1024 <= self.surrogate.port <= 65535:
+                raise ValueError("surrogate port must be between 1024 and 65535")
         for label, value in (("name", self.name), ("constitution", self.constitution)):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{label} must be nonempty text")
@@ -245,8 +265,16 @@ class AssembledAgent:
         default_factory=threading.Event, init=False, repr=False
     )
     _shutdown_started_at: float | None = field(default=None, init=False, repr=False)
+    surrogate: object | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.spec.surrogate is not None:
+            from theseus.surrogate_service import SurrogateService
+            self.surrogate = SurrogateService(self.core, self.spec.surrogate)
 
     def run(self) -> None:
+        if self.surrogate is not None:
+            raise ValueError("surrogate service requires --managed")
         if self.spec.interface.kind == "none":
             self.core.loop()
             return
@@ -277,6 +305,8 @@ class AssembledAgent:
         if self._shutdown_started_at is None:
             self._shutdown_started_at = monotonic()
         self._shutdown_requested.set()
+        if self.surrogate is not None:
+            self.surrogate.stop()
         request = getattr(self.core, "request_shutdown", None)
         if request is not None:
             request()
@@ -356,6 +386,8 @@ class AssembledAgent:
             threads.append(thread)
             thread.start()
 
+        if self.surrogate is not None:
+            start_worker("agent-surrogate", self.surrogate.run)
         start_worker("agent-core", self.core.loop)
         if self.observer is not None:
             start_worker("agent-observer", self.observer.run)
@@ -536,7 +568,7 @@ def render(spec: AgentSpec) -> str:
     return (
         GENERATED_HEADER + "from __future__ import annotations\n\n"
         "from pathlib import Path\n"
-        "from theseus.assembly import AgentSpec, ModelSpec, MemorySpec, InterfaceSpec, PairingSpec, run_agent\n\n"
+        "from theseus.assembly import AgentSpec, ModelSpec, MemorySpec, InterfaceSpec, PairingSpec, SurrogateSpec, run_agent\n\n"
         f"SPEC = {pformat(spec, width=100)}\n\n"
         "if __name__ == '__main__':\n"
         "    run_agent(SPEC, Path(__file__).resolve().parent / 'state')\n"

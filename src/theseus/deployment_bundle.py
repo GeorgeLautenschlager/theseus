@@ -123,6 +123,14 @@ def validate_managed_deployment(spec: DeploymentSpec, definition_root: Path) -> 
             "managed Compose currently supports only Auto Telegram/headless agents: "
             + ", ".join(sorted(unsupported))
         )
+    ports = []
+    for agent in spec.agents.values():
+        if agent.surrogate is not None:
+            if agent.surrogate.host != "0.0.0.0":
+                raise ValueError("managed container surrogate must listen on 0.0.0.0; published port is loopback-only")
+            ports.append(agent.surrogate.port)
+    if len(ports) != len(set(ports)):
+        raise ValueError("surrogate host ports must be unique within a deployment")
     missing_secrets = _required_secrets(spec) - set(spec.secrets)
     if missing_secrets:
         raise ValueError(
@@ -308,6 +316,9 @@ def _compose(spec: DeploymentSpec, image_tag: str) -> str:
             "    volumes:",
         ])
         lines.extend(f"      - {json.dumps(mount)}" for mount in _mount_lines(spec, agent_id))
+        surrogate = spec.agents[agent_id].surrogate
+        if surrogate is not None:
+            lines.extend(["    ports:", f'      - "127.0.0.1:{surrogate.port}:{surrogate.port}"'])
         if spec.secrets:
             lines.append("    secrets:")
             lines.extend(f"      - {json.dumps(secret)}" for secret in spec.secrets)
