@@ -8,6 +8,7 @@ from theseus.command_feed import CommandFeed
 from theseus.high_water import HighWaterMarks
 from theseus.replication_ingress import ReplicationIngress
 from theseus.tools.surrogate_voice import SaySurrogate, NotifySurrogate
+from theseus.tools.desktop_state import DesktopStateTool
 
 
 class SurrogateService:
@@ -34,7 +35,8 @@ class SurrogateService:
             return {'ready': True, 'target': spec.target}
 
         for tool in (SaySurrogate(spec.target, core.stimulus_log),
-                     NotifySurrogate(spec.target, core.stimulus_log)):
+                     NotifySurrogate(spec.target, core.stimulus_log),
+                     DesktopStateTool(spec.target, core.stimulus_log)):
             core.tools[tool.name] = tool
         core.tools['say_to_surrogate'].description += (
             f' Reply here to messages originating from {spec.target}; '

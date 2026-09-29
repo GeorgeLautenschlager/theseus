@@ -26,7 +26,8 @@ from theseus.replication_batch import (
     parse_batch,
 )
 from theseus.replication_dedupe import plan_batch
-from theseus.stimulus_log import StimulusLog
+from theseus.stimulus_log import StimulusEvent, StimulusLog
+from theseus.wake_policy import wakes_agent
 
 
 class CoalescingTrigger:
@@ -234,10 +235,12 @@ class ReplicationIngress:
         marks: HighWaterMarks,
         *,
         on_arrival: Callable[[], None] | None = None,
+        wake_on: Callable[[StimulusEvent], bool] = wakes_agent,
         max_events: int = DEFAULT_MAX_BATCH_EVENTS,
         max_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     ) -> None:
         self._log = log
+        self._wake_on = wake_on
         self._marks = marks
         self._max_events = max_events
         self._max_bytes = max_bytes
@@ -324,7 +327,7 @@ class ReplicationIngress:
         # Outside the lock, and only for a batch that actually added something. A duplicate
         # is the surrogate re-asking a question already answered; waking the agent for it
         # would turn a lost ack into a cognitive turn about nothing.
-        if plan.to_append and self._trigger is not None:
+        if self._trigger is not None and any(self._wake_on(e) for e in plan.to_append):
             self._trigger.request()
 
         return Ingested(

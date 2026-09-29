@@ -23,6 +23,7 @@ from theseus.replication_ingress import ReplicationIngress
 from theseus.stimulus_log import StimulusLog
 from theseus.tools.registry import all_tools
 from theseus.tools.surrogate_voice import NotifySurrogate, SaySurrogate
+from theseus.tools.desktop_state import DesktopStateTool
 from theseus.tools.web_chat import WebChat
 from theseus.web_chat_ui_observer import WebChatUIObserver
 
@@ -37,6 +38,7 @@ class SurrogateHost:
     say_tool: SaySurrogate
     notify_tool: NotifySurrogate
     target: str
+    desktop_state_tool: DesktopStateTool
 
 
 def build_surrogate_host(
@@ -66,6 +68,7 @@ def build_surrogate_host(
         say_tool=SaySurrogate(target, log),
         notify_tool=NotifySurrogate(target, log),
         target=target,
+        desktop_state_tool=DesktopStateTool(target, log),
     )
 
 
@@ -89,6 +92,7 @@ def main() -> None:
     host = build_surrogate_host(log, marks, core.wake, target=args.target)
     core.tools[host.say_tool.name] = host.say_tool
     core.tools[host.notify_tool.name] = host.notify_tool
+    core.tools[host.desktop_state_tool.name] = host.desktop_state_tool
     mouth = WebChat(web_observer=host.observer)
     core.tools[mouth.name] = mouth
     host.ingress.start()

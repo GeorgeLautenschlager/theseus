@@ -22,6 +22,8 @@ from theseus.surrogates.runtime import SurrogateRuntime
 from theseus.surrogates.sse_command_channel import SseCommandChannel
 from theseus.surrogates.web_ui import SurrogateWebUI
 from theseus.surrogates.windows.toast import ToastNotifier
+from theseus.surrogates.desktop_observer import DesktopObserver, DesktopSource
+from theseus.surrogates.windows.desktop import WindowsDesktopSource
 
 
 class FocusState:
@@ -62,6 +64,8 @@ def build_windows_surrogate(
     origin: str = "windows-desktop",
     data_dir: Path,
     headless: bool = False,
+    observe_desktop: bool = True,
+    desktop_source: DesktopSource | None = None,
 ) -> WindowsSurrogateApp:
     """Wire the surrogate's full runtime. No server, no window — offline-testable.
 
@@ -93,6 +97,10 @@ def build_windows_surrogate(
         command_channel=command_channel,
         renderer=renderer,
         command_cursor=command_cursor,
+        desktop_observer=(
+            DesktopObserver(log, desktop_source if desktop_source is not None else WindowsDesktopSource())
+            if observe_desktop else None
+        ),
     )
     return WindowsSurrogateApp(
         runtime=runtime,
@@ -112,11 +120,13 @@ def main() -> None:
     parser.add_argument("--ui-host", default="127.0.0.1")
     parser.add_argument("--ui-port", type=int, default=8765)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--no-observe-desktop", action="store_true", help="Disable ambient desktop observations")
     args = parser.parse_args()
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
     app = build_windows_surrogate(
-        args.host_url, origin=args.origin, data_dir=args.data_dir, headless=args.headless
+        args.host_url, origin=args.origin, data_dir=args.data_dir, headless=args.headless,
+        observe_desktop=not args.no_observe_desktop,
     )
     app.runtime.start()
     url = f"http://{args.ui_host}:{args.ui_port}"
@@ -124,10 +134,11 @@ def main() -> None:
     if args.headless:
         # ponytail: serve on the main thread headlessly; shell mode needs it free for pywebview
         print(f"Surrogate UI: {url}")
-        # Serve-and-return: this blocks until the process is killed, and every runtime
-        # thread is a daemon, so there is no shutdown path here to call runtime.stop() on
-        # (mirrors surrogate_host.main). Graceful headless shutdown is a follow-up.
-        app.web_ui.serve(args.ui_host, args.ui_port)
+        # Uvicorn returns after graceful shutdown; stop sensory and transport workers.
+        try:
+            app.web_ui.serve(args.ui_host, args.ui_port)
+        finally:
+            app.runtime.stop()
         return
 
     from theseus.surrogates.windows.shell import run_shell

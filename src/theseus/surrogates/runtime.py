@@ -21,6 +21,7 @@ from theseus.surrogates.command_executor import CommandExecutor, Renderer
 from theseus.surrogates.cursor import AckedCursor
 from theseus.surrogates.replicator import Replicator
 from theseus.surrogates.transport import StimulusTransport
+from theseus.surrogates.desktop_observer import DesktopObserver
 
 
 class SurrogateRuntime:
@@ -54,8 +55,10 @@ class SurrogateRuntime:
         command_cursor: AckedCursor | None = None,
         user_actor: str = "user",
         flush_interval_seconds: float = 30.0,
+        desktop_observer: DesktopObserver | None = None,
     ) -> None:
         self._log = log
+        self._desktop_observer = desktop_observer
         self._user_actor = user_actor
         self._flush_interval_seconds = flush_interval_seconds
         self._replicator = Replicator(log, transport, upstream_cursor)
@@ -121,10 +124,11 @@ class SurrogateRuntime:
                 daemon=True,
             )
             self._command_thread.start()
+        if self._desktop_observer is not None:
+            self._desktop_observer.start()
 
     def stop(self) -> None:
-        """Close the command channel and join the command thread, then tear down the
-        drain (unsubscribe → flush → trigger).
+        """Stop observation, close/join commands, then tear down replication.
 
         Command-first ordering: closing the channel ends `stream()`, so the executor
         finishes its last report and exits while the drain listener is still
@@ -133,6 +137,8 @@ class SurrogateRuntime:
         a request that has not yet started a drain — so anything unshipped rides the
         drain's at-least-once recovery and ships on the next `start()`.
         """
+        if self._desktop_observer is not None:
+            self._desktop_observer.stop()
         if self._command_channel is not None:
             self._command_channel.close()
         if self._command_thread is not None:

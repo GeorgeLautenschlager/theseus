@@ -21,6 +21,7 @@ from theseus.model_providers.model_provider import ModelProvider
 from theseus.schedule import Schedule
 from theseus.stimulus_log import StimulusEvent, StimulusLog
 from theseus.tools.tool import AssistantTurn, Tool, ToolCall
+from theseus.wake_policy import wakes_agent
 
 SLEEP_FLOOR_SECONDS = 5
 
@@ -333,11 +334,11 @@ class Autocore:
             self.wake(event)
 
     def _is_external(self, event: StimulusEvent) -> bool:
-        """The default wake filter: anything this core did not write itself. Its own
+        """The default wake filter: external events requiring attention. Its own
         `decision` and `tool_result` events must not count — every turn writes several,
         so counting them would re-wake the loop that just finished and the agent would
-        never sleep at all."""
-        return event.actor != self.name
+        never sleep at all. Ambient observations remain on the tape without waking."""
+        return event.actor != self.name and wakes_agent(event)
 
     def _initialize_home_directory(
         self, home_directory: Path, *, create_stimulus_log: bool = True
